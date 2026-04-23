@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pwsh-checks:
+    name: PowerShell Checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: PowerShell syntax check
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $files = Get-ChildItem -Path . -Recurse -File -Filter *.ps1
+          $parseErrors = @()
+          foreach ($file in $files) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$errors)
+            if ($errors) {
+              $parseErrors += $errors | ForEach-Object { "$($file.FullName): $($_.Message)" }
+            }
+          }
+
+          if ($parseErrors.Count -gt 0) {
+            $parseErrors | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            throw "Syntax check failed."
+          }
+
+          Write-Host "PowerShell syntax check passed."
+
+      - name: Run regression tests
+        shell: pwsh
+        run: ./tests/regression.ps1

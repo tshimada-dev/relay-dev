@@ -1,0 +1,4 @@
+interface:
+  display_name: "Relay Dev Seed Author"
+  short_description: "Prepare relay-dev seed files, including DESIGN.md-derived inputs"
+  default_prompt: "Use $relay-dev-seed-author to prepare task.md and Phase0 seed files for this relay-dev task, including DESIGN.md-derived design inputs when UI work is in scope."

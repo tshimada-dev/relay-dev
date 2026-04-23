@@ -1,0 +1,4 @@
+interface:
+  display_name: "Relay Dev Phase2 Clarifier"
+  short_description: "Resolve Phase2 clarification pauses with the user"
+  default_prompt: "Use $relay-dev-phase2-clarifier to summarize unresolved Phase2 questions, decide them with me, update the seed inputs, and tell me when it is safe to resume with y."

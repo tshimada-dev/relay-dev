@@ -1,0 +1,4 @@
+interface:
+  display_name: "Relay Dev Front Door"
+  short_description: "Workshop-style relay-dev intake with DESIGN.md-aware discovery"
+  default_prompt: "Use $relay-dev-front-door to run a relay-dev requirements workshop, including DESIGN.md and visual reference intake when UI work is in scope."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Relay Dev Troubleshooter"
+  short_description: "Investigate stuck or inconsistent relay-dev runs"
+  default_prompt: "Use $relay-dev-troubleshooter to inspect this relay-dev run and explain the safest recovery path."

@@ -1,0 +1,62 @@
+# Codex CLI 用 settings サンプル
+# 使い方:
+#   Copy-Item config/setting.yaml.sample config/settings.yaml
+#
+# Codex CLI インストール:
+#   npm install -g @openai/codex
+#   codex login
+#   codex --version
+
+cli:
+  command: "codex"
+  flags: "--ask-for-approval never exec --skip-git-repo-check --sandbox workspace-write"
+  implementer_command: ""
+  implementer_flags: ""
+  reviewer_command: ""
+  reviewer_flags: ""
+
+escalation:
+  phase1_timeout_sec: 300
+  phase2_timeout_sec: 600
+  phase3_timeout_sec: 1200
+
+watcher:
+  poll_fallback_sec: 5
+  debounce_ms: 300
+
+terminal:
+  type: wt
+
+lock:
+  retry_count: 30
+  retry_delay_ms: 200
+  timeout_sec: 300
+  loop_guard_wait_sec: 1800
+
+log:
+  directory: logs
+  max_size_mb: 10
+  rotation_count: 5
+
+paths:
+  project_dir: ".."
+  # DESIGN.md path. Relative paths are resolved from paths.project_dir.
+  design_file: "DESIGN.md"
+  status_file: queue/status.yaml
+  lock_file: queue/status.lock
+  dashboard_file: dashboard.md
+  task_file: tasks/task.md
+
+human_review:
+  enabled: true
+  phases:
+    - Phase3-1  # 設計書レビュー → ゲート: Phase4
+    - Phase4-1  # タスク分解レビュー → ゲート: Phase5
+    - Phase7    # PRレビュー → ゲート: Phase7-1
+  prompt_message: "レビューが完了しました。出力を確認して判断してください:"
+  options: |
+    [y] 承認（推奨通り次のフェーズへ進む）
+    [n] 却下（理由を入力して前のフェーズに戻る）
+    [c] 条件付き承認（追加フィードバックを付与）
+    [s] スキップ（今回のみ自動承認）
+    [q] 終了（手動対応のためエージェントを停止）

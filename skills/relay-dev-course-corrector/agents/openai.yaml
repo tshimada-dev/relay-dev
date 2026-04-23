@@ -1,0 +1,4 @@
+interface:
+  display_name: "Relay Dev Course Corrector"
+  short_description: "Safely change direction or restart a run"
+  default_prompt: "Use $relay-dev-course-corrector to safely change direction for this relay-dev run."

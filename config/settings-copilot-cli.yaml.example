@@ -1,0 +1,85 @@
+# GitHub Copilot CLI (copilot コマンド) 用の設定例
+# このファイルをsettings.yamlにコピーして使用してください
+# cp config/settings-copilot-cli.yaml.example config/settings.yaml
+#
+# 【前提条件】
+#   GitHub Copilot サブスクリプション（Individual, Business, または Enterprise）が必要です。
+#
+# 【インストール・セットアップ】
+#   1. VS Code に GitHub Copilot 拡張機能をインストール
+#   2. copilot CLI をインストール (Node.js 18+ が必要):
+#      npm install -g @github/copilot-cli   ※ パッケージ名はバージョンにより異なる場合あり
+#   3. 認証:
+#      copilot auth
+#
+# 【インストール確認】
+#   copilot --version
+#
+# 【主要フラグの説明】
+#   --autopilot              : 各ステップで確認を求めずに自律実行するモード
+#   --yolo                   : すべてのツール権限を自動許可（ファイル操作・コマンド実行等）
+#   --max-autopilot-continues: autoplotモードで自律継続する最大回数（大きいほど長い作業が可能）
+#   -p "プロンプト"           : 非対話モードでプロンプトを直接渡す（relay-dev 使用に必須）
+#
+# 【使用例1: すべての役割を copilot CLI で動かす】
+#   cli.command: copilot
+#   cli.flags: "--autopilot --yolo --max-autopilot-continues 30 -p"
+#
+# 【使用例2: 役割ごとにCLIを使い分ける（Multi-CLI）】
+#   implementer_command: copilot
+#   implementer_flags: "--autopilot --yolo --max-autopilot-continues 30 -p"
+#   reviewer_command: gemini
+#   reviewer_flags: "-y -p"
+
+cli:
+  command: "copilot"
+  flags: "--autopilot --yolo --max-autopilot-continues 30 -p"
+  implementer_command: ""  # 空欄 = command を使用
+  implementer_flags: ""
+  reviewer_command: ""     # 空欄 = command を使用
+  reviewer_flags: ""
+
+escalation:
+  # copilot CLI は応答が比較的速いため、デフォルト値で問題ないことが多い
+  # 複雑なPhase（Phase5 実装など）では phase3_timeout_sec を大きくすることを検討
+  phase1_timeout_sec: 120
+  phase2_timeout_sec: 300
+  phase3_timeout_sec: 600
+
+watcher:
+  poll_fallback_sec: 5
+  debounce_ms: 300
+
+terminal:
+  type: wt
+
+lock:
+  retry_count: 30
+  retry_delay_ms: 200
+  timeout_sec: 300
+
+log:
+  directory: logs
+  max_size_mb: 10
+  rotation_count: 5
+
+paths:
+  project_dir: ".."           # コード出力先ディレクトリ。空 = relay-devディレクトリ自身。".." = 親ディレクトリ
+  status_file: queue/status.yaml
+  lock_file: queue/status.lock
+  dashboard_file: dashboard.md
+  task_file: tasks/task.md
+
+human_review:
+  enabled: true
+  phases:
+    - Phase3-1  # 設計書レビュー → ゲート: Phase4
+    - Phase4-1  # タスク分解レビュー → ゲート: Phase5
+    - Phase7    # PRレビュー → ゲート: Phase7-1
+  prompt_message: "レビューが完了しました。出力を確認して判断してください:"
+  options: |
+    [y] 承認（推奨通り次のフェーズへ進む）
+    [n] 却下（理由を入力して前のフェーズに戻る）
+    [c] 条件付き承認（追加フィードバックを付与）
+    [s] スキップ（今回のみ自動承認）
+    [q] 終了（手動対応のためエージェントを停止）

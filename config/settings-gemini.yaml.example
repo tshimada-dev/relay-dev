@@ -1,0 +1,64 @@
+# Relay-Dev Configuration File
+# P1 Improvements Enabled (2026-02-24):
+# - State transition validation (auto-correction on phase mismatch)
+# - Forbidden command detection (git push, destructive operations)
+# - Test result verification (warns when test_output.log is missing after Phase6)
+# - Config validation (type checking, timeout order validation)
+
+cli:
+  command: gemini          # 共通デフォルト（role別未設定時のフォールバック）
+  flags: "-y -p"
+  implementer_command: ""  # 例: gemini  （空欄 = command を使用）
+  implementer_flags: ""    # 例: -y -p    （空欄 = flags  を使用）
+  reviewer_command: ""     # 例: claude   （空欄 = command を使用）
+  reviewer_flags: ""       # 例: -p        （空欄 = flags  を使用）
+
+escalation:
+  phase1_timeout_sec: 300
+  phase2_timeout_sec: 600
+  phase3_timeout_sec: 1200
+
+watcher:
+  poll_fallback_sec: 5
+  debounce_ms: 300
+
+terminal:
+  type: wt
+
+lock:
+  retry_count: 30
+  retry_delay_ms: 200
+  timeout_sec: 300
+  loop_guard_wait_sec: 1800  # LOOP GUARD発火時の待機秒数（クォータ以外の失敗向けフォールバック）
+
+log:
+  directory: logs
+  max_size_mb: 10
+  rotation_count: 5
+
+paths:
+  project_dir: ".."           # Code output directory. Empty = relay-dev directory itself. ".." = parent directory (use when relay-dev is placed in .relay-dev/ subdirectory)
+  status_file: queue/status.yaml
+  lock_file: queue/status.lock
+  dashboard_file: dashboard.md
+  task_file: tasks/task.md
+
+human_review:
+  enabled: false  # Set to false for fully autonomous operation
+  # Human confirmation points: implementer asks BEFORE starting these phases
+  # (triggered when: role=implementer, not a rollback, phase in list)
+  #   Phase4  ← after Phase3-1 (design review) passes
+  #   Phase5  ← after Phase4-1 (task breakdown review) passes
+  #   Phase7-1 ← after Phase7 (PR review) passes
+  # (This field is used for backward compatibility / future reviewer checks)
+  phases:
+    - Phase3-1  # Design review  → gate: Phase4
+    - Phase4-1  # Task breakdown review → gate: Phase5
+    - Phase7    # PR review → gate: Phase7-1
+  prompt_message: "Review completed. Please check the output and decide:"
+  options: |
+    [y] Approve (proceed to next phase as recommended)
+    [n] Reject (provide reason and return to previous phase)
+    [c] Conditional approval (add additional feedback)
+    [s] Skip (auto-approve this time only)
+    [q] Quit (stop agents for manual intervention)

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Relay Dev Operator Launch"
+  short_description: "Choose and run the next relay-dev command"
+  default_prompt: "Use $relay-dev-operator-launch to inspect the repo and run the safest next relay-dev command."
