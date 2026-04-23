@@ -1,3 +1,5 @@
+#requires -Version 7.0
+
 param(
     [string]$ConfigFile = "config/settings.yaml",
     [string]$RunId,

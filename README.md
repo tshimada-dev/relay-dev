@@ -1,7 +1,22 @@
 # Relay-Dev
 
+Relay-Dev is a phase-driven AI development runner that turns `task.md` / `DESIGN.md` inputs into reviewable design, implementation, test, approval, and release artifacts.
+
 Relay-Dev は、`runs/<run-id>/run-state.json` と `runs/<run-id>/events.jsonl` を正本に持つ、フェーズ駆動の自律開発ランナーです。  
 AI は provider CLI として差し替え可能で、Control Plane は `app/cli.ps1` が一元管理します。
+主な用途は「曖昧な開発依頼を、設計・実装・レビュー・検証 artifacts と approval 履歴を持つ成果物へ進めること」です。
+
+## 5分で見る relay-dev
+
+- 何をするものか: `tasks/task.md` と任意の `DESIGN.md` を入力に、Phase0 から Phase8 までの typed artifacts を生成する AI 開発ランナーです。
+- どこが難しいか: AI 出力を散文だけで流さず、`run-state.json`、`events.jsonl`、JSON artifact、approval gate、validator で追跡可能にしている点です。
+- 何が証拠か: CI、`tests/regression.ps1`、canonical artifact store、公開用に sanitize する examples、approval / review artifacts です。
+- まず見る順番: README -> `examples/README.md` -> `docs/architecture-redesign.md` -> `docs/portfolio-roadmap.md`
+
+## 非対象
+
+relay-dev は汎用 AGI や完全無人の自律運転基盤ではありません。
+本番 SaaS として提供するものでもなく、人間承認を前提にした開発 runner です。安全性は runtime enforcement と prompt / 運用規律を分けて扱います。
 
 現在の relay-dev は、旧来の「2エージェントが `queue/status.yaml` を受け渡しながら進む仕組み」からリファクタされ、次の考え方に寄せています。
 
@@ -390,10 +405,10 @@ run 開始前に以下の 2 ファイルが揃っていて、`phase0_context.jso
 日常運用では、まず `app/cli.ps1` を入口として見てください。
 
 ```powershell
-.\app\cli.ps1 new
-.\app\cli.ps1 resume
-.\app\cli.ps1 step
-.\app\cli.ps1 show
+pwsh -NoLogo -NoProfile -File .\app\cli.ps1 new
+pwsh -NoLogo -NoProfile -File .\app\cli.ps1 resume
+pwsh -NoLogo -NoProfile -File .\app\cli.ps1 step
+pwsh -NoLogo -NoProfile -File .\app\cli.ps1 show
 ```
 
 各コマンドの役割:
@@ -448,7 +463,7 @@ Linux / macOS でも、現在の基本形は visible な単一 orchestrator work
 
 ### 必須
 
-- PowerShell 7 以上推奨
+- PowerShell 7 以上必須（`pwsh`）
 - AI provider CLI
 - Windows の場合は `wt.exe`
 - Linux / macOS の場合は `tmux`
@@ -479,13 +494,13 @@ cli:
 1. AI に `relay-dev-front-door` を読ませる
 2. 対話で要件を決める
 3. AI に `relay-dev-seed-author` を使って `tasks/task.md` と必要な `Phase0` seed を作らせる
-4. AI に `relay-dev-operator-launch` を使って `.\start-agents.ps1` を実行させる
+4. AI に `relay-dev-operator-launch` を使って `pwsh -NoLogo -NoProfile -File .\start-agents.ps1` を実行させる
 5. AI から `run_id`、現在 phase、次の確認ポイントを受け取る
 
 ### 手動で確認したい場合
 
 ```powershell
-.\app\cli.ps1 show
+pwsh -NoLogo -NoProfile -File .\app\cli.ps1 show
 Get-Content .\runs\<run-id>\events.jsonl
 Get-Content .\dashboard.md
 ```
@@ -493,13 +508,13 @@ Get-Content .\dashboard.md
 ### 再開する場合
 
 ```powershell
-.\app\cli.ps1 resume
+pwsh -NoLogo -NoProfile -File .\app\cli.ps1 resume
 ```
 
 または:
 
 ```powershell
-.\start-agents.ps1
+pwsh -NoLogo -NoProfile -File .\start-agents.ps1
 ```
 
 ### 止まったり方針が変わった場合
@@ -546,7 +561,8 @@ relay-dev/
 ├── config/
 ├── docs/
 ├── examples/
-│   └── gemini_video_plugin/
+│   ├── README.md
+│   └── gemini_video_plugin/  # legacy example; not portfolio proof
 ├── outputs/
 ├── queue/
 ├── runs/
@@ -597,7 +613,7 @@ relay-dev/
 
 問題が起きたときは、まず次を見ます。
 
-1. `.\app\cli.ps1 show`
+1. `pwsh -NoLogo -NoProfile -File .\app\cli.ps1 show`
 2. `runs/<run-id>/run-state.json`
 3. `runs/<run-id>/events.jsonl`
 4. `runs/<run-id>/jobs/<job-id>/`
@@ -620,7 +636,8 @@ pwsh -NoLogo -NoProfile -File tests/regression.ps1
 
 ## 実例
 
-実際の完走サンプルは [examples/gemini_video_plugin](./examples/gemini_video_plugin) を参照してください。
+公開用 examples の方針は [examples/README.md](./examples/README.md) を参照してください。
+既存の [examples/gemini_video_plugin](./examples/gemini_video_plugin) はリファクタ前の旧成果物であり、portfolio の主証拠としては扱いません。
 
 ## よくある運用上の注意
 

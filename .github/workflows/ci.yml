@@ -44,3 +44,7 @@ jobs:
       - name: Run regression tests
         shell: pwsh
         run: ./tests/regression.ps1
+
+      - name: Check public examples
+        shell: pwsh
+        run: ./scripts/check-public-examples.ps1

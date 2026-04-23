@@ -1,0 +1,4 @@
+interface:
+  display_name: "Worklog"
+  short_description: "Record handoffs and daily repo worklogs"
+  default_prompt: "Use the worklog skill to update the current handoff and append a concise worklog entry for completed work."

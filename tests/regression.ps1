@@ -53,6 +53,19 @@ function Assert-NotContains {
     }
 }
 
+function Get-TestFileSha256 {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $Path).Path)
+        return ([System.BitConverter]::ToString($sha256.ComputeHash($bytes)).Replace("-", "").ToLowerInvariant())
+    }
+    finally {
+        $sha256.Dispose()
+    }
+}
+
 function New-ChecklistEntry {
     param(
         [string]$CheckId,
@@ -638,6 +651,9 @@ try {
         open_questions = @("none")
         design_inputs = @("DESIGN.md")
         visual_constraints = @("Keep the documented editorial spacing and accent colors.")
+        task_fingerprint = "remaining-phases-fixture-fingerprint"
+        task_path = "tasks/task.md"
+        seed_created_at = "2026-04-23T00:00:00Z"
     }
     $phase1Write = Write-Phase1Artifacts -ProjectRoot $tempRemainingRoot -RunId $remainingRunId -MarkdownContent "# Phase1" -JsonContent @{
         goals = @("refresh system")
@@ -1333,12 +1349,21 @@ $startAgentsShText = Get-Content -Path $startAgentsShPath -Raw -Encoding UTF8
 Assert-Contains $startAgentsShText "-Role orchestrator -ConfigFile" "Linux launcher should start the orchestrator worker"
 Assert-Contains $startAgentsShText "-InteractiveApproval" "Linux launcher should enable interactive approval in the worker pane"
 Assert-Contains $startAgentsShText "watch-run.ps1" "Linux launcher should start the monitor pane"
+Assert-Contains $startAgentsShText "runs/current-run.json" "Linux launcher should check the canonical run pointer before status.yaml"
+Assert-Contains $startAgentsShText 'RESUME_SOURCE" == "runs/current-run.json"' "Linux launcher should resume canonical runs without legacy phase overrides"
 Assert-True (-not $startAgentsShText.Contains("-Role implementer")) "Linux launcher should no longer rely on implementer-only pane startup"
 Assert-True (-not $startAgentsShText.Contains("-Role reviewer")) "Linux launcher should no longer rely on reviewer-only pane startup"
+
+$startAgentsPs1Path = Join-Path $repoRoot "start-agents.ps1"
+$startAgentsPs1Text = Get-Content -Path $startAgentsPs1Path -Raw -Encoding UTF8
+Assert-Contains $startAgentsPs1Text "Get-CanonicalRunSummary" "Windows launcher should inspect canonical run state before legacy status.yaml"
+Assert-Contains $startAgentsPs1Text '$resumeSource -eq "runs/current-run.json"' "Windows launcher should resume canonical runs without legacy phase overrides"
+Assert-Contains $startAgentsPs1Text "#requires -Version 7.0" "Windows launcher should fail fast outside PowerShell 7"
 
 Write-Host "[11/12] Testing engine-driven CLI step..."
 $cliRunId = "run-cli-step-" + [guid]::NewGuid().ToString("N")
 $cliSeedRunId = "run-cli-seed-" + [guid]::NewGuid().ToString("N")
+$staleSeedRunId = "run-cli-stale-seed-" + [guid]::NewGuid().ToString("N")
 $cliSpawnRunId = "run-cli-spawn-" + [guid]::NewGuid().ToString("N")
 $cliInvalidPhase6RunId = "run-cli-phase6-invalid-" + [guid]::NewGuid().ToString("N")
 $cliRecoverResumeRunId = "run-cli-resume-recover-" + [guid]::NewGuid().ToString("N")
@@ -1349,8 +1374,10 @@ $originalPointerRaw = if (Test-Path $currentRunPointerPath) { Get-Content -Path 
 $cliOutputDir = Join-Path $repoRoot "outputs/req-cli-step"
 $phase0SeedMarkdownPath = Join-Path $repoRoot "outputs/phase0_context.md"
 $phase0SeedJsonPath = Join-Path $repoRoot "outputs/phase0_context.json"
+$taskFilePath = Join-Path $repoRoot "tasks/task.md"
 $originalPhase0SeedMarkdown = if (Test-Path $phase0SeedMarkdownPath) { Get-Content -Path $phase0SeedMarkdownPath -Raw -Encoding UTF8 } else { $null }
 $originalPhase0SeedJson = if (Test-Path $phase0SeedJsonPath) { Get-Content -Path $phase0SeedJsonPath -Raw -Encoding UTF8 } else { $null }
+$originalTaskFile = if (Test-Path $taskFilePath) { Get-Content -Path $taskFilePath -Raw -Encoding UTF8 } else { $null }
 
 try {
     $seedRunState = New-RunState -RunId $cliSeedRunId -ProjectRoot $repoRoot -TaskId "req-cli-seed" -CurrentPhase "Phase0" -CurrentRole "implementer"
@@ -1366,6 +1393,12 @@ try {
 - Project name: Relay-Dev
 - Summary: Seeded regression fixture
 '@ | Set-Content -Path $phase0SeedMarkdownPath -Encoding UTF8
+    @'
+# Seeded Regression Task
+
+Use the seeded Phase0 fixture.
+'@ | Set-Content -Path $taskFilePath -Encoding UTF8
+    $taskFingerprint = Get-TestFileSha256 -Path $taskFilePath
     @{
         project_summary = "Seeded regression fixture"
         project_root = $repoRoot
@@ -1376,6 +1409,9 @@ try {
         open_questions = @("Seeded regression fixture question")
         design_inputs = @("DESIGN.md")
         visual_constraints = @("Use the seeded design system when UI work exists.")
+        task_fingerprint = $taskFingerprint
+        task_path = $taskFilePath
+        seed_created_at = "2026-04-23T00:00:00Z"
     } | ConvertTo-Json -Depth 5 | Set-Content -Path $phase0SeedJsonPath -Encoding UTF8
 
     $seedStepRaw = & $pwshPath -NoLogo -NoProfile -File $cliScriptPath step -ConfigFile $configPath -RunId $cliSeedRunId -Provider fake-provider
@@ -1383,6 +1419,14 @@ try {
     $seedStep = ConvertTo-RelayHashtable -InputObject ($seedStepJson | ConvertFrom-Json)
     Assert-Equal $seedStep["action"]["type"] "SeedPhase0" "CLI step should seed Phase0 from outputs/phase0_context artifacts when available"
     Assert-Equal $seedStep["run_state"]["current_phase"] "Phase1" "Seeded Phase0 should advance directly to Phase1"
+    $seedEvent = ConvertTo-RelayHashtable -InputObject ((Get-Events -ProjectRoot $repoRoot -RunId $cliSeedRunId | Where-Object { $_["type"] -eq "phase0.seeded" } | Select-Object -Last 1))
+    Assert-Equal $seedEvent["task_fingerprint"] $taskFingerprint "Seeded Phase0 event should record the accepted task fingerprint"
+
+    $staleSeedRunState = New-RunState -RunId $staleSeedRunId -ProjectRoot $repoRoot -TaskId "req-cli-stale-seed" -CurrentPhase "Phase0" -CurrentRole "implementer"
+    Write-RunState -ProjectRoot $repoRoot -RunState $staleSeedRunState | Out-Null
+    Set-Content -Path $taskFilePath -Value "# Changed Seeded Regression Task`n" -Encoding UTF8
+    $staleSeedRaw = & $pwshPath -NoLogo -NoProfile -File $cliScriptPath step -ConfigFile $configPath -RunId $staleSeedRunId -Provider fake-provider 2>&1 | Out-String
+    Assert-Contains $staleSeedRaw "Phase0 seed is stale or incomplete" "CLI step should reject stale Phase0 seeds when task.md changes"
 
     $cliRunState = New-RunState -RunId $cliRunId -ProjectRoot $repoRoot -TaskId "req-cli-step" -CurrentPhase "Phase4-1" -CurrentRole "reviewer"
     Write-RunState -ProjectRoot $repoRoot -RunState $cliRunState | Out-Null
@@ -1612,6 +1656,7 @@ try {
 }
 finally {
     Remove-Item -Path (Get-RunRootPath -ProjectRoot $repoRoot -RunId $cliSeedRunId) -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path (Get-RunRootPath -ProjectRoot $repoRoot -RunId $staleSeedRunId) -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -Path (Get-RunRootPath -ProjectRoot $repoRoot -RunId $cliRunId) -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -Path (Get-RunRootPath -ProjectRoot $repoRoot -RunId $cliSpawnRunId) -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -Path (Get-RunRootPath -ProjectRoot $repoRoot -RunId $cliInvalidPhase6RunId) -Recurse -Force -ErrorAction SilentlyContinue
@@ -1632,6 +1677,13 @@ finally {
     }
     else {
         Remove-Item -Path $phase0SeedJsonPath -Force -ErrorAction SilentlyContinue
+    }
+
+    if ($null -ne $originalTaskFile) {
+        Set-Content -Path $taskFilePath -Value $originalTaskFile -Encoding UTF8
+    }
+    else {
+        Remove-Item -Path $taskFilePath -Force -ErrorAction SilentlyContinue
     }
 
     if ($null -ne $originalPointerRaw) {

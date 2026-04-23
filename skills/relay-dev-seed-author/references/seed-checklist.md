@@ -46,7 +46,12 @@ Required keys:
   ],
   "open_questions": [
     "Should existing outputs be reused or regenerated?"
-  ]
+  ],
+  "design_inputs": [],
+  "visual_constraints": [],
+  "task_fingerprint": "sha256-of-current-tasks-task-md",
+  "task_path": "tasks/task.md",
+  "seed_created_at": "2026-04-23T00:00:00Z"
 }
 ```
 
@@ -56,6 +61,8 @@ Validation-minded reminders:
 - required array fields must exist
 - required arrays should contain at least one meaningful item
 - when something is unknown, add it to `open_questions`
+- `task_fingerprint` must match the current `tasks/task.md` SHA-256
+- `seed_created_at` must describe when this seed was authored, not copied from an older run
 
 Decision rule:
 

@@ -1,3 +1,5 @@
+#requires -Version 7.0
+
 param(
     [Parameter(Position = 0)][ValidateSet("new", "resume", "step", "show")][string]$Command = "show",
     [string]$ConfigFile = "config/settings.yaml",
@@ -238,6 +240,76 @@ function Read-OptionalUtf8File {
     }
 
     return (Get-Content -Path $Path -Raw -Encoding UTF8)
+}
+
+function Resolve-TaskFilePath {
+    if ([System.IO.Path]::IsPathRooted($script:TaskFile)) {
+        return $script:TaskFile
+    }
+
+    return (Join-Path $script:ProjectRoot $script:TaskFile)
+}
+
+function Get-FileSha256 {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path $Path)) {
+        throw "Cannot calculate SHA256 because '$Path' does not exist."
+    }
+
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $Path).Path)
+        $hashBytes = $sha256.ComputeHash($bytes)
+        return ([System.BitConverter]::ToString($hashBytes).Replace("-", "").ToLowerInvariant())
+    }
+    finally {
+        $sha256.Dispose()
+    }
+}
+
+function Get-CurrentTaskSeedMetadata {
+    $taskFilePath = Resolve-TaskFilePath
+    return [ordered]@{
+        task_path = $taskFilePath
+        task_fingerprint = Get-FileSha256 -Path $taskFilePath
+        seed_checked_at = (Get-Date).ToString("o")
+    }
+}
+
+function Test-Phase0SeedFreshness {
+    param([Parameter(Mandatory)]$SeedArtifact)
+
+    $artifact = ConvertTo-RelayHashtable -InputObject $SeedArtifact
+    $errors = New-Object System.Collections.Generic.List[string]
+
+    foreach ($field in @("task_fingerprint", "task_path", "seed_created_at")) {
+        if (-not $artifact.ContainsKey($field) -or [string]::IsNullOrWhiteSpace([string]$artifact[$field])) {
+            $errors.Add("phase0_context.json is missing required seed metadata '$field'.")
+        }
+    }
+
+    $currentMetadata = $null
+    try {
+        $currentMetadata = Get-CurrentTaskSeedMetadata
+    }
+    catch {
+        $errors.Add($_.Exception.Message)
+    }
+
+    if ($currentMetadata -and $artifact.ContainsKey("task_fingerprint")) {
+        $expectedFingerprint = [string]$currentMetadata["task_fingerprint"]
+        $seedFingerprint = [string]$artifact["task_fingerprint"]
+        if ($seedFingerprint -ne $expectedFingerprint) {
+            $errors.Add("phase0_context.json task_fingerprint does not match the current tasks/task.md fingerprint.")
+        }
+    }
+
+    return @{
+        valid = ($errors.Count -eq 0)
+        errors = @($errors)
+        current_metadata = $currentMetadata
+    }
 }
 
 function Resolve-ContractArtifactPath {
@@ -600,6 +672,7 @@ function Get-Phase0SeedArtifacts {
     $markdownContent = Get-Content -Path $markdownPath -Raw -Encoding UTF8
     $jsonArtifact = ConvertTo-RelayHashtable -InputObject ((Get-Content -Path $jsonPath -Raw -Encoding UTF8) | ConvertFrom-Json)
     $validation = Test-ArtifactContract -ArtifactId "phase0_context.json" -Artifact $jsonArtifact -Phase "Phase0"
+    $freshness = Test-Phase0SeedFreshness -SeedArtifact $jsonArtifact
 
     return @{
         markdown_path = $markdownPath
@@ -607,6 +680,7 @@ function Get-Phase0SeedArtifacts {
         markdown = $markdownContent
         artifact = $jsonArtifact
         validation = $validation
+        freshness = $freshness
     }
 }
 
@@ -631,13 +705,20 @@ function Invoke-SeededPhase0Step {
 
     $seedValidation = ConvertTo-RelayHashtable -InputObject $seedArtifacts["validation"]
     if (-not [bool]$seedValidation["valid"]) {
-        return $null
+        throw "Phase0 seed is invalid: $(@($seedValidation['errors']) -join '; ')"
+    }
+
+    $seedFreshness = ConvertTo-RelayHashtable -InputObject $seedArtifacts["freshness"]
+    if (-not [bool]$seedFreshness["valid"]) {
+        throw "Phase0 seed is stale or incomplete: $(@($seedFreshness['errors']) -join '; ')"
     }
 
     Write-Phase0Artifacts -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -MarkdownContent ([string]$seedArtifacts["markdown"]) -JsonContent $seedArtifacts["artifact"] | Out-Null
     Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event @{
         type = "phase0.seeded"
         source = @($seedArtifacts["markdown_path"], $seedArtifacts["json_path"])
+        task_fingerprint = [string]$seedArtifacts["artifact"]["task_fingerprint"]
+        task_path = [string]$seedArtifacts["artifact"]["task_path"]
     }
     Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event @{
         type = "artifact.validated"

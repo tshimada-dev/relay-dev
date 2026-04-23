@@ -1,3 +1,5 @@
+#requires -Version 7.0
+
 param(
     [Parameter(Mandatory)][ValidateSet("implementer", "reviewer", "orchestrator")][string]$Role,
     [string]$ConfigFile = "config/settings.yaml",

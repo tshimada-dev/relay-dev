@@ -403,9 +403,12 @@ function Test-Phase0ContextArtifact {
         "risks",
         "open_questions",
         "design_inputs",
-        "visual_constraints"
+        "visual_constraints",
+        "task_fingerprint",
+        "task_path",
+        "seed_created_at"
     ) -ArtifactId "phase0_context.json"
-    foreach ($field in @("project_summary", "project_root", "framework_root")) {
+    foreach ($field in @("project_summary", "project_root", "framework_root", "task_fingerprint", "task_path", "seed_created_at")) {
         Test-ArtifactStringField -Artifact $Artifact -Result $result -FieldName $field
     }
     foreach ($field in @("constraints", "available_tools", "risks", "open_questions")) {

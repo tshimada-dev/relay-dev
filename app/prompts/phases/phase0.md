@@ -25,14 +25,19 @@
 - `open_questions`
 - `design_inputs`
 - `visual_constraints`
+- `task_fingerprint`
+- `task_path`
+- `seed_created_at`
 
 `constraints`、`available_tools`、`risks`、`open_questions`、`design_inputs`、`visual_constraints` は配列で表現すること。
 `project_root` と `framework_root` は、prompt context から判明している場合は絶対パスで保持すること。
 `design_inputs` と `visual_constraints` は、`DESIGN.md` や明示されたデザイン参照がない場合は空配列でよい。
+`task_fingerprint` は `tasks/task.md` の SHA-256、`task_path` は参照した task file path、`seed_created_at` は ISO 8601 形式の作成時刻にすること。
 
 ## 実行ルール
 
 - Phase0 を飛ばして要件定義や設計に進まないこと
 - `tasks/task.md` が不完全でも、勝手に補完せず未確定事項は `open_questions` に明示すること
+- `task_fingerprint` は推測せず、可能なら実ファイルから計算すること。計算できない場合は Phase0 を成功扱いにしないこと
 - 以降のフェーズで参照しやすいよう、安定情報と今回タスク固有の情報を混同しないこと
 - `DESIGN.md` がある場合は、色・タイポグラフィ・コンポーネント傾向・レスポンシブ指針などの安定した視覚ルールだけを抽出し、ページ固有コピーや一時的なキャンペーン文言は固定しないこと

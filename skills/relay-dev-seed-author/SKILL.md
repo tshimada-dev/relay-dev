@@ -134,9 +134,13 @@ UI が無関係なら両方とも空配列でよい。
 
 - `design_inputs`
 - `visual_constraints`
+- `task_fingerprint`
+- `task_path`
+- `seed_created_at`
 
 UI タスクで design source があるなら空のままにしない。  
 非 UI タスクなら空配列でよい。
+`task_fingerprint` は現在の `tasks/task.md` から SHA-256 を計算して入れる。古い seed をコピーした値で済ませない。
 
 ### 7. Validate before handoff
 

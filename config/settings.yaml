@@ -1,7 +1,7 @@
 # Relay-Dev Configuration File
-# P1 Improvements Enabled (2026-02-24):
+# Historical P1 improvement notes (2026-02-24):
 # - State transition validation (auto-correction on phase mismatch)
-# - Forbidden command detection (git push, destructive operations)
+# - Forbidden command guidance in prompts / operational policy
 # - Test result verification (warns when test_output.log is missing after Phase6)
 # - Config validation (type checking, timeout order validation)
 

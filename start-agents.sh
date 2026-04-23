@@ -20,6 +20,7 @@ SESSION_NAME="relay-dev"
 ACTIVE_RUN_ID=""
 USE_CLI_BOOTSTRAP=false
 APP_CLI="$SCRIPT_DIR/app/cli.ps1"
+RESUME_SOURCE=""
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ヘルパー関数
@@ -130,9 +131,21 @@ mkdir -p queue config outputs tasks "$LOG_DIR"
 # ─────────────────────────────────────────────────────────────────────────────
 RESUME_MODE=false
 
-if [[ "$FORCE" == false && -f "$STATUS_FILE" ]]; then
-    EXISTING_PHASE=$(grep 'current_phase:' "$STATUS_FILE" | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
-    EXISTING_AGENT=$(grep 'assigned_to:' "$STATUS_FILE" | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
+if [[ "$FORCE" == false ]]; then
+    if [[ -f "$SCRIPT_DIR/runs/current-run.json" ]]; then
+        POINTER_RUN_ID=$(pwsh -NoLogo -NoProfile -Command '$p = Get-Content -Raw -LiteralPath $args[0] | ConvertFrom-Json; $p.run_id' "$SCRIPT_DIR/runs/current-run.json" 2>/dev/null || true)
+        if [[ -n "$POINTER_RUN_ID" && -f "$SCRIPT_DIR/runs/$POINTER_RUN_ID/run-state.json" ]]; then
+            EXISTING_PHASE=$(pwsh -NoLogo -NoProfile -Command '$s = Get-Content -Raw -LiteralPath $args[0] | ConvertFrom-Json; $s.current_phase' "$SCRIPT_DIR/runs/$POINTER_RUN_ID/run-state.json" 2>/dev/null || true)
+            EXISTING_AGENT=$(pwsh -NoLogo -NoProfile -Command '$s = Get-Content -Raw -LiteralPath $args[0] | ConvertFrom-Json; $s.current_role' "$SCRIPT_DIR/runs/$POINTER_RUN_ID/run-state.json" 2>/dev/null || true)
+            RESUME_SOURCE="runs/current-run.json"
+        fi
+    fi
+
+    if [[ -z "${EXISTING_PHASE:-}" && -f "$STATUS_FILE" ]]; then
+        EXISTING_PHASE=$(grep 'current_phase:' "$STATUS_FILE" | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
+        EXISTING_AGENT=$(grep 'assigned_to:' "$STATUS_FILE" | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
+        RESUME_SOURCE="queue/status.yaml"
+    fi
 
     if [[ -n "$EXISTING_PHASE" && -n "$EXISTING_AGENT" ]]; then
         echo ""
@@ -140,6 +153,7 @@ if [[ "$FORCE" == false && -f "$STATUS_FILE" ]]; then
         echo "  EXISTING SESSION DETECTED"
         echo "  Phase : $EXISTING_PHASE"
         echo "  Agent : $EXISTING_AGENT"
+        echo "  Source: $RESUME_SOURCE"
         echo "════════════════════════════════════════════════"
         echo ""
         echo "  [r] Resume  - $EXISTING_PHASE から継続"
@@ -165,10 +179,16 @@ NOW=$(date -u +"%Y-%m-%dT%H:%M:%S")
 
 if [[ -f "$APP_CLI" ]]; then
     if [[ "$RESUME_MODE" == true ]]; then
-        RESUME_PHASE="${EXISTING_PHASE:-Phase0}"
-        RESUME_AGENT="${EXISTING_AGENT:-implementer}"
-        if ACTIVE_RUN_ID=$(pwsh -NoLogo -NoProfile -File "$APP_CLI" resume -ConfigFile "$CONFIG_FILE" -CurrentPhase "$RESUME_PHASE" -CurrentRole "$RESUME_AGENT" 2>/dev/null | tail -n 1); then
-            [[ -n "$ACTIVE_RUN_ID" ]] && USE_CLI_BOOTSTRAP=true
+        if [[ "$RESUME_SOURCE" == "runs/current-run.json" ]]; then
+            if ACTIVE_RUN_ID=$(pwsh -NoLogo -NoProfile -File "$APP_CLI" resume -ConfigFile "$CONFIG_FILE" 2>/dev/null | tail -n 1); then
+                [[ -n "$ACTIVE_RUN_ID" ]] && USE_CLI_BOOTSTRAP=true
+            fi
+        else
+            RESUME_PHASE="${EXISTING_PHASE:-Phase0}"
+            RESUME_AGENT="${EXISTING_AGENT:-implementer}"
+            if ACTIVE_RUN_ID=$(pwsh -NoLogo -NoProfile -File "$APP_CLI" resume -ConfigFile "$CONFIG_FILE" -CurrentPhase "$RESUME_PHASE" -CurrentRole "$RESUME_AGENT" 2>/dev/null | tail -n 1); then
+                [[ -n "$ACTIVE_RUN_ID" ]] && USE_CLI_BOOTSTRAP=true
+            fi
         fi
     else
         if ACTIVE_RUN_ID=$(pwsh -NoLogo -NoProfile -File "$APP_CLI" new -ConfigFile "$CONFIG_FILE" -CurrentPhase "Phase0" -CurrentRole "implementer" 2>/dev/null | tail -n 1); then

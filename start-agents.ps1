@@ -1,3 +1,5 @@
+#requires -Version 7.0
+
 param(
     [string]$ConfigFile = "config/settings.yaml",
     [switch]$Force,  # Force fresh start even if status.yaml exists
@@ -19,6 +21,7 @@ $AppCli = Join-Path $ProjectRoot "app/cli.ps1"
 # Config Loading (shared with agent-loop.ps1)
 # ============================================================
 . (Join-Path $ProjectRoot "config/common.ps1")
+. (Join-Path $ProjectRoot "app/core/run-state-store.ps1")
 
 $Config = Read-Config -Path $ConfigFile
 
@@ -29,6 +32,47 @@ $LockFile = Get-DefaultValue $Config["paths.lock_file"]      "queue/status.lock"
 $DashboardFile = Get-DefaultValue $Config["paths.dashboard_file"] "dashboard.md"
 $TaskFile = Get-DefaultValue $Config["paths.task_file"]      "tasks/task.md"
 $LogDirectory = Get-DefaultValue $Config["log.directory"]        "logs"
+
+function Get-CanonicalRunSummary {
+    $runId = Resolve-ActiveRunId -ProjectRoot $ProjectRoot
+    if ([string]::IsNullOrWhiteSpace($runId)) {
+        return $null
+    }
+
+    $runState = Read-RunState -ProjectRoot $ProjectRoot -RunId $runId
+    if (-not $runState) {
+        return $null
+    }
+
+    return @{
+        run_id = $runId
+        phase = [string]$runState["current_phase"]
+        agent = [string]$runState["current_role"]
+        status = [string]$runState["status"]
+        source = "runs/current-run.json"
+    }
+}
+
+function Get-LegacyStatusSummary {
+    if (-not (Test-Path $StatusFile)) {
+        return $null
+    }
+
+    $existingContent = Get-Content -Path $StatusFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+    $hasValidPhase = $existingContent -match 'current_phase:\s*"Phase\d'
+    $hasValidAgent = $existingContent -match 'assigned_to:\s*"(implementer|reviewer|orchestrator)"'
+    if (-not $hasValidPhase -or -not $hasValidAgent) {
+        return $null
+    }
+
+    return @{
+        run_id = ""
+        phase = if ($existingContent -match 'current_phase:\s*"([^"]+)"') { $Matches[1] } else { '?' }
+        agent = if ($existingContent -match 'assigned_to:\s*"([^"]+)"') { $Matches[1] } else { '?' }
+        status = "legacy"
+        source = "queue/status.yaml"
+    }
+}
 
 function Stop-RelayDevProcessTreeById {
     param(
@@ -129,25 +173,28 @@ if (-not (Test-Path $LogDirectory)) { New-Item -ItemType Directory -Path $LogDir
 if (Test-Path $LockFile) { Remove-Item $LockFile -Force }
 
 $resumeMode = [bool]$ResumeCurrent
+$resumeSource = ""
 if ($ResumeCurrent) {
     Write-Host "Resuming current run without interactive prompt..." -ForegroundColor Green
 }
-elseif (-not $Force -and (Test-Path $StatusFile)) {
-    # Read existing status to check if it has valid data
-    $existingContent = Get-Content -Path $StatusFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-    $hasValidPhase = $existingContent -match 'current_phase:\s*"Phase\d'
-    $hasValidAgent = $existingContent -match 'assigned_to:\s*"(implementer|reviewer)"'
+elseif (-not $Force) {
+    $existingSummary = Get-CanonicalRunSummary
+    if (-not $existingSummary) {
+        $existingSummary = Get-LegacyStatusSummary
+    }
 
-    if ($hasValidPhase -and $hasValidAgent) {
+    if ($existingSummary) {
         # Extract current state for display
-        $existingPhase = if ($existingContent -match 'current_phase:\s*"([^"]+)"') { $Matches[1] } else { '?' }
-        $existingAgent = if ($existingContent -match 'assigned_to:\s*"([^"]+)"') { $Matches[1] } else { '?' }
+        $existingPhase = [string]$existingSummary["phase"]
+        $existingAgent = [string]$existingSummary["agent"]
+        $resumeSource = [string]$existingSummary["source"]
 
         Write-Host ""
         Write-Host "===============================================" -ForegroundColor Cyan
         Write-Host "  EXISTING SESSION DETECTED" -ForegroundColor Yellow
         Write-Host "  Phase : $existingPhase" -ForegroundColor White
         Write-Host "  Agent : $existingAgent" -ForegroundColor White
+        Write-Host "  Source: $resumeSource" -ForegroundColor White
         Write-Host "===============================================" -ForegroundColor Cyan
         Write-Host ""
         Write-Host "  [r] Resume  - Continue from $existingPhase" -ForegroundColor Green
@@ -186,7 +233,7 @@ $now = Get-Date -Format "yyyy-MM-ddTHH:mm:ss"
 if (Test-Path $AppCli) {
     try {
         if ($resumeMode) {
-            if ($ResumeCurrent) {
+            if ($ResumeCurrent -or $resumeSource -eq "runs/current-run.json") {
                 $ActiveRunId = & $AppCli resume -ConfigFile $ConfigFile
             }
             else {
