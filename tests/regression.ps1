@@ -900,6 +900,48 @@ try {
     }
     Assert-Equal $failureResult["failure_class"] "provider_error" "Fake provider failure should map to provider_error"
 
+    $artifactRecoveryScriptPath = Join-Path $tempFakeRoot "artifact-recovery.ps1"
+    $artifactRecoveryFlagPath = Join-Path $tempFakeRoot "artifact-recovery.flag"
+    @"
+Start-Sleep -Seconds 1
+Set-Content -Path "$artifactRecoveryFlagPath" -Value "done" -Encoding UTF8
+Start-Sleep -Seconds 30
+"@ | Set-Content -Path $artifactRecoveryScriptPath -Encoding UTF8
+    $artifactRecoveryProbe = {
+        param($ProbeContext)
+
+        if (Test-Path $artifactRecoveryFlagPath) {
+            return @{
+                detected = $true
+                snapshot = "flag-ready"
+            }
+        }
+
+        return @{
+            detected = $false
+        }
+    }.GetNewClosure()
+    $artifactRecoveryStartedAt = Get-Date
+    $artifactRecoveryResult = Invoke-ExecutionRunner -JobSpec @{
+        run_id = "run-fake-provider"
+        job_id = "job-fake-artifact-recovery"
+        phase = "Phase3"
+        role = "implementer"
+        provider = "generic-cli"
+        command = $artifactRecoveryScriptPath
+        flags = "--autopilot --yolo --max-autopilot-continues 30"
+    } -PromptText "artifact recovery" -ProjectRoot $tempFakeRoot -WorkingDirectory $tempFakeRoot -TimeoutPolicy @{
+        warn_after_sec = 0
+        retry_after_sec = 0
+        abort_after_sec = 0
+        max_retries = 0
+    } -ArtifactCompletionProbe $artifactRecoveryProbe -ArtifactCompletionStabilitySec 3
+    $artifactRecoveryElapsedSec = [int]((Get-Date) - $artifactRecoveryStartedAt).TotalSeconds
+    Assert-True ($artifactRecoveryElapsedSec -lt 15) "Execution runner should stop waiting once artifact completion is stable"
+    Assert-Equal $artifactRecoveryResult["result_status"] "succeeded" "Artifact completion recovery should normalize the job to succeeded"
+    Assert-True ([bool]$artifactRecoveryResult["recovered_from_artifacts"]) "Artifact completion recovery should report recovered_from_artifacts"
+    Assert-Equal $artifactRecoveryResult["artifact_completion"]["snapshot"] "flag-ready" "Artifact completion recovery should preserve the confirmed snapshot"
+
     $staleState = New-RunState -RunId "run-fake-provider" -ProjectRoot $tempFakeRoot -CurrentPhase "Phase1" -CurrentRole "implementer"
     $staleState["active_job_id"] = "job-stale"
     Write-JobMetadata -ProjectRoot $tempFakeRoot -RunId "run-fake-provider" -JobId "job-stale" -Metadata @{

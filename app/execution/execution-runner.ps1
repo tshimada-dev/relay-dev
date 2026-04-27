@@ -105,6 +105,121 @@ function Resolve-ProcessInvocationSpec {
     return $spec
 }
 
+function Stop-ExecutionProcessTreeById {
+    param(
+        [Parameter(Mandatory)][int]$ProcessId,
+        [Parameter(Mandatory)]$ChildrenByParent
+    )
+
+    foreach ($child in @($ChildrenByParent[$ProcessId])) {
+        Stop-ExecutionProcessTreeById -ProcessId ([int]$child.ProcessId) -ChildrenByParent $ChildrenByParent
+    }
+
+    try {
+        Stop-Process -Id $ProcessId -Force -ErrorAction Stop
+    }
+    catch {
+    }
+}
+
+function Stop-ExecutionProcessTree {
+    param([AllowNull()]$Process)
+
+    if ($null -eq $Process) {
+        return
+    }
+
+    $processId = 0
+    try {
+        $processId = [int]$Process.Id
+    }
+    catch {
+        return
+    }
+
+    if ($processId -le 0) {
+        return
+    }
+
+    $allProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+    $childrenByParent = @{}
+    foreach ($candidate in $allProcesses) {
+        $parentId = [int]$candidate.ParentProcessId
+        if (-not $childrenByParent.ContainsKey($parentId)) {
+            $childrenByParent[$parentId] = @()
+        }
+        $childrenByParent[$parentId] = @($childrenByParent[$parentId]) + $candidate
+    }
+
+    Stop-ExecutionProcessTreeById -ProcessId $processId -ChildrenByParent $childrenByParent
+}
+
+function Request-ExecutionProcessStop {
+    param([AllowNull()]$Process)
+
+    if ($null -eq $Process) {
+        return
+    }
+
+    $processId = 0
+    try {
+        $processId = [int]$Process.Id
+    }
+    catch {
+        return
+    }
+
+    if ($processId -le 0) {
+        return
+    }
+
+    $isWindowsPlatform = $false
+    try {
+        $isWindowsPlatform = [bool]$IsWindows -or $env:OS -eq "Windows_NT"
+    }
+    catch {
+        $isWindowsPlatform = $env:OS -eq "Windows_NT"
+    }
+
+    if ($isWindowsPlatform) {
+        $taskkillCommand = Get-Command taskkill.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($taskkillCommand) {
+            $taskkillPath = if ($taskkillCommand.Path) { [string]$taskkillCommand.Path } else { [string]$taskkillCommand.Source }
+            try {
+                Start-Process -FilePath $taskkillPath -ArgumentList @("/T", "/F", "/PID", "$processId") -WindowStyle Hidden | Out-Null
+                return
+            }
+            catch {
+            }
+        }
+
+        try {
+            Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+        }
+        catch {
+        }
+        return
+    }
+
+    Stop-ExecutionProcessTree -Process $Process
+}
+
+function Write-ExecutionProbeTrace {
+    param([AllowNull()]$Payload)
+
+    $logPath = $env:RELAY_DEV_ARTIFACT_PROBE_LOG
+    if ([string]::IsNullOrWhiteSpace($logPath)) {
+        return
+    }
+
+    try {
+        $entry = ConvertTo-RelayHashtable -InputObject $Payload
+        Add-Content -Path $logPath -Value ($entry | ConvertTo-Json -Depth 20 -Compress) -Encoding UTF8
+    }
+    catch {
+    }
+}
+
 function Drain-ExecutionOutputQueue {
     param(
         [Parameter(Mandatory)]$Queue,
@@ -158,6 +273,8 @@ function Invoke-ExecutionAttempt {
         [Parameter(Mandatory)][string]$WorkingDirectory,
         [Parameter(Mandatory)][int]$Attempt,
         [Parameter(Mandatory)]$TimeoutPolicy,
+        [scriptblock]$ArtifactCompletionProbe,
+        [int]$ArtifactCompletionStabilitySec = 5,
         [scriptblock]$OnStarted,
         [scriptblock]$OnWarn,
         [scriptblock]$OnRetry,
@@ -235,12 +352,88 @@ function Invoke-ExecutionAttempt {
     $warned = $false
     $shouldRetry = $false
     $wasAborted = $false
+    $artifactCompleted = $false
+    $artifactCompletion = $null
+    $artifactCompletionCandidate = $null
+    $processStopRequested = $false
+    Write-ExecutionProbeTrace -Payload @{
+        detected = $false
+        reason = "attempt_started"
+        has_probe = [bool]$ArtifactCompletionProbe
+        attempt = $Attempt
+        pid = $process.Id
+    }
 
     while (-not $process.HasExited) {
         Start-Sleep -Seconds 1
         Drain-ExecutionEventStream -SourceIdentifier $stdoutEventId -Target $stdoutLines -StreamName "stdout"
         Drain-ExecutionEventStream -SourceIdentifier $stderrEventId -Target $stderrLines -StreamName "stderr"
         $elapsed = (Get-Date) - $startedAt
+        Write-ExecutionProbeTrace -Payload @{
+            detected = $false
+            reason = "attempt_poll"
+            has_probe = [bool]$ArtifactCompletionProbe
+            attempt = $Attempt
+            pid = $process.Id
+            elapsed_seconds = [int]$elapsed.TotalSeconds
+        }
+
+        if ($ArtifactCompletionProbe) {
+            $probeResult = $null
+            try {
+                $probeResult = & $ArtifactCompletionProbe @{
+                    attempt = $Attempt
+                    pid = $process.Id
+                    started_at = $startedAt.ToString("o")
+                    observed_at = (Get-Date).ToString("o")
+                }
+            }
+            catch {
+                Write-ExecutionProbeTrace -Payload @{
+                    detected = $false
+                    reason = "probe_call_exception"
+                    attempt = $Attempt
+                    pid = $process.Id
+                    errors = @([string]$_.Exception.Message)
+                }
+                $probeResult = $null
+            }
+
+            $probe = ConvertTo-RelayHashtable -InputObject $probeResult
+            if ($probe -and [bool]$probe["detected"]) {
+                $snapshot = [string]$probe["snapshot"]
+                if ([string]::IsNullOrWhiteSpace($snapshot)) {
+                    $snapshot = "__artifact_complete__"
+                }
+
+                $observedAt = Get-Date
+                if ($artifactCompletionCandidate -and [string]$artifactCompletionCandidate["snapshot"] -eq $snapshot) {
+                    $firstSeen = [datetime]::MinValue
+                    $firstSeenRaw = [string]$artifactCompletionCandidate["first_seen"]
+                    if ([datetime]::TryParse($firstSeenRaw, [ref]$firstSeen)) {
+                        if (($observedAt - $firstSeen).TotalSeconds -ge $ArtifactCompletionStabilitySec) {
+                            $artifactCompletion = $probe
+                            $artifactCompletion["first_detected_at"] = $firstSeen.ToString("o")
+                            $artifactCompletion["confirmed_at"] = $observedAt.ToString("o")
+                            $artifactCompletion["stability_seconds"] = $ArtifactCompletionStabilitySec
+                            $processStopRequested = $true
+                            Request-ExecutionProcessStop -Process $process
+                            $artifactCompleted = $true
+                            break
+                        }
+                    }
+                }
+                else {
+                    $artifactCompletionCandidate = @{
+                        snapshot = $snapshot
+                        first_seen = $observedAt.ToString("o")
+                    }
+                }
+            }
+            else {
+                $artifactCompletionCandidate = $null
+            }
+        }
 
         if ($warnAfter -gt 0 -and -not $warned -and $elapsed.TotalSeconds -ge $warnAfter) {
             $warned = $true
@@ -262,7 +455,8 @@ function Invoke-ExecutionAttempt {
                 }
             }
             try {
-                $process.Kill()
+                $processStopRequested = $true
+                Request-ExecutionProcessStop -Process $process
             }
             catch {
             }
@@ -272,7 +466,8 @@ function Invoke-ExecutionAttempt {
 
         if ($abortAfter -gt 0 -and $elapsed.TotalSeconds -ge $abortAfter) {
             try {
-                $process.Kill()
+                $processStopRequested = $true
+                Request-ExecutionProcessStop -Process $process
             }
             catch {
             }
@@ -288,7 +483,26 @@ function Invoke-ExecutionAttempt {
         }
     }
 
-    $process.WaitForExit()
+    if (-not $process.HasExited) {
+        if ($artifactCompleted) {
+            try {
+                $process.CancelOutputRead()
+            }
+            catch {
+            }
+            try {
+                $process.CancelErrorRead()
+            }
+            catch {
+            }
+        }
+        elseif ($processStopRequested) {
+            $null = $process.WaitForExit(5000)
+        }
+        else {
+            $process.WaitForExit()
+        }
+    }
     Start-Sleep -Milliseconds 200
     Drain-ExecutionEventStream -SourceIdentifier $stdoutEventId -Target $stdoutLines -StreamName "stdout"
     Drain-ExecutionEventStream -SourceIdentifier $stderrEventId -Target $stderrLines -StreamName "stderr"
@@ -299,10 +513,19 @@ function Invoke-ExecutionAttempt {
     $stdout = ($stdoutLines.ToArray() -join [Environment]::NewLine)
     $stderr = ($stderrLines.ToArray() -join [Environment]::NewLine)
     $finishedAt = Get-Date
+    $exitCode = if ($process.HasExited) {
+        $process.ExitCode
+    }
+    elseif ($artifactCompleted) {
+        0
+    }
+    else {
+        1
+    }
 
     return [ordered]@{
         process_id = $process.Id
-        exit_code = $process.ExitCode
+        exit_code = $exitCode
         stdout = $stdout
         stderr = $stderr
         started_at = $startedAt.ToString("o")
@@ -310,6 +533,8 @@ function Invoke-ExecutionAttempt {
         elapsed_sec = [int](($finishedAt - $startedAt).TotalSeconds)
         should_retry = $shouldRetry
         was_aborted = $wasAborted
+        artifact_completed = $artifactCompleted
+        artifact_completion = $artifactCompletion
     }
 }
 
@@ -320,6 +545,8 @@ function Invoke-ExecutionRunner {
         [Parameter(Mandatory)][string]$ProjectRoot,
         [Parameter(Mandatory)][string]$WorkingDirectory,
         [Parameter(Mandatory)]$TimeoutPolicy,
+        [scriptblock]$ArtifactCompletionProbe,
+        [int]$ArtifactCompletionStabilitySec = 5,
         [scriptblock]$OnWarn,
         [scriptblock]$OnRetry,
         [scriptblock]$OnAbort
@@ -331,6 +558,13 @@ function Invoke-ExecutionRunner {
     $attempt = 1
     if ($job["attempt"]) {
         $attempt = [int]$job["attempt"]
+    }
+    Write-ExecutionProbeTrace -Payload @{
+        detected = $false
+        reason = "runner_started"
+        has_probe = [bool]$ArtifactCompletionProbe
+        job_id = $jobId
+        run_id = $runId
     }
 
     $maxRetries = 0
@@ -347,6 +581,8 @@ function Invoke-ExecutionRunner {
     $finalFinishedAt = $null
     $finalExitCode = 1
     $wasEscalated = $false
+    $recoveredFromArtifacts = $false
+    $artifactCompletion = $null
 
     if ($runId) {
         Append-Event -ProjectRoot $ProjectRoot -RunId $runId -Event @{
@@ -386,7 +622,7 @@ function Invoke-ExecutionRunner {
             }
         }
 
-        $attemptResult = Invoke-ExecutionAttempt -InvocationSpec $invocationSpec -PromptText $PromptText -WorkingDirectory $WorkingDirectory -Attempt $attempt -TimeoutPolicy $TimeoutPolicy -OnStarted {
+        $attemptResult = Invoke-ExecutionAttempt -InvocationSpec $invocationSpec -PromptText $PromptText -WorkingDirectory $WorkingDirectory -Attempt $attempt -TimeoutPolicy $TimeoutPolicy -ArtifactCompletionProbe $ArtifactCompletionProbe -ArtifactCompletionStabilitySec $ArtifactCompletionStabilitySec -OnStarted {
             param($StartedInfo)
 
             if ($runId) {
@@ -414,6 +650,15 @@ function Invoke-ExecutionRunner {
         $header = "=== attempt $attempt ($(Get-Date -Format "yyyy-MM-dd HH:mm:ss")) ==="
         Add-Content -Path $stdoutPath -Value ($header + [Environment]::NewLine + $attemptResult["stdout"]) -Encoding UTF8
         Add-Content -Path $stderrPath -Value ($header + [Environment]::NewLine + $attemptResult["stderr"]) -Encoding UTF8
+
+        if ([bool]$attemptResult["artifact_completed"]) {
+            $resultStatus = "succeeded"
+            $failureClass = $null
+            $recoveredFromArtifacts = $true
+            $artifactCompletion = ConvertTo-RelayHashtable -InputObject $attemptResult["artifact_completion"]
+            $finalExitCode = 0
+            break
+        }
 
         if ($attemptResult["was_aborted"]) {
             $resultStatus = "failed"
@@ -454,6 +699,7 @@ function Invoke-ExecutionRunner {
             exit_code = $finalExitCode
             result_status = $resultStatus
             failure_class = $failureClass
+            recovered_from_artifacts = $recoveredFromArtifacts
         }
         Write-JobMetadata -ProjectRoot $ProjectRoot -RunId $runId -JobId $jobId -Metadata @{
             run_id = $runId
@@ -472,6 +718,8 @@ function Invoke-ExecutionRunner {
             result_status = $resultStatus
             failure_class = $failureClass
             was_escalated = $wasEscalated
+            recovered_from_artifacts = $recoveredFromArtifacts
+            artifact_completion = $artifactCompletion
         } | Out-Null
     }
 
@@ -486,6 +734,8 @@ function Invoke-ExecutionRunner {
         stdout_path = $stdoutPath
         stderr_path = $stderrPath
         failure_class = $failureClass
+        recovered_from_artifacts = $recoveredFromArtifacts
+        artifact_completion = $artifactCompletion
         provider_metadata = @{
             provider = $invocationSpec["provider"]
             command = $invocationSpec["command"]

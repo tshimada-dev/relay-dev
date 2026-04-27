@@ -441,6 +441,308 @@ function Sync-PhaseOutputArtifacts {
     }
 }
 
+function Get-CurrentPhaseHistoryEntry {
+    param(
+        [Parameter(Mandatory)]$RunState,
+        [Parameter(Mandatory)][string]$PhaseName,
+        [string]$Role
+    )
+
+    $state = ConvertTo-RelayHashtable -InputObject $RunState
+    $history = @($state["phase_history"])
+    for ($index = $history.Count - 1; $index -ge 0; $index--) {
+        $entry = ConvertTo-RelayHashtable -InputObject $history[$index]
+        if ([string]$entry["phase"] -ne $PhaseName) {
+            continue
+        }
+        if (-not [string]::IsNullOrWhiteSpace($Role) -and [string]$entry["agent"] -ne $Role) {
+            continue
+        }
+
+        return $entry
+    }
+
+    return $null
+}
+
+function Convert-RelayDateTimeToUtc {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $null
+    }
+
+    $parsed = [datetime]::MinValue
+    if (-not [datetime]::TryParse($Value, [ref]$parsed)) {
+        return $null
+    }
+
+    return $parsed.ToUniversalTime()
+}
+
+function Resolve-ArtifactCompletionCutoffUtc {
+    param(
+        [AllowNull()][datetime]$PhaseStartedAtUtc,
+        [AllowNull()][datetime]$AttemptStartedAtUtc
+    )
+
+    if ($null -eq $PhaseStartedAtUtc) {
+        return $AttemptStartedAtUtc
+    }
+    if ($null -eq $AttemptStartedAtUtc) {
+        return $PhaseStartedAtUtc
+    }
+    if ($PhaseStartedAtUtc -gt $AttemptStartedAtUtc) {
+        return $PhaseStartedAtUtc
+    }
+
+    return $AttemptStartedAtUtc
+}
+
+function Write-ArtifactProbeTrace {
+    param([AllowNull()]$Payload)
+
+    $logPath = $env:RELAY_DEV_ARTIFACT_PROBE_LOG
+    if ([string]::IsNullOrWhiteSpace($logPath)) {
+        return
+    }
+
+    try {
+        $entry = ConvertTo-RelayHashtable -InputObject $Payload
+        Add-Content -Path $logPath -Value ($entry | ConvertTo-Json -Depth 20 -Compress) -Encoding UTF8
+    }
+    catch {
+    }
+}
+
+$script:ArtifactCompletionProbeState = $null
+
+function Test-PhaseArtifactCompletion {
+    param(
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][string]$PhaseName,
+        [Parameter(Mandatory)]$PhaseDefinition,
+        [string]$TaskId,
+        [AllowNull()][datetime]$PhaseStartedAtUtc,
+        [AllowNull()][datetime]$AttemptStartedAtUtc
+    )
+
+    $definition = ConvertTo-RelayHashtable -InputObject $PhaseDefinition
+    $cutoffUtc = Resolve-ArtifactCompletionCutoffUtc -PhaseStartedAtUtc $PhaseStartedAtUtc -AttemptStartedAtUtc $AttemptStartedAtUtc
+    $missingRequired = New-Object System.Collections.Generic.List[string]
+    $staleRequired = New-Object System.Collections.Generic.List[string]
+    $requiredArtifacts = New-Object System.Collections.Generic.List[object]
+    $snapshotParts = New-Object System.Collections.Generic.List[string]
+    $resolvedPaths = @{}
+
+    foreach ($contractItem in @($definition["output_contract"])) {
+        $item = ConvertTo-RelayHashtable -InputObject $contractItem
+        $artifactId = [string]$item["artifact_id"]
+        if ([string]::IsNullOrWhiteSpace($artifactId)) {
+            continue
+        }
+
+        $path = Resolve-ContractArtifactPath -RunId $RunId -PhaseName $PhaseName -ContractItem $item -TaskId $TaskId
+        $resolvedPaths[$artifactId] = $path
+
+        $required = $false
+        if ($item.ContainsKey("required")) {
+            $required = [bool]$item["required"]
+        }
+        if (-not $required) {
+            continue
+        }
+
+        if (-not (Test-Path $path)) {
+            $missingRequired.Add($artifactId) | Out-Null
+            continue
+        }
+
+        $fileItem = Get-Item -LiteralPath $path -ErrorAction Stop
+        $lastWriteTimeUtc = $fileItem.LastWriteTimeUtc
+        if ($cutoffUtc -and $lastWriteTimeUtc -lt $cutoffUtc) {
+            $staleRequired.Add("$artifactId<$($lastWriteTimeUtc.ToString("o"))") | Out-Null
+            continue
+        }
+
+        $length = if ($fileItem.PSIsContainer) { 0 } else { [int64]$fileItem.Length }
+        $requiredArtifacts.Add([ordered]@{
+            artifact_id = $artifactId
+            path = $path
+            last_write_time_utc = $lastWriteTimeUtc.ToString("o")
+            length = $length
+        }) | Out-Null
+        $snapshotParts.Add("$artifactId|$($lastWriteTimeUtc.ToString("o"))|$length") | Out-Null
+    }
+
+    if ($missingRequired.Count -gt 0 -or $staleRequired.Count -gt 0) {
+        $result = [ordered]@{
+            detected = $false
+            reason = if ($missingRequired.Count -gt 0) { "required_artifacts_missing" } else { "required_artifacts_stale" }
+            missing_required = @($missingRequired)
+            stale_required = @($staleRequired)
+            cutoff_utc = if ($cutoffUtc) { $cutoffUtc.ToString("o") } else { $null }
+            phase_started_at_utc = if ($PhaseStartedAtUtc) { $PhaseStartedAtUtc.ToString("o") } else { $null }
+            attempt_started_at_utc = if ($AttemptStartedAtUtc) { $AttemptStartedAtUtc.ToString("o") } else { $null }
+        }
+        Write-ArtifactProbeTrace -Payload $result
+        return $result
+    }
+
+    $validatorRef = Resolve-PhaseValidatorArtifactRef -PhaseDefinition $PhaseDefinition -PhaseName $PhaseName -TaskId $TaskId
+    $validation = $null
+    $artifact = $null
+    if ($validatorRef) {
+        $validatorRef = ConvertTo-RelayHashtable -InputObject $validatorRef
+        $validatorArtifactId = [string]$validatorRef["artifact_id"]
+        $validatorPath = if ($resolvedPaths.ContainsKey($validatorArtifactId)) {
+            [string]$resolvedPaths[$validatorArtifactId]
+        }
+        else {
+            $validatorPath = $null
+            foreach ($contractItem in @($definition["output_contract"])) {
+                $item = ConvertTo-RelayHashtable -InputObject $contractItem
+                if ([string]$item["artifact_id"] -eq $validatorArtifactId) {
+                    $validatorPath = Resolve-ContractArtifactPath -RunId $RunId -PhaseName $PhaseName -ContractItem $item -TaskId $TaskId
+                    break
+                }
+            }
+
+            if ([string]::IsNullOrWhiteSpace($validatorPath)) {
+                if ([string]$validatorRef["scope"] -eq "task") {
+                    $validatorPath = Get-ArtifactPath -ProjectRoot $script:ProjectRoot -RunId $RunId -Scope "task" -Phase ([string]$validatorRef["phase"]) -ArtifactId $validatorArtifactId -TaskId ([string]$validatorRef["task_id"])
+                }
+                else {
+                    $validatorPath = Get-ArtifactPath -ProjectRoot $script:ProjectRoot -RunId $RunId -Scope ([string]$validatorRef["scope"]) -Phase ([string]$validatorRef["phase"]) -ArtifactId $validatorArtifactId
+                }
+            }
+
+            $resolvedPaths[$validatorArtifactId] = $validatorPath
+            $validatorPath
+        }
+
+        if (-not (Test-Path $validatorPath)) {
+            $result = [ordered]@{
+                detected = $false
+                reason = "validator_missing"
+                validator_ref = $validatorRef
+                validator_path = $validatorPath
+                cutoff_utc = if ($cutoffUtc) { $cutoffUtc.ToString("o") } else { $null }
+                phase_started_at_utc = if ($PhaseStartedAtUtc) { $PhaseStartedAtUtc.ToString("o") } else { $null }
+                attempt_started_at_utc = if ($AttemptStartedAtUtc) { $AttemptStartedAtUtc.ToString("o") } else { $null }
+            }
+            Write-ArtifactProbeTrace -Payload $result
+            return $result
+        }
+
+        $validatorFileItem = Get-Item -LiteralPath $validatorPath -ErrorAction Stop
+        $validatorLastWriteUtc = $validatorFileItem.LastWriteTimeUtc
+        if ($cutoffUtc -and $validatorLastWriteUtc -lt $cutoffUtc) {
+            $result = [ordered]@{
+                detected = $false
+                reason = "validator_stale"
+                validator_ref = $validatorRef
+                validator_path = $validatorPath
+                stale_required = @("$validatorArtifactId<$($validatorLastWriteUtc.ToString("o"))")
+                cutoff_utc = if ($cutoffUtc) { $cutoffUtc.ToString("o") } else { $null }
+                phase_started_at_utc = if ($PhaseStartedAtUtc) { $PhaseStartedAtUtc.ToString("o") } else { $null }
+                attempt_started_at_utc = if ($AttemptStartedAtUtc) { $AttemptStartedAtUtc.ToString("o") } else { $null }
+            }
+            Write-ArtifactProbeTrace -Payload $result
+            return $result
+        }
+
+        $validatorLength = if ($validatorFileItem.PSIsContainer) { 0 } else { [int64]$validatorFileItem.Length }
+        $validatorSnapshot = "$validatorArtifactId|$($validatorLastWriteUtc.ToString("o"))|$validatorLength"
+        if ($validatorArtifactId -notin @($requiredArtifacts | ForEach-Object { [string]$_["artifact_id"] })) {
+            $snapshotParts.Add($validatorSnapshot) | Out-Null
+        }
+
+        try {
+            $validation = ConvertTo-RelayHashtable -InputObject (Test-ArtifactRef -ProjectRoot $script:ProjectRoot -RunId $RunId -ArtifactRef $validatorRef)
+            $artifact = Read-Artifact -ProjectRoot $script:ProjectRoot -RunId $RunId -ArtifactRef $validatorRef
+        }
+        catch {
+            $result = [ordered]@{
+                detected = $false
+                reason = "validator_unreadable"
+                validator_ref = $validatorRef
+                validator_path = $validatorPath
+                errors = @([string]$_.Exception.Message)
+            }
+            Write-ArtifactProbeTrace -Payload $result
+            return $result
+        }
+
+        if (-not [bool]$validation["valid"]) {
+            $result = [ordered]@{
+                detected = $false
+                reason = "validator_invalid"
+                validator_ref = $validatorRef
+                validator_path = $validatorPath
+                validation = $validation
+                cutoff_utc = if ($cutoffUtc) { $cutoffUtc.ToString("o") } else { $null }
+                phase_started_at_utc = if ($PhaseStartedAtUtc) { $PhaseStartedAtUtc.ToString("o") } else { $null }
+                attempt_started_at_utc = if ($AttemptStartedAtUtc) { $AttemptStartedAtUtc.ToString("o") } else { $null }
+            }
+            Write-ArtifactProbeTrace -Payload $result
+            return $result
+        }
+    }
+
+    $snapshot = ($snapshotParts.ToArray() | Sort-Object) -join ";"
+    if ([string]::IsNullOrWhiteSpace($snapshot)) {
+        $snapshot = "__artifact_complete__"
+    }
+
+    $result = [ordered]@{
+        detected = $true
+        reason = "validated_artifacts_ready"
+        snapshot = $snapshot
+        required_artifacts = @($requiredArtifacts.ToArray())
+        validator_ref = $validatorRef
+        validation = $validation
+        artifact = $artifact
+        cutoff_utc = if ($cutoffUtc) { $cutoffUtc.ToString("o") } else { $null }
+        phase_started_at_utc = if ($PhaseStartedAtUtc) { $PhaseStartedAtUtc.ToString("o") } else { $null }
+        attempt_started_at_utc = if ($AttemptStartedAtUtc) { $AttemptStartedAtUtc.ToString("o") } else { $null }
+    }
+    Write-ArtifactProbeTrace -Payload $result
+    return $result
+}
+
+function Invoke-PhaseArtifactCompletionProbe {
+    param($ProbeContext)
+
+    $probeState = ConvertTo-RelayHashtable -InputObject $script:ArtifactCompletionProbeState
+    if (-not $probeState) {
+        return $null
+    }
+
+    $probe = ConvertTo-RelayHashtable -InputObject $ProbeContext
+    Write-ArtifactProbeTrace -Payload @{
+        detected = $false
+        reason = "probe_invoked"
+        probe_context = $probe
+        phase = [string]$probeState["phase_name"]
+    }
+
+    try {
+        $attemptStartedAtUtc = Convert-RelayDateTimeToUtc -Value ([string]$probe["started_at"])
+        return (Test-PhaseArtifactCompletion -RunId ([string]$probeState["run_id"]) -PhaseName ([string]$probeState["phase_name"]) -PhaseDefinition $probeState["phase_definition"] -TaskId ([string]$probeState["task_id"]) -PhaseStartedAtUtc $probeState["phase_started_at_utc"] -AttemptStartedAtUtc $attemptStartedAtUtc)
+    }
+    catch {
+        Write-ArtifactProbeTrace -Payload @{
+            detected = $false
+            reason = "probe_exception"
+            probe_context = $probe
+            phase = [string]$probeState["phase_name"]
+            errors = @([string]$_.Exception.Message)
+        }
+        throw
+    }
+}
+
 function Resolve-StepValidation {
     param(
         [Parameter(Mandatory)][string]$RunId,
@@ -924,6 +1226,7 @@ function Invoke-EngineStep {
             $dispatchState["status"] = "running"
             $dispatchState["active_job_id"] = $jobSpec["job_id"]
             $dispatchState = Set-RunStateCursor -RunState $dispatchState -Phase $phaseName -TaskId $taskId
+            $dispatchState = Sync-RunStatePhaseHistory -RunState $dispatchState
             Write-RunState -ProjectRoot $script:ProjectRoot -RunState $dispatchState | Out-Null
             Append-RunStatusChangedEvent -RunId $ResolvedRunId -RunState $dispatchState
 
@@ -946,7 +1249,21 @@ function Invoke-EngineStep {
                 New-EnginePromptText -RunState $dispatchState -Action $nextAction -JobSpec $jobSpec -PhaseDefinition $phaseDefinition
             }
 
-            $executionResult = Invoke-ExecutionRunner -JobSpec $jobSpec -PromptText $promptText -ProjectRoot $script:ProjectRoot -WorkingDirectory $script:ProjectDir -TimeoutPolicy (Get-StepTimeoutPolicy)
+            $phaseHistoryEntry = Get-CurrentPhaseHistoryEntry -RunState $dispatchState -PhaseName $phaseName -Role $resolvedRole
+            $phaseStartedAtUtc = Convert-RelayDateTimeToUtc -Value ([string]$phaseHistoryEntry["started"])
+            $script:ArtifactCompletionProbeState = @{
+                run_id = $ResolvedRunId
+                phase_name = $phaseName
+                phase_definition = $phaseDefinition
+                task_id = $taskId
+                phase_started_at_utc = $phaseStartedAtUtc
+            }
+            try {
+                $executionResult = Invoke-ExecutionRunner -JobSpec $jobSpec -PromptText $promptText -ProjectRoot $script:ProjectRoot -WorkingDirectory $script:ProjectDir -TimeoutPolicy (Get-StepTimeoutPolicy) -ArtifactCompletionProbe ${function:Invoke-PhaseArtifactCompletionProbe}
+            }
+            finally {
+                $script:ArtifactCompletionProbeState = $null
+            }
             $outputSync = Sync-PhaseOutputArtifacts -RunId $ResolvedRunId -PhaseName $phaseName -PhaseDefinition $phaseDefinition -TaskId $taskId
             $validationResult = Resolve-StepValidation -RunId $ResolvedRunId -PhaseName $phaseName -PhaseDefinition $phaseDefinition -OutputSyncResult $outputSync -TaskId $taskId
 
@@ -972,6 +1289,15 @@ function Invoke-EngineStep {
                     job_id = $jobSpec["job_id"]
                     phase = $phaseName
                     task_id = $taskId
+                }
+            }
+            if ([bool]$effectiveExecutionResult["recovered_from_artifacts"]) {
+                Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event @{
+                    type = "job.artifact_completion_recovered"
+                    job_id = $jobSpec["job_id"]
+                    phase = $phaseName
+                    task_id = $taskId
+                    artifact_completion = (ConvertTo-RelayHashtable -InputObject $effectiveExecutionResult["artifact_completion"])
                 }
             }
 
@@ -1049,7 +1375,7 @@ function Invoke-EngineStep {
                     Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event @{
                         type = "run.failed"
                         reason = $mutationAction["reason"]
-                        failure_class = $executionResult["failure_class"]
+                        failure_class = $effectiveExecutionResult["failure_class"]
                     }
                 }
                 "CompleteRun" {
@@ -1062,7 +1388,7 @@ function Invoke-EngineStep {
             return @{
                 mode = "engine"
                 action = $nextAction
-                job = $executionResult
+                job = $effectiveExecutionResult
                 validation = $validationResult["validation"]
                 output_sync = $outputSync
                 mutation_action = $mutationAction
