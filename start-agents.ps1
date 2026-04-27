@@ -318,12 +318,13 @@ Write-Host ""
 
 $AgentScript = Join-Path $ProjectRoot "agent-loop.ps1"
 $MonitorScript = Join-Path $ProjectRoot "watch-run.ps1"
-$WorkerCmd = "& '$AgentScript' -Role orchestrator -ConfigFile '$ConfigFile' -InteractiveApproval"
+$Utf8Bootstrap = '[Console]::InputEncoding=[System.Text.Encoding]::UTF8; [Console]::OutputEncoding=[System.Text.Encoding]::UTF8; $OutputEncoding=[System.Text.Encoding]::UTF8'
+$WorkerCmd = "$Utf8Bootstrap; & '$AgentScript' -Role orchestrator -ConfigFile '$ConfigFile' -InteractiveApproval"
 $MonitorCmd = if ($ActiveRunId) {
-    "& '$MonitorScript' -ConfigFile '$ConfigFile' -RunId '$ActiveRunId'"
+    "$Utf8Bootstrap; & '$MonitorScript' -ConfigFile '$ConfigFile' -RunId '$ActiveRunId'"
 }
 else {
-    "& '$MonitorScript' -ConfigFile '$ConfigFile'"
+    "$Utf8Bootstrap; & '$MonitorScript' -ConfigFile '$ConfigFile'"
 }
 
 Write-Host "Launching visible terminal..." -ForegroundColor Green

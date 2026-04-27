@@ -14,8 +14,11 @@ function Get-FakeProviderInvocationSpec {
 
     $scriptLines = @()
     if ($fakeMode -eq "echo_prompt") {
+        $scriptLines += '[Console]::InputEncoding = [System.Text.Encoding]::UTF8'
+        $scriptLines += '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8'
+        $scriptLines += '$OutputEncoding = [System.Text.Encoding]::UTF8'
         $scriptLines += '$inputText = [Console]::In.ReadToEnd()'
-        $scriptLines += 'Write-Output ("PROMPT:" + $inputText.Trim())'
+        $scriptLines += "Write-Output ('PROMPT:' + " + '$inputText.Trim())'
     }
     elseif (-not [string]::IsNullOrWhiteSpace($stdoutText)) {
         $escapedStdout = $stdoutText.Replace("'", "''")

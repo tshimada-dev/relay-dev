@@ -334,11 +334,15 @@ function Invoke-ExecutionAttempt {
     $processInfo.RedirectStandardInput = $true
     $processInfo.RedirectStandardOutput = $true
     $processInfo.RedirectStandardError = $true
+    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+    if ($processInfo.PSObject.Properties.Name -contains "StandardInputEncoding") {
+        $processInfo.StandardInputEncoding = $utf8NoBom
+    }
     if ($processInfo.PSObject.Properties.Name -contains "StandardOutputEncoding") {
-        $processInfo.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+        $processInfo.StandardOutputEncoding = $utf8NoBom
     }
     if ($processInfo.PSObject.Properties.Name -contains "StandardErrorEncoding") {
-        $processInfo.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+        $processInfo.StandardErrorEncoding = $utf8NoBom
     }
 
     $process = [System.Diagnostics.Process]::new()

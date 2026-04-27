@@ -884,6 +884,23 @@ try {
     Assert-Equal $successJobMetadata["status"] "finished" "Execution runner should persist finished job metadata"
     Assert-Equal $successJobMetadata["result_status"] "succeeded" "Finished job metadata should store normalized result status"
 
+    $utf8Prompt = "勤怠シフト承認"
+    $echoPromptResult = Invoke-ExecutionRunner -JobSpec @{
+        run_id = "run-fake-provider"
+        job_id = "job-fake-echo-prompt"
+        phase = "Phase1"
+        role = "implementer"
+        provider = "fake-provider"
+        fake_mode = "echo_prompt"
+    } -PromptText $utf8Prompt -ProjectRoot $tempFakeRoot -WorkingDirectory $tempFakeRoot -TimeoutPolicy @{
+        warn_after_sec = 0
+        retry_after_sec = 0
+        abort_after_sec = 0
+        max_retries = 0
+    }
+    Assert-Equal $echoPromptResult["result_status"] "succeeded" "Fake provider prompt echo should succeed"
+    Assert-Contains (Get-Content -Path $echoPromptResult["stdout_path"] -Raw -Encoding UTF8) "PROMPT:$utf8Prompt" "Execution runner should preserve UTF-8 prompt text through provider stdin"
+
     $failureResult = Invoke-ExecutionRunner -JobSpec @{
         run_id = "run-fake-provider"
         job_id = "job-fake-failure"
@@ -1401,6 +1418,10 @@ $startAgentsPs1Text = Get-Content -Path $startAgentsPs1Path -Raw -Encoding UTF8
 Assert-Contains $startAgentsPs1Text "Get-CanonicalRunSummary" "Windows launcher should inspect canonical run state before legacy status.yaml"
 Assert-Contains $startAgentsPs1Text '$resumeSource -eq "runs/current-run.json"' "Windows launcher should resume canonical runs without legacy phase overrides"
 Assert-Contains $startAgentsPs1Text "#requires -Version 7.0" "Windows launcher should fail fast outside PowerShell 7"
+Assert-Contains $startAgentsPs1Text '[Console]::InputEncoding=[System.Text.Encoding]::UTF8' "Windows launcher should seed worker terminals with UTF-8 encoding"
+$executionRunnerPath = Join-Path $repoRoot "app/execution/execution-runner.ps1"
+$executionRunnerText = Get-Content -Path $executionRunnerPath -Raw -Encoding UTF8
+Assert-Contains $executionRunnerText "StandardInputEncoding" "Execution runner should opt into UTF-8 stdin when the runtime supports it"
 
 Write-Host "[11/12] Testing engine-driven CLI step..."
 $cliRunId = "run-cli-step-" + [guid]::NewGuid().ToString("N")
