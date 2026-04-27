@@ -141,6 +141,35 @@ function Stop-ExecutionProcessTree {
         return
     }
 
+    try {
+        if (-not $Process.HasExited) {
+            $killTreeMethod = $Process.GetType().GetMethod("Kill", [type[]]@([bool]))
+            if ($null -ne $killTreeMethod) {
+                $Process.Kill($true)
+                return
+            }
+        }
+    }
+    catch {
+    }
+
+    $isWindowsPlatform = $false
+    try {
+        $isWindowsPlatform = [bool]$IsWindows -or $env:OS -eq "Windows_NT"
+    }
+    catch {
+        $isWindowsPlatform = $env:OS -eq "Windows_NT"
+    }
+
+    if (-not $isWindowsPlatform) {
+        try {
+            Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+        }
+        catch {
+        }
+        return
+    }
+
     $allProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
     $childrenByParent = @{}
     foreach ($candidate in $allProcesses) {
