@@ -485,6 +485,13 @@ cli:
 - [config/settings-gemini.yaml.example](./config/settings-gemini.yaml.example): Gemini 用サンプル
 - [config/settings-copilot-cli.yaml.example](./config/settings-copilot-cli.yaml.example): Copilot 用サンプル
 
+Windows で visible worker を起動する例:
+
+```powershell
+pwsh -NoLogo -NoProfile -File .\start-agents.ps1 -ConfigFile config/settings-copilot-cli.yaml.example
+pwsh -NoLogo -NoProfile -File .\start-agents.ps1 -ConfigFile config/settings-gemini.yaml.example
+```
+
 ## 最短の使い方
 
 ### Skill ベースで起動する場合

@@ -24,6 +24,7 @@ function Get-ProviderInvocationSpec {
         '^(fake|fake-provider)$' { return (Get-FakeProviderInvocationSpec -JobSpec $JobSpec) }
         '^(codex|codex-cli)$' { return (Get-CodexProviderInvocationSpec -JobSpec $JobSpec) }
         '^(gemini|gemini-cli)$' { return (Get-GeminiProviderInvocationSpec -JobSpec $JobSpec) }
+        '^(copilot|copilot-cli)$' { return (Get-CopilotProviderInvocationSpec -JobSpec $JobSpec) }
         default { return (Get-GenericCliProviderInvocationSpec -JobSpec $JobSpec) }
     }
 }

@@ -31,9 +31,121 @@ function Get-ExecutionJobDirectory {
 }
 
 function Join-ExecutionArguments {
-    param([Parameter(Mandatory)][string[]]$Parts)
+    param([Parameter(Mandatory)][AllowEmptyString()][string[]]$Parts)
 
     return (($Parts | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }) -join " ")
+}
+
+function Quote-ExecutionArgument {
+    param([AllowNull()][string]$Value)
+
+    if ($null -eq $Value -or $Value.Length -eq 0) {
+        return '""'
+    }
+
+    if ($Value -notmatch '[\s"]') {
+        return $Value
+    }
+
+    $builder = [System.Text.StringBuilder]::new()
+    $null = $builder.Append('"')
+    $backslashCount = 0
+
+    foreach ($character in $Value.ToCharArray()) {
+        if ($character -eq '\\') {
+            $backslashCount++
+            continue
+        }
+
+        if ($character -eq '"') {
+            $null = $builder.Append(('\\' * (($backslashCount * 2) + 1)))
+            $null = $builder.Append('"')
+            $backslashCount = 0
+            continue
+        }
+
+        if ($backslashCount -gt 0) {
+            $null = $builder.Append(('\\' * $backslashCount))
+            $backslashCount = 0
+        }
+
+        $null = $builder.Append($character)
+    }
+
+    if ($backslashCount -gt 0) {
+        $null = $builder.Append(('\\' * ($backslashCount * 2)))
+    }
+
+    $null = $builder.Append('"')
+    return $builder.ToString()
+}
+
+function Get-ExecutionPromptMode {
+    param([Parameter(Mandatory)]$InvocationSpec)
+
+    $spec = ConvertTo-RelayHashtable -InputObject $InvocationSpec
+    $promptMode = [string]$spec["prompt_mode"]
+    if ([string]::IsNullOrWhiteSpace($promptMode)) {
+        return "stdin"
+    }
+
+    return $promptMode.ToLowerInvariant()
+}
+
+function Get-ExecutionPromptFlag {
+    param([Parameter(Mandatory)]$InvocationSpec)
+
+    $spec = ConvertTo-RelayHashtable -InputObject $InvocationSpec
+    $promptFlag = [string]$spec["prompt_flag"]
+    if ([string]::IsNullOrWhiteSpace($promptFlag)) {
+        return "-p"
+    }
+
+    return $promptFlag
+}
+
+function Get-ExecutionArgumentsForAttempt {
+    param(
+        [Parameter(Mandatory)]$InvocationSpec,
+        [Parameter(Mandatory)][string]$PromptText,
+        [switch]$ForDisplay
+    )
+
+    $spec = ConvertTo-RelayHashtable -InputObject $InvocationSpec
+    $arguments = [string]$spec["arguments"]
+    if ((Get-ExecutionPromptMode -InvocationSpec $spec) -ne "argv") {
+        return $arguments
+    }
+
+    $promptToken = if ($ForDisplay) { "<prompt>" } else { Quote-ExecutionArgument -Value $PromptText }
+    return (Join-ExecutionArguments -Parts @(
+            $arguments
+            (Get-ExecutionPromptFlag -InvocationSpec $spec)
+            $promptToken
+        ))
+}
+
+function Apply-ExecutionEnvironmentOverrides {
+    param(
+        [Parameter(Mandatory)]$ProcessInfo,
+        [Parameter(Mandatory)]$InvocationSpec
+    )
+
+    $spec = ConvertTo-RelayHashtable -InputObject $InvocationSpec
+    $environment = ConvertTo-RelayHashtable -InputObject $spec["environment"]
+    if (-not ($environment -is [System.Collections.IDictionary])) {
+        return
+    }
+
+    foreach ($name in $environment.Keys) {
+        $value = [string]$environment[$name]
+        if ($ProcessInfo.PSObject.Properties.Name -contains "Environment") {
+            $ProcessInfo.Environment[[string]$name] = $value
+        }
+        else {
+            $ProcessInfo.EnvironmentVariables[[string]$name] = $value
+        }
+    }
 }
 
 function Resolve-ProcessInvocationSpec {
@@ -326,16 +438,19 @@ function Invoke-ExecutionAttempt {
     }
 
     $resolvedInvocation = Resolve-ProcessInvocationSpec -InvocationSpec $InvocationSpec
+    $promptMode = Get-ExecutionPromptMode -InvocationSpec $resolvedInvocation
+    $executionArguments = Get-ExecutionArgumentsForAttempt -InvocationSpec $resolvedInvocation -PromptText $PromptText
+    $displayArguments = Get-ExecutionArgumentsForAttempt -InvocationSpec $resolvedInvocation -PromptText $PromptText -ForDisplay
     $processInfo = New-Object System.Diagnostics.ProcessStartInfo
     $processInfo.FileName = $resolvedInvocation["command"]
-    $processInfo.Arguments = [string]$resolvedInvocation["arguments"]
+    $processInfo.Arguments = $executionArguments
     $processInfo.WorkingDirectory = $WorkingDirectory
     $processInfo.UseShellExecute = $false
-    $processInfo.RedirectStandardInput = $true
+    $processInfo.RedirectStandardInput = $promptMode -eq "stdin"
     $processInfo.RedirectStandardOutput = $true
     $processInfo.RedirectStandardError = $true
     $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-    if ($processInfo.PSObject.Properties.Name -contains "StandardInputEncoding") {
+    if ($processInfo.RedirectStandardInput -and $processInfo.PSObject.Properties.Name -contains "StandardInputEncoding") {
         $processInfo.StandardInputEncoding = $utf8NoBom
     }
     if ($processInfo.PSObject.Properties.Name -contains "StandardOutputEncoding") {
@@ -344,6 +459,7 @@ function Invoke-ExecutionAttempt {
     if ($processInfo.PSObject.Properties.Name -contains "StandardErrorEncoding") {
         $processInfo.StandardErrorEncoding = $utf8NoBom
     }
+    Apply-ExecutionEnvironmentOverrides -ProcessInfo $processInfo -InvocationSpec $resolvedInvocation
 
     $process = [System.Diagnostics.Process]::new()
     $process.StartInfo = $processInfo
@@ -355,7 +471,7 @@ function Invoke-ExecutionAttempt {
             pid = $process.Id
             started_at = $startedAt.ToString("o")
             command = $resolvedInvocation["command"]
-            arguments = $resolvedInvocation["arguments"]
+            arguments = $displayArguments
         }
     }
 
@@ -367,18 +483,20 @@ function Invoke-ExecutionAttempt {
     $stderrSubscription = Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -SourceIdentifier $stderrEventId
     $process.BeginOutputReadLine()
     $process.BeginErrorReadLine()
-    try {
-        $process.StandardInput.Write($PromptText)
-    }
-    catch {
-        # Some providers may exit before consuming stdin. Treat this as non-fatal and
-        # normalize based on the provider's exit code instead.
-    }
-    finally {
+    if ($promptMode -eq "stdin") {
         try {
-            $process.StandardInput.Close()
+            $process.StandardInput.Write($PromptText)
         }
         catch {
+            # Some providers may exit before consuming stdin. Treat this as non-fatal and
+            # normalize based on the provider's exit code instead.
+        }
+        finally {
+            try {
+                $process.StandardInput.Close()
+            }
+            catch {
+            }
         }
     }
 

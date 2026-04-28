@@ -84,6 +84,7 @@ function Resolve-PromptPackage {
     $providerKey = switch -Regex ($Provider.ToLowerInvariant()) {
         'codex' { "codex-cli.md" }
         'gemini' { "gemini-cli.md" }
+        'copilot' { "copilot-cli.md" }
         default { "default.md" }
     }
     $providerFile = Join-Path $ProjectRoot "app\prompts\providers\$providerKey"

@@ -26,6 +26,8 @@ $AppCli = Join-Path $ProjectRoot "app/cli.ps1"
 $Config = Read-Config -Path $ConfigFile
 
 $CliCommand = Get-DefaultValue $Config["cli.command"]          "gemini-cli"
+$ImplementerCommand = Get-DefaultValue $Config["cli.implementer_command"] $CliCommand
+$ReviewerCommand = Get-DefaultValue $Config["cli.reviewer_command"] $CliCommand
 $TerminalType = Get-DefaultValue $Config["terminal.type"]        "wt"
 $StatusFile = Get-DefaultValue $Config["paths.status_file"]    "queue/status.yaml"
 $LockFile = Get-DefaultValue $Config["paths.lock_file"]      "queue/status.lock"
@@ -151,9 +153,16 @@ if (-not (Get-Command "pwsh" -ErrorAction SilentlyContinue)) {
     Write-Error "pwsh is not installed or not in PATH."
     exit 1
 }
-if (-not (Get-Command $CliCommand -ErrorAction SilentlyContinue)) {
-    Write-Error "$CliCommand is not installed or not in PATH."
-    exit 1
+
+$requiredCliCommands = @($CliCommand, $ImplementerCommand, $ReviewerCommand) |
+    Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+    Select-Object -Unique
+
+foreach ($requiredCliCommand in $requiredCliCommands) {
+    if (-not (Get-Command $requiredCliCommand -ErrorAction SilentlyContinue)) {
+        Write-Error "$requiredCliCommand is not installed or not in PATH."
+        exit 1
+    }
 }
 
 # ============================================================
@@ -309,6 +318,12 @@ if (-not (Test-Path $DashboardFile) -or -not $resumeMode) {
 # ============================================================
 Write-Host "Starting engine worker..." -ForegroundColor Cyan
 Write-Host "  CLI:        $CliCommand"
+if ($ImplementerCommand -ne $CliCommand) {
+    Write-Host "  Implementer CLI: $ImplementerCommand"
+}
+if ($ReviewerCommand -ne $CliCommand) {
+    Write-Host "  Reviewer CLI:    $ReviewerCommand"
+}
 Write-Host "  Task:       $TaskFile"
 Write-Host "  ProjectDir: $ProjectDir"
 if ($ActiveRunId) {

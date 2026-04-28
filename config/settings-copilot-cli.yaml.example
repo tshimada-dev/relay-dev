@@ -6,11 +6,10 @@
 #   GitHub Copilot サブスクリプション（Individual, Business, または Enterprise）が必要です。
 #
 # 【インストール・セットアップ】
-#   1. VS Code に GitHub Copilot 拡張機能をインストール
-#   2. copilot CLI をインストール (Node.js 18+ が必要):
-#      npm install -g @github/copilot-cli   ※ パッケージ名はバージョンにより異なる場合あり
-#   3. 認証:
-#      copilot auth
+#   1. copilot CLI をインストール (Node.js 22+ が必要):
+#      npm install -g @github/copilot
+#      または winget install GitHub.Copilot
+#   2. 初回起動後に /login を実行するか、COPILOT_GITHUB_TOKEN / GH_TOKEN / GITHUB_TOKEN を設定
 #
 # 【インストール確認】
 #   copilot --version
@@ -19,7 +18,7 @@
 #   --autopilot              : 各ステップで確認を求めずに自律実行するモード
 #   --yolo                   : すべてのツール権限を自動許可（ファイル操作・コマンド実行等）
 #   --max-autopilot-continues: autoplotモードで自律継続する最大回数（大きいほど長い作業が可能）
-#   -p "プロンプト"           : 非対話モードでプロンプトを直接渡す（relay-dev 使用に必須）
+#   -p "プロンプト"           : 非対話モードでプロンプトを直接渡す（relay-dev が実行時に本文を付与）
 #
 # 【使用例1: すべての役割を copilot CLI で動かす】
 #   cli.command: copilot

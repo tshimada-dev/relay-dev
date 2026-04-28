@@ -5,8 +5,32 @@ function Remove-RelayPromptFlags {
         return ""
     }
 
-    $normalized = $Arguments -replace '(^|\s)(--prompt|-p)(?=\s|$)', ' '
+    $normalized = $Arguments
+    $normalized = $normalized -replace '(?<!\S)--prompt=(?:"(?:[^"\\]|\\.)*"|\S+)', ' '
+    $normalized = $normalized -replace '(?<!\S)--prompt(?=\s|$)\s+(?:"(?:[^"\\]|\\.)*"|\S+)', ' '
+    $normalized = $normalized -replace '(^|\s)(--prompt|-p)(?=\s|$)', ' '
     return ($normalized -replace '\s+', ' ').Trim()
+}
+
+function Get-RelayPromptFlag {
+    param(
+        [string]$Arguments,
+        [string]$DefaultFlag = ""
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Arguments)) {
+        return $DefaultFlag
+    }
+
+    if ($Arguments -match '(^|\s)--prompt(?=\s|=|$)') {
+        return "--prompt"
+    }
+
+    if ($Arguments -match '(^|\s)-p(?=\s|$)') {
+        return "-p"
+    }
+
+    return $DefaultFlag
 }
 
 function Get-GenericCliProviderInvocationSpec {
@@ -22,6 +46,7 @@ function Get-GenericCliProviderInvocationSpec {
         provider = if ($spec["provider"]) { [string]$spec["provider"] } else { "generic-cli" }
         command = $command
         arguments = Remove-RelayPromptFlags -Arguments ([string]$spec["flags"])
+        prompt_mode = "stdin"
     }
 }
 

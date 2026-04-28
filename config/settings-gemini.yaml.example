@@ -1,9 +1,16 @@
-# Relay-Dev Configuration File
-# P1 Improvements Enabled (2026-02-24):
-# - State transition validation (auto-correction on phase mismatch)
-# - Forbidden command detection (git push, destructive operations)
-# - Test result verification (warns when test_output.log is missing after Phase6)
-# - Config validation (type checking, timeout order validation)
+# Gemini CLI (gemini コマンド) 用の設定例
+# このファイルをsettings.yamlにコピーして使用してください
+# cp config/settings-gemini.yaml.example config/settings.yaml
+#
+# 【インストール・セットアップ】
+#   1. gemini CLI をインストール (Node.js 20+ が必要):
+#      npm install -g @google/gemini-cli
+#   2. 認証:
+#      gemini を起動して Google ログインを完了する
+#      または GEMINI_API_KEY / GOOGLE_API_KEY を設定する
+#
+# 【インストール確認】
+#   gemini --version
 
 cli:
   command: gemini          # 共通デフォルト（role別未設定時のフォールバック）

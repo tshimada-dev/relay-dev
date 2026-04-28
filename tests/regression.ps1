@@ -403,6 +403,7 @@ Write-Host "[4/11] Testing provider adapter argument normalization..."
 . (Join-Path $repoRoot "app/execution/providers/generic-cli.ps1")
 . (Join-Path $repoRoot "app/execution/providers/codex.ps1")
 . (Join-Path $repoRoot "app/execution/providers/gemini.ps1")
+. (Join-Path $repoRoot "app/execution/providers/copilot.ps1")
 . (Join-Path $repoRoot "app/execution/providers/fake-provider.ps1")
 . (Join-Path $repoRoot "app/execution/provider-adapter.ps1")
 . (Join-Path $repoRoot "app/execution/execution-runner.ps1")
@@ -414,6 +415,25 @@ $providerSpec = Get-ProviderInvocationSpec -JobSpec @{
 }
 Assert-Equal $providerSpec["arguments"] "-y" "Provider adapter should strip prompt flags from CLI arguments"
 Assert-Equal $providerSpec["provider"] "gemini-cli" "Provider adapter should preserve normalized provider name"
+Assert-Equal $providerSpec["environment"]["GEMINI_CLI_TRUST_WORKSPACE"] "true" "Gemini provider should trust the workspace for headless runs"
+
+$copilotSpec = Get-ProviderInvocationSpec -JobSpec @{
+    provider = "copilot"
+    command = "copilot"
+    flags = "--autopilot --yolo --max-autopilot-continues 30 -p"
+}
+Assert-Equal $copilotSpec["provider"] "copilot-cli" "Copilot provider should normalize to copilot-cli"
+Assert-Equal $copilotSpec["prompt_mode"] "argv" "Copilot provider should pass prompts via CLI arguments"
+Assert-Equal $copilotSpec["prompt_flag"] "-p" "Copilot provider should preserve the prompt flag"
+Assert-Equal $copilotSpec["arguments"] "--autopilot --yolo --max-autopilot-continues 30" "Copilot provider should strip prompt flags from base arguments"
+Assert-True (-not [string]::IsNullOrWhiteSpace([string]$copilotSpec["environment"]["PATH"])) "Copilot provider should propagate PATH for GitHub CLI discovery"
+
+$copilotInvocation = Resolve-ProcessInvocationSpec -InvocationSpec $copilotSpec
+$copilotArguments = Get-ExecutionArgumentsForAttempt -InvocationSpec $copilotInvocation -PromptText "hello world"
+Assert-Contains $copilotArguments '-p "hello world"' "Copilot execution should append the prompt as a quoted CLI argument"
+
+$copilotDisplayArguments = Get-ExecutionArgumentsForAttempt -InvocationSpec $copilotInvocation -PromptText "hello world" -ForDisplay
+Assert-Contains $copilotDisplayArguments "-p <prompt>" "Copilot execution logs should redact the raw prompt text"
 
 $timeoutRecovery = Resolve-EffectiveExecutionResult -ExecutionResult @{
     result_status = "failed"
@@ -454,6 +474,9 @@ Write-Host "[5/11] Testing typed artifacts and validator..."
 . (Join-Path $repoRoot "app/core/artifact-repository.ps1")
 . (Join-Path $repoRoot "app/core/artifact-validator.ps1")
 . (Join-Path $repoRoot "app/phases/phase-registry.ps1")
+
+$copilotPromptPackage = Resolve-PromptPackage -ProjectRoot $repoRoot -Phase "Phase1" -Role "implementer" -Provider "copilot-cli"
+Assert-Contains $copilotPromptPackage["provider_hints_ref"] "copilot-cli.md" "Prompt package should load Copilot-specific provider hints"
 
 $tempArtifactRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("relay-dev-artifact-test-" + [guid]::NewGuid().ToString("N"))
 try {

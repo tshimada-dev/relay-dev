@@ -6,6 +6,9 @@ function Get-GeminiProviderInvocationSpec {
     if (-not $spec["command"]) {
         $spec["command"] = "gemini"
     }
+    $spec["environment"] = @{
+        GEMINI_CLI_TRUST_WORKSPACE = "true"
+    }
     return $spec
 }
 
