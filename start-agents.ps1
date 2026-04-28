@@ -17,6 +17,40 @@ $ActiveRunId = ""
 $UseCliBootstrap = $false
 $AppCli = Join-Path $ProjectRoot "app/cli.ps1"
 
+function Sync-RelayDevProcessPath {
+    $entries = New-Object System.Collections.Generic.List[string]
+    $seen = @{}
+
+    foreach ($sourcePath in @(
+            $env:Path,
+            [System.Environment]::GetEnvironmentVariable("Path", "Machine"),
+            [System.Environment]::GetEnvironmentVariable("Path", "User")
+        )) {
+        if ([string]::IsNullOrWhiteSpace($sourcePath)) {
+            continue
+        }
+
+        foreach ($entry in @($sourcePath -split [System.IO.Path]::PathSeparator)) {
+            if ([string]::IsNullOrWhiteSpace($entry)) {
+                continue
+            }
+
+            $normalized = $entry.Trim()
+            $key = $normalized.ToLowerInvariant()
+            if ($seen.ContainsKey($key)) {
+                continue
+            }
+
+            $seen[$key] = $true
+            $entries.Add($normalized) | Out-Null
+        }
+    }
+
+    $env:Path = ($entries -join [System.IO.Path]::PathSeparator)
+}
+
+Sync-RelayDevProcessPath
+
 # ============================================================
 # Config Loading (shared with agent-loop.ps1)
 # ============================================================

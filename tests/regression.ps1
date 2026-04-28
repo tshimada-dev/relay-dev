@@ -403,6 +403,7 @@ Write-Host "[4/11] Testing provider adapter argument normalization..."
 . (Join-Path $repoRoot "app/execution/providers/generic-cli.ps1")
 . (Join-Path $repoRoot "app/execution/providers/codex.ps1")
 . (Join-Path $repoRoot "app/execution/providers/gemini.ps1")
+. (Join-Path $repoRoot "app/execution/providers/claude.ps1")
 . (Join-Path $repoRoot "app/execution/providers/copilot.ps1")
 . (Join-Path $repoRoot "app/execution/providers/fake-provider.ps1")
 . (Join-Path $repoRoot "app/execution/provider-adapter.ps1")
@@ -416,6 +417,17 @@ $providerSpec = Get-ProviderInvocationSpec -JobSpec @{
 Assert-Equal $providerSpec["arguments"] "-y" "Provider adapter should strip prompt flags from CLI arguments"
 Assert-Equal $providerSpec["provider"] "gemini-cli" "Provider adapter should preserve normalized provider name"
 Assert-Equal $providerSpec["environment"]["GEMINI_CLI_TRUST_WORKSPACE"] "true" "Gemini provider should trust the workspace for headless runs"
+
+$claudeSpec = Get-ProviderInvocationSpec -JobSpec @{
+    provider = "claudecode"
+    command = "claude"
+    flags = "--dangerously-skip-permissions -p"
+}
+Assert-Equal $claudeSpec["provider"] "claude-code" "Claude provider should normalize to claude-code"
+Assert-Equal $claudeSpec["prompt_mode"] "argv" "Claude provider should pass prompts via CLI arguments"
+Assert-Equal $claudeSpec["prompt_flag"] "-p" "Claude provider should preserve the prompt flag"
+Assert-Equal $claudeSpec["arguments"] "--dangerously-skip-permissions" "Claude provider should strip prompt flags from base arguments"
+Assert-True (-not [string]::IsNullOrWhiteSpace([string]$claudeSpec["environment"]["PATH"])) "Claude provider should propagate PATH for CLI discovery"
 
 $copilotSpec = Get-ProviderInvocationSpec -JobSpec @{
     provider = "copilot"
@@ -474,6 +486,9 @@ Write-Host "[5/11] Testing typed artifacts and validator..."
 . (Join-Path $repoRoot "app/core/artifact-repository.ps1")
 . (Join-Path $repoRoot "app/core/artifact-validator.ps1")
 . (Join-Path $repoRoot "app/phases/phase-registry.ps1")
+
+$claudePromptPackage = Resolve-PromptPackage -ProjectRoot $repoRoot -Phase "Phase1" -Role "implementer" -Provider "claude-code"
+Assert-Contains $claudePromptPackage["provider_hints_ref"] "claude-code.md" "Prompt package should load Claude-specific provider hints"
 
 $copilotPromptPackage = Resolve-PromptPackage -ProjectRoot $repoRoot -Phase "Phase1" -Role "implementer" -Provider "copilot-cli"
 Assert-Contains $copilotPromptPackage["provider_hints_ref"] "copilot-cli.md" "Prompt package should load Copilot-specific provider hints"

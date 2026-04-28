@@ -1,18 +1,22 @@
-# Codex CLI 用 settings サンプル
-# 使い方:
-#   Copy-Item config/setting.yaml.sample config/settings.yaml
+# Codex CLI (codex コマンド) 用の設定例
+# このファイルをsettings.yamlにコピーして使用してください
+# cp config/settings-codex.yaml.example config/settings.yaml
 #
-# Codex CLI インストール:
-#   npm install -g @openai/codex
-#   codex login
+# 【インストール・セットアップ】
+#   1. Codex CLI をインストール:
+#      npm install -g @openai/codex
+#   2. 認証:
+#      codex login
+#
+# 【インストール確認】
 #   codex --version
 
 cli:
   command: "codex"
   flags: "--ask-for-approval never exec --skip-git-repo-check --sandbox workspace-write"
-  implementer_command: ""
+  implementer_command: ""  # 空欄 = command を使用
   implementer_flags: ""
-  reviewer_command: ""
+  reviewer_command: ""     # 空欄 = command を使用
   reviewer_flags: ""
 
 escalation:
@@ -39,8 +43,7 @@ log:
   rotation_count: 5
 
 paths:
-  project_dir: ".."
-  # DESIGN.md path. Relative paths are resolved from paths.project_dir.
+  project_dir: ".."           # コード出力先ディレクトリ。空 = relay-dev ディレクトリ自身。".." = 親ディレクトリ
   design_file: "DESIGN.md"
   status_file: queue/status.yaml
   lock_file: queue/status.lock

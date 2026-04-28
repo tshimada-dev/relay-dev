@@ -84,6 +84,7 @@ function Resolve-PromptPackage {
     $providerKey = switch -Regex ($Provider.ToLowerInvariant()) {
         'codex' { "codex-cli.md" }
         'gemini' { "gemini-cli.md" }
+        'claude' { "claude-code.md" }
         'copilot' { "copilot-cli.md" }
         default { "default.md" }
     }

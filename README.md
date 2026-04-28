@@ -481,13 +481,15 @@ cli:
 設定ファイル:
 
 - [config/settings.yaml](./config/settings.yaml): 現在の実行設定
-- [config/setting-codex.yaml.sample](./config/setting-codex.yaml.sample): Codex 用サンプル
+- [config/settings-codex.yaml.example](./config/settings-codex.yaml.example): Codex 用サンプル
 - [config/settings-gemini.yaml.example](./config/settings-gemini.yaml.example): Gemini 用サンプル
+- [config/settings-claude.yaml.example](./config/settings-claude.yaml.example): Claude Code 用サンプル
 - [config/settings-copilot-cli.yaml.example](./config/settings-copilot-cli.yaml.example): Copilot 用サンプル
 
 Windows で visible worker を起動する例:
 
 ```powershell
+pwsh -NoLogo -NoProfile -File .\start-agents.ps1 -ConfigFile config/settings-claude.yaml.example
 pwsh -NoLogo -NoProfile -File .\start-agents.ps1 -ConfigFile config/settings-copilot-cli.yaml.example
 pwsh -NoLogo -NoProfile -File .\start-agents.ps1 -ConfigFile config/settings-gemini.yaml.example
 ```

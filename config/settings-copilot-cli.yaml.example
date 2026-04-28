@@ -63,7 +63,8 @@ log:
   rotation_count: 5
 
 paths:
-  project_dir: ".."           # コード出力先ディレクトリ。空 = relay-devディレクトリ自身。".." = 親ディレクトリ
+  project_dir: ".."           # コード出力先ディレクトリ。空 = relay-dev ディレクトリ自身。".." = 親ディレクトリ
+  design_file: "DESIGN.md"
   status_file: queue/status.yaml
   lock_file: queue/status.lock
   dashboard_file: dashboard.md

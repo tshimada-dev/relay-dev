@@ -1,20 +1,28 @@
-# Gemini CLI (gemini コマンド) 用の設定例
+# Claude Code (claude コマンド) 用の設定例
 # このファイルをsettings.yamlにコピーして使用してください
-# cp config/settings-gemini.yaml.example config/settings.yaml
+# cp config/settings-claude.yaml.example config/settings.yaml
+#
+# 【前提条件】
+#   Claude Code を使うには Claude の契約または Anthropic Console アカウントが必要です。
+#   Windows では Git for Windows が必要です。
 #
 # 【インストール・セットアップ】
-#   1. gemini CLI をインストール (Node.js 20+ が必要):
-#      npm install -g @google/gemini-cli
+#   1. Claude Code をインストール:
+#      irm https://claude.ai/install.ps1 | iex
 #   2. 認証:
-#      gemini を起動して Google ログインを完了する
-#      または GEMINI_API_KEY / GOOGLE_API_KEY を設定する
+#      claude auth login
+#      または claude を起動して /login を実行
 #
 # 【インストール確認】
-#   gemini --version
+#   claude -v
+#
+# 【主要フラグの説明】
+#   --dangerously-skip-permissions : 非対話実行で permission prompt を省略する
+#   -p "プロンプト"                : 非対話モードでプロンプトを直接渡す（relay-dev が実行時に本文を付与）
 
 cli:
-  command: "gemini"        # 共通デフォルト（role別未設定時のフォールバック）
-  flags: "-y -p"
+  command: "claude"
+  flags: "--dangerously-skip-permissions -p"
   implementer_command: ""  # 空欄 = command を使用
   implementer_flags: ""
   reviewer_command: ""     # 空欄 = command を使用
@@ -36,7 +44,7 @@ lock:
   retry_count: 30
   retry_delay_ms: 200
   timeout_sec: 300
-  loop_guard_wait_sec: 1800  # LOOP GUARD発火時の待機秒数（クォータ以外の失敗向けフォールバック）
+  loop_guard_wait_sec: 1800
 
 log:
   directory: logs
@@ -52,7 +60,7 @@ paths:
   task_file: tasks/task.md
 
 human_review:
-  enabled: false  # 完全自動で回す場合は false
+  enabled: true
   phases:
     - Phase3-1  # 設計書レビュー → ゲート: Phase4
     - Phase4-1  # タスク分解レビュー → ゲート: Phase5

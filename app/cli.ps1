@@ -39,6 +39,7 @@ Set-Location $script:ProjectRoot
 . (Join-Path $script:ProjectRoot "app/execution/providers/generic-cli.ps1")
 . (Join-Path $script:ProjectRoot "app/execution/providers/codex.ps1")
 . (Join-Path $script:ProjectRoot "app/execution/providers/gemini.ps1")
+. (Join-Path $script:ProjectRoot "app/execution/providers/claude.ps1")
 . (Join-Path $script:ProjectRoot "app/execution/providers/copilot.ps1")
 . (Join-Path $script:ProjectRoot "app/execution/providers/fake-provider.ps1")
 . (Join-Path $script:ProjectRoot "app/execution/provider-adapter.ps1")
