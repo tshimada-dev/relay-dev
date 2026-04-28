@@ -1,3 +1,7 @@
+if (-not (Get-Command Get-VisualContractSchema -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "visual-contract-schema.ps1")
+}
+
 function New-ArtifactValidationResult {
     return [ordered]@{
         valid = $true
@@ -504,25 +508,12 @@ function Test-VisualContractField {
         return
     }
 
-    $requiredKeys = @(
-        "mode",
-        "design_sources",
-        "visual_constraints",
-        "component_patterns",
-        "responsive_expectations",
-        "interaction_guidelines"
-    )
+    $requiredKeys = Get-VisualContractRequiredKeys
     Test-ArtifactRequiredKeys -Artifact $contract -Result $Result -Keys $requiredKeys -ArtifactId "$ArtifactId $FieldName"
     Test-ArtifactStringField -Artifact $contract -Result $Result -FieldName "mode"
-    Test-ArtifactEnumField -Artifact $contract -Result $Result -FieldName "mode" -AllowedValues @("not_applicable", "design_md", "reference_only", "custom")
+    Test-ArtifactEnumField -Artifact $contract -Result $Result -FieldName "mode" -AllowedValues (Get-VisualContractModeValues)
 
-    $detailFields = @(
-        "design_sources",
-        "visual_constraints",
-        "component_patterns",
-        "responsive_expectations",
-        "interaction_guidelines"
-    )
+    $detailFields = Get-VisualContractArrayFieldNames
     foreach ($detailField in $detailFields) {
         Test-ArtifactArrayField -Artifact $contract -Result $Result -FieldName $detailField -AllowEmpty
     }
@@ -1037,38 +1028,47 @@ function Test-ArtifactContract {
         [string]$Phase
     )
 
-    $normalizedArtifact = ConvertTo-RelayHashtable -InputObject $Artifact
+    $normalization = ConvertTo-RelayHashtable -InputObject (Normalize-ArtifactForValidation -ArtifactId $ArtifactId -Artifact $Artifact)
+    $normalizedArtifact = ConvertTo-RelayHashtable -InputObject $normalization["artifact"]
+    $normalizationWarnings = @($normalization["warnings"])
     if (-not ($normalizedArtifact -is [System.Collections.IDictionary])) {
         return [ordered]@{
             valid = $false
             errors = @("Artifact '$ArtifactId' must deserialize to an object.")
-            warnings = @()
+            warnings = $normalizationWarnings
         }
     }
 
-    switch ($ArtifactId) {
-        "phase0_context.json" { return (Test-Phase0ContextArtifact -Artifact $normalizedArtifact) }
-        "phase1_requirements.json" { return (Test-Phase1RequirementsArtifact -Artifact $normalizedArtifact) }
-        "phase2_info_gathering.json" { return (Test-Phase2InfoGatheringArtifact -Artifact $normalizedArtifact) }
-        "phase3_design.json" { return (Test-Phase3DesignArtifact -Artifact $normalizedArtifact) }
-        "phase3-1_verdict.json" { return (Test-Phase31VerdictArtifact -Artifact $normalizedArtifact) }
-        "phase4_tasks.json" { return (Test-Phase4TasksArtifact -Artifact $normalizedArtifact) }
-        "phase4-1_verdict.json" { return (Test-Phase41VerdictArtifact -Artifact $normalizedArtifact) }
-        "phase5_result.json" { return (Test-Phase5ResultArtifact -Artifact $normalizedArtifact) }
-        "phase5-1_verdict.json" { return (Test-Phase51VerdictArtifact -Artifact $normalizedArtifact) }
-        "phase5-2_verdict.json" { return (Test-Phase52VerdictArtifact -Artifact $normalizedArtifact) }
-        "phase6_result.json" { return (Test-Phase6ResultArtifact -Artifact $normalizedArtifact) }
-        "phase7_verdict.json" { return (Test-Phase7VerdictArtifact -Artifact $normalizedArtifact) }
-        "phase7-1_summary.json" { return (Test-Phase71SummaryArtifact -Artifact $normalizedArtifact) }
-        "phase8_release.json" { return (Test-Phase8ReleaseArtifact -Artifact $normalizedArtifact) }
+    $validationResult = switch ($ArtifactId) {
+        "phase0_context.json" { Test-Phase0ContextArtifact -Artifact $normalizedArtifact }
+        "phase1_requirements.json" { Test-Phase1RequirementsArtifact -Artifact $normalizedArtifact }
+        "phase2_info_gathering.json" { Test-Phase2InfoGatheringArtifact -Artifact $normalizedArtifact }
+        "phase3_design.json" { Test-Phase3DesignArtifact -Artifact $normalizedArtifact }
+        "phase3-1_verdict.json" { Test-Phase31VerdictArtifact -Artifact $normalizedArtifact }
+        "phase4_tasks.json" { Test-Phase4TasksArtifact -Artifact $normalizedArtifact }
+        "phase4-1_verdict.json" { Test-Phase41VerdictArtifact -Artifact $normalizedArtifact }
+        "phase5_result.json" { Test-Phase5ResultArtifact -Artifact $normalizedArtifact }
+        "phase5-1_verdict.json" { Test-Phase51VerdictArtifact -Artifact $normalizedArtifact }
+        "phase5-2_verdict.json" { Test-Phase52VerdictArtifact -Artifact $normalizedArtifact }
+        "phase6_result.json" { Test-Phase6ResultArtifact -Artifact $normalizedArtifact }
+        "phase7_verdict.json" { Test-Phase7VerdictArtifact -Artifact $normalizedArtifact }
+        "phase7-1_summary.json" { Test-Phase71SummaryArtifact -Artifact $normalizedArtifact }
+        "phase8_release.json" { Test-Phase8ReleaseArtifact -Artifact $normalizedArtifact }
         default {
-            return [ordered]@{
+            [ordered]@{
                 valid = $true
                 errors = @()
                 warnings = @("No validator registered for artifact '$ArtifactId'.")
             }
         }
     }
+
+    $validationResult = ConvertTo-RelayHashtable -InputObject $validationResult
+    if ($normalizationWarnings.Count -gt 0) {
+        $validationResult["warnings"] = @($validationResult["warnings"]) + $normalizationWarnings
+    }
+
+    return $validationResult
 }
 
 function Test-ArtifactRef {

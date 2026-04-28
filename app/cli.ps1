@@ -797,9 +797,35 @@ function Resolve-StepValidation {
         }
     }
 
+    $artifactId = [string]$validatorRef["artifact_id"]
+    $normalization = ConvertTo-RelayHashtable -InputObject (Normalize-ArtifactForValidation -ArtifactId $artifactId -Artifact $artifact)
+    $artifact = $normalization["artifact"]
+    $normalizationWarnings = @($normalization["warnings"])
+    if ([bool]$normalization["changed"]) {
+        $saveParams = @{
+            ProjectRoot = $script:ProjectRoot
+            RunId = $RunId
+            Scope = [string]$validatorRef["scope"]
+            Phase = [string]$validatorRef["phase"]
+            ArtifactId = $artifactId
+            Content = $artifact
+            AsJson = $true
+        }
+        if ([string]$validatorRef["scope"] -eq "task") {
+            $saveParams["TaskId"] = [string]$validatorRef["task_id"]
+        }
+
+        Save-Artifact @saveParams | Out-Null
+    }
+
+    $validation = ConvertTo-RelayHashtable -InputObject (Test-ArtifactContract -ArtifactId $artifactId -Artifact $artifact -Phase $PhaseName)
+    if ($normalizationWarnings.Count -gt 0) {
+        $validation["warnings"] = @($validation["warnings"]) + $normalizationWarnings
+    }
+
     return @{
         validator_ref = $validatorRef
-        validation = (Test-ArtifactRef -ProjectRoot $script:ProjectRoot -RunId $RunId -ArtifactRef $validatorRef)
+        validation = $validation
         artifact = $artifact
     }
 }
@@ -856,6 +882,7 @@ function New-EnginePromptText {
     }
 
     $phaseText = Read-OptionalUtf8File -Path ([string]$promptPackage["phase_prompt_ref"])
+    $phaseText = Expand-VisualContractPromptTemplates -Text $phaseText
     if (-not [string]::IsNullOrWhiteSpace($phaseText)) {
         $sections.Add("## Phase Instructions`n$phaseText")
     }

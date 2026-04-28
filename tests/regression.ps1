@@ -579,6 +579,68 @@ try {
     Assert-True ([bool]$phase3Write["validation"]["valid"]) "Phase3 artifact should validate"
     Assert-True ([bool]$phase6Write["validation"]["valid"]) "Phase6 artifact should validate"
     Assert-True ([bool]$phase7Write["validation"]["valid"]) "Phase7 artifact should validate"
+    $legacyPhase3Json = [ordered]@{
+        feature_list = @(@{ id = "F-legacy"; summary = "Legacy schema" })
+        api_definitions = @(@{ name = "GET /api/legacy" })
+        entities = @(@{ name = "LegacyView" })
+        constraints = @(@{ name = "Schema"; target = "Normalize visual_contract" })
+        state_transitions = @(@{ from = "draft"; to = "published" })
+        reuse_decisions = @(@{ target = "layout"; decision = "reuse" })
+        module_boundaries = @(@{ module = "ui/legacy"; responsibility = "Render legacy UI" })
+        public_interfaces = @(@{ name = "LegacyView"; kind = "component" })
+        allowed_dependencies = @(@{ from = "ui/legacy"; to = "ui/shared" })
+        forbidden_dependencies = @(@{ from = "ui/legacy"; to = "infra/db"; reason = "UI must stay pure" })
+        side_effect_boundaries = @(@{ effect = "network"; boundary = "hooks/useLegacyData" })
+        state_ownership = @(@{ state = "LegacyFilters"; owner = "ui/legacy" })
+        visual_contract = [ordered]@{
+            mode = "design_md"
+            design_sources = @("DESIGN.md")
+            visual_constraints = @("Keep the documented neutral workspace tone.")
+            component_patterns = [ordered]@{
+                buttons = [ordered]@{
+                    primary = "Use the compact filled button style."
+                }
+            }
+            responsive_expectations = [ordered]@{
+                mobile_employee = [ordered]@{
+                    breakpoint = "<= 640px"
+                    layout = "single column"
+                }
+            }
+            interaction_guidelines = [ordered]@{
+                loading = [ordered]@{
+                    button = "Show a spinner and disable repeat taps."
+                }
+            }
+        }
+    }
+    $legacyNormalization = Normalize-ArtifactForValidation -ArtifactId "phase3_design.json" -Artifact $legacyPhase3Json
+    $legacyNormalizedArtifact = ConvertTo-RelayHashtable -InputObject $legacyNormalization["artifact"]
+    Assert-True ([bool]$legacyNormalization["changed"]) "Legacy Phase3 visual_contract maps should be normalized before validation"
+    Assert-Contains (@($legacyNormalization["warnings"]) -join "`n") "visual_contract.component_patterns" "Normalization warnings should explain which Phase3 field was repaired"
+    Assert-True ($legacyNormalizedArtifact["visual_contract"]["component_patterns"] -is [System.Collections.IEnumerable] -and -not ($legacyNormalizedArtifact["visual_contract"]["component_patterns"] -is [string]) -and -not ($legacyNormalizedArtifact["visual_contract"]["component_patterns"] -is [System.Collections.IDictionary])) "Normalized Phase3 component_patterns should become an array"
+    $legacyPhase3Validation = Test-ArtifactContract -ArtifactId "phase3_design.json" -Artifact $legacyPhase3Json -Phase "Phase3"
+    Assert-True ([bool]$legacyPhase3Validation["valid"]) "Legacy Phase3 visual_contract maps should validate after normalization"
+    Assert-Contains (@($legacyPhase3Validation["warnings"]) -join "`n") "visual_contract.responsive_expectations" "Phase3 validation should preserve normalization warnings"
+
+    $legacyPhase4Tasks = [ordered]@{
+        tasks = @(
+            [ordered]@{
+                task_id = "T-legacy"
+                purpose = "Carry normalized visual contract into tasks"
+                changed_files = @("src/legacy.tsx")
+                acceptance_criteria = @("Legacy task keeps the documented UI contract")
+                boundary_contract = (New-BoundaryContract)
+                visual_contract = $legacyPhase3Json["visual_contract"]
+                dependencies = @()
+                tests = @("npm test")
+                complexity = "small"
+            }
+        )
+    }
+    $legacyPhase4Validation = Test-ArtifactContract -ArtifactId "phase4_tasks.json" -Artifact $legacyPhase4Tasks -Phase "Phase4"
+    Assert-True ([bool]$legacyPhase4Validation["valid"]) "Legacy task visual_contract maps should validate after normalization in Phase4"
+    Assert-Contains (@($legacyPhase4Validation["warnings"]) -join "`n") "tasks[T-legacy].visual_contract.component_patterns" "Phase4 normalization warnings should include the task path"
     Assert-True (Test-Path (Join-Path $tempArtifactRoot "outputs/req-compat/phase3_design.md")) "Run-scoped markdown should be projected to outputs/"
     Assert-True (Test-Path (Join-Path $tempArtifactRoot "outputs/req-compat/tasks/T-01/phase6_result.json")) "Task-scoped JSON should be projected to outputs/"
     Assert-True (Test-Path (Join-Path $tempArtifactRoot "outputs/req-compat/.tasks/T-01_completed.md")) "Phase6 verdict should create compatibility completion marker"
@@ -1419,7 +1481,19 @@ $phase3PromptText = Get-Content -Path $phase3PromptRef -Raw -Encoding UTF8
 Assert-Contains $phase3PromptText "app/prompts/phases/examples/phase3_example.md" "Phase3 prompt should reference in-tree example guidance"
 Assert-Contains $phase3PromptText "module_boundaries" "Phase3 prompt should require explicit module boundary design"
 Assert-Contains $phase3PromptText "visual_contract" "Phase3 prompt should require explicit visual contracts"
+Assert-Contains $phase3PromptText "{{VISUAL_CONTRACT_SCHEMA}}" "Phase3 prompt should source visual_contract schema from the shared template"
 Assert-True (-not $phase3PromptText.Contains("templates/examples/phase3_example.md")) "Phase3 prompt should not reference templates examples"
+$expandedPhase3PromptText = Expand-VisualContractPromptTemplates -Text $phase3PromptText
+Assert-Contains $expandedPhase3PromptText '`component_patterns`: array' "Expanded Phase3 prompt should state that component_patterns must be an array"
+Assert-Contains $expandedPhase3PromptText "連想オブジェクトは許可しない" "Expanded Phase3 prompt should forbid associative-object visual_contract output"
+Assert-NotContains $expandedPhase3PromptText "配列またはオブジェクトのどちらでもよい" "Expanded Phase3 prompt should not preserve the ambiguous array-or-object guidance"
+
+$phase4PromptDefinition = Get-PhaseDefinition -ProjectRoot $repoRoot -Phase "Phase4" -Provider "codex-cli"
+$phase4PromptRef = [string]$phase4PromptDefinition["prompt_package"]["phase_prompt_ref"]
+$phase4PromptText = Get-Content -Path $phase4PromptRef -Raw -Encoding UTF8
+Assert-Contains $phase4PromptText "{{VISUAL_CONTRACT_SCHEMA}}" "Phase4 prompt should source visual_contract schema from the shared template"
+$expandedPhase4PromptText = Expand-VisualContractPromptTemplates -Text $phase4PromptText
+Assert-Contains $expandedPhase4PromptText '`responsive_expectations`: array' "Expanded Phase4 prompt should state that responsive_expectations must be an array"
 
 $phase6Definition = Get-PhaseDefinition -ProjectRoot $repoRoot -Phase "Phase6" -Provider "codex-cli"
 $phase6PromptRef = [string]$phase6Definition["prompt_package"]["phase_prompt_ref"]

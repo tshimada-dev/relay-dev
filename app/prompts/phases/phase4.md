@@ -44,14 +44,9 @@
 - `side_effect_boundaries`
 - `state_ownership`
 
-`visual_contract` は各 task が守るべき視覚設計の task-scoped 正本であり、以下のキーを必ず持つこと。
+`visual_contract` は各 task が守るべき視覚設計の task-scoped 正本であり、以下の schema を厳守すること。
 
-- `mode`
-- `design_sources`
-- `visual_constraints`
-- `component_patterns`
-- `responsive_expectations`
-- `interaction_guidelines`
+{{VISUAL_CONTRACT_SCHEMA}}
 
 ## 品質基準
 
