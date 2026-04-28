@@ -9,7 +9,6 @@ function Test-ConfigValues {
         "escalation.phase2_timeout_sec",
         "escalation.phase3_timeout_sec",
         "watcher.poll_fallback_sec",
-        "watcher.debounce_ms",
         "lock.retry_count",
         "lock.retry_delay_ms",
         "lock.timeout_sec",
@@ -99,7 +98,6 @@ function Initialize-Settings {
     
     # Watcher settings
     $script:FallbackSec = [int](Get-DefaultValue $Config["watcher.poll_fallback_sec"]          "5")
-    $script:DebounceMsec = [int](Get-DefaultValue $Config["watcher.debounce_ms"]                "300")
     
     # Escalation settings
     $script:EscPhase1Sec = [int](Get-DefaultValue $Config["escalation.phase1_timeout_sec"]      "120")
@@ -110,7 +108,6 @@ function Initialize-Settings {
     $script:LockRetryCount = [int](Get-DefaultValue $Config["lock.retry_count"]                   "30")
     $script:LockRetryDelay = [int](Get-DefaultValue $Config["lock.retry_delay_ms"]                "200")
     $script:LockTimeout = [int](Get-DefaultValue $Config["lock.timeout_sec"]                   "300")
-    $script:LoopGuardWaitSec = [int](Get-DefaultValue $Config["lock.loop_guard_wait_sec"]        "1800")
     
     # Log settings
     $script:LogDirectory = Get-DefaultValue $Config["log.directory"]                        "logs"

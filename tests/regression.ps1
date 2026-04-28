@@ -298,7 +298,8 @@ human_review:
   phases:
     - Phase3-1
     - Phase4-1
-  options: |
+notes:
+    summary: |
     [y] approve
     [n] reject
 '@ | Set-Content -Path $tempConfig -Encoding UTF8
@@ -309,7 +310,7 @@ human_review:
     Assert-Equal $config["human_review.enabled"] "true" "Read-Config should parse booleans as strings"
     Assert-Equal $config["human_review.phases.0"] "Phase3-1" "Read-Config should parse first array item"
     Assert-Equal $config["human_review.phases.1"] "Phase4-1" "Read-Config should parse second array item"
-    Assert-Contains $config["human_review.options"] "[y] approve" "Read-Config should parse block scalar"
+    Assert-Contains $config["notes.summary"] "[y] approve" "Read-Config should parse block scalar"
 }
 finally {
     Remove-Item $tempConfig -Force -ErrorAction SilentlyContinue

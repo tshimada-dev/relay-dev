@@ -35,16 +35,11 @@ escalation:
 
 watcher:
   poll_fallback_sec: 5
-  debounce_ms: 300
-
-terminal:
-  type: wt
 
 lock:
   retry_count: 30
   retry_delay_ms: 200
   timeout_sec: 300
-  loop_guard_wait_sec: 1800
 
 log:
   directory: logs
@@ -65,10 +60,3 @@ human_review:
     - Phase3-1  # 設計書レビュー → ゲート: Phase4
     - Phase4-1  # タスク分解レビュー → ゲート: Phase5
     - Phase7    # PRレビュー → ゲート: Phase7-1
-  prompt_message: "レビューが完了しました。出力を確認して判断してください:"
-  options: |
-    [y] 承認（推奨通り次のフェーズへ進む）
-    [n] 却下（理由を入力して前のフェーズに戻る）
-    [c] 条件付き承認（追加フィードバックを付与）
-    [s] スキップ（今回のみ自動承認）
-    [q] 終了（手動対応のためエージェントを停止）

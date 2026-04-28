@@ -62,7 +62,6 @@ $Config = Read-Config -Path $ConfigFile
 $CliCommand = Get-DefaultValue $Config["cli.command"]          "gemini-cli"
 $ImplementerCommand = Get-DefaultValue $Config["cli.implementer_command"] $CliCommand
 $ReviewerCommand = Get-DefaultValue $Config["cli.reviewer_command"] $CliCommand
-$TerminalType = Get-DefaultValue $Config["terminal.type"]        "wt"
 $StatusFile = Get-DefaultValue $Config["paths.status_file"]    "queue/status.yaml"
 $LockFile = Get-DefaultValue $Config["paths.lock_file"]      "queue/status.lock"
 $DashboardFile = Get-DefaultValue $Config["paths.dashboard_file"] "dashboard.md"
@@ -179,7 +178,7 @@ if ($stoppedProcesses.Count -gt 0) {
 # ============================================================
 # Pre-flight checks
 # ============================================================
-if ($TerminalType -eq "wt" -and -not (Get-Command "wt.exe" -ErrorAction SilentlyContinue)) {
+if (-not (Get-Command "wt.exe" -ErrorAction SilentlyContinue)) {
     Write-Error "Windows Terminal (wt.exe) is not installed or not in PATH."
     exit 1
 }
