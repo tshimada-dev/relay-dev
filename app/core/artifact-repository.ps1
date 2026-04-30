@@ -330,6 +330,137 @@ function Write-CompatibilityArtifactProjection {
     return $compatibilityPath
 }
 
+function Get-JobArtifactsRootPath {
+    param(
+        [Parameter(Mandatory)][string]$ProjectRoot,
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][string]$JobId
+    )
+
+    return (Join-Path (Get-RunJobPath -ProjectRoot $ProjectRoot -RunId $RunId -JobId $JobId) "artifacts")
+}
+
+function Get-AttemptArtifactsRootPath {
+    param(
+        [Parameter(Mandatory)][string]$ProjectRoot,
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][string]$JobId,
+        [Parameter(Mandatory)][string]$AttemptId
+    )
+
+    return (Join-Path (Get-JobArtifactsRootPath -ProjectRoot $ProjectRoot -RunId $RunId -JobId $JobId) "attempts\$AttemptId")
+}
+
+function Resolve-ArtifactStorageRootPath {
+    param(
+        [Parameter(Mandatory)][string]$ProjectRoot,
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][ValidateSet("canonical", "job", "attempt")][string]$StorageScope,
+        [string]$JobId,
+        [string]$AttemptId
+    )
+
+    switch ($StorageScope) {
+        "canonical" {
+            return (Join-Path (Get-RunRootPath -ProjectRoot $ProjectRoot -RunId $RunId) "artifacts")
+        }
+        "job" {
+            if ([string]::IsNullOrWhiteSpace($JobId)) {
+                throw "JobId is required when resolving job-scoped artifact storage roots."
+            }
+
+            return (Get-JobArtifactsRootPath -ProjectRoot $ProjectRoot -RunId $RunId -JobId $JobId)
+        }
+        "attempt" {
+            if ([string]::IsNullOrWhiteSpace($JobId)) {
+                throw "JobId is required when resolving attempt-scoped artifact storage roots."
+            }
+
+            if ([string]::IsNullOrWhiteSpace($AttemptId)) {
+                throw "AttemptId is required when resolving attempt-scoped artifact storage roots."
+            }
+
+            return (Get-AttemptArtifactsRootPath -ProjectRoot $ProjectRoot -RunId $RunId -JobId $JobId -AttemptId $AttemptId)
+        }
+    }
+}
+
+function Get-JobArtifactPath {
+    param(
+        [Parameter(Mandatory)][string]$ProjectRoot,
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][string]$JobId,
+        [Parameter(Mandatory)][ValidateSet("run", "task")][string]$Scope,
+        [Parameter(Mandatory)][string]$Phase,
+        [Parameter(Mandatory)][string]$ArtifactId,
+        [string]$TaskId
+    )
+
+    $root = Get-JobArtifactsRootPath -ProjectRoot $ProjectRoot -RunId $RunId -JobId $JobId
+    if ($Scope -eq "run") {
+        return (Join-Path $root "run\$Phase\$ArtifactId")
+    }
+
+    if (-not $TaskId) {
+        throw "TaskId is required when scope is 'task'"
+    }
+
+    return (Join-Path $root "tasks\$TaskId\$Phase\$ArtifactId")
+}
+
+function Get-AttemptArtifactPath {
+    param(
+        [Parameter(Mandatory)][string]$ProjectRoot,
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][string]$JobId,
+        [Parameter(Mandatory)][string]$AttemptId,
+        [Parameter(Mandatory)][ValidateSet("run", "task")][string]$Scope,
+        [Parameter(Mandatory)][string]$Phase,
+        [Parameter(Mandatory)][string]$ArtifactId,
+        [string]$TaskId
+    )
+
+    $root = Get-AttemptArtifactsRootPath -ProjectRoot $ProjectRoot -RunId $RunId -JobId $JobId -AttemptId $AttemptId
+    if ($Scope -eq "run") {
+        return (Join-Path $root "run\$Phase\$ArtifactId")
+    }
+
+    if (-not $TaskId) {
+        throw "TaskId is required when scope is 'task'"
+    }
+
+    return (Join-Path $root "tasks\$TaskId\$Phase\$ArtifactId")
+}
+
+function Get-JobArtifactPhaseDirectory {
+    param(
+        [Parameter(Mandatory)][string]$ProjectRoot,
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][string]$JobId,
+        [Parameter(Mandatory)][ValidateSet("run", "task")][string]$Scope,
+        [Parameter(Mandatory)][string]$Phase,
+        [string]$TaskId
+    )
+
+    $artifactPath = Get-JobArtifactPath -ProjectRoot $ProjectRoot -RunId $RunId -JobId $JobId -Scope $Scope -Phase $Phase -ArtifactId "__phase_dir_placeholder__" -TaskId $TaskId
+    return (Split-Path -Parent $artifactPath)
+}
+
+function Get-AttemptArtifactPhaseDirectory {
+    param(
+        [Parameter(Mandatory)][string]$ProjectRoot,
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][string]$JobId,
+        [Parameter(Mandatory)][string]$AttemptId,
+        [Parameter(Mandatory)][ValidateSet("run", "task")][string]$Scope,
+        [Parameter(Mandatory)][string]$Phase,
+        [string]$TaskId
+    )
+
+    $artifactPath = Get-AttemptArtifactPath -ProjectRoot $ProjectRoot -RunId $RunId -JobId $JobId -AttemptId $AttemptId -Scope $Scope -Phase $Phase -ArtifactId "__phase_dir_placeholder__" -TaskId $TaskId
+    return (Split-Path -Parent $artifactPath)
+}
+
 function Get-ArtifactPath {
     param(
         [Parameter(Mandatory)][string]$ProjectRoot,
@@ -350,6 +481,246 @@ function Get-ArtifactPath {
     }
 
     return (Join-Path $root "artifacts\tasks\$TaskId\$Phase\$ArtifactId")
+}
+
+function Resolve-StagedArtifactPath {
+    param(
+        [Parameter(Mandatory)][string]$ProjectRoot,
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][ValidateSet("canonical", "job", "attempt")][string]$StorageScope,
+        [Parameter(Mandatory)][ValidateSet("run", "task")][string]$Scope,
+        [Parameter(Mandatory)][string]$Phase,
+        [Parameter(Mandatory)][string]$ArtifactId,
+        [string]$TaskId,
+        [string]$JobId,
+        [string]$AttemptId
+    )
+
+    switch ($StorageScope) {
+        "canonical" {
+            return (Get-ArtifactPath -ProjectRoot $ProjectRoot -RunId $RunId -Scope $Scope -Phase $Phase -ArtifactId $ArtifactId -TaskId $TaskId)
+        }
+        "job" {
+            if ([string]::IsNullOrWhiteSpace($JobId)) {
+                throw "JobId is required when resolving job-scoped staged artifact paths."
+            }
+
+            return (Get-JobArtifactPath -ProjectRoot $ProjectRoot -RunId $RunId -JobId $JobId -Scope $Scope -Phase $Phase -ArtifactId $ArtifactId -TaskId $TaskId)
+        }
+        "attempt" {
+            if ([string]::IsNullOrWhiteSpace($JobId)) {
+                throw "JobId is required when resolving attempt-scoped staged artifact paths."
+            }
+
+            if ([string]::IsNullOrWhiteSpace($AttemptId)) {
+                throw "AttemptId is required when resolving attempt-scoped staged artifact paths."
+            }
+
+            return (Get-AttemptArtifactPath -ProjectRoot $ProjectRoot -RunId $RunId -JobId $JobId -AttemptId $AttemptId -Scope $Scope -Phase $Phase -ArtifactId $ArtifactId -TaskId $TaskId)
+        }
+    }
+}
+
+function Get-ArtifactPhaseDirectory {
+    param(
+        [Parameter(Mandatory)][string]$ProjectRoot,
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][ValidateSet("run", "task")][string]$Scope,
+        [Parameter(Mandatory)][string]$Phase,
+        [string]$TaskId
+    )
+
+    $artifactPath = Get-ArtifactPath -ProjectRoot $ProjectRoot -RunId $RunId -Scope $Scope -Phase $Phase -ArtifactId "__phase_dir_placeholder__" -TaskId $TaskId
+    return (Split-Path -Parent $artifactPath)
+}
+
+function Get-ArchivedArtifactPhaseRoot {
+    param(
+        [Parameter(Mandatory)][string]$ProjectRoot,
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][ValidateSet("run", "task")][string]$Scope,
+        [Parameter(Mandatory)][string]$Phase,
+        [string]$TaskId
+    )
+
+    $root = Get-RunRootPath -ProjectRoot $ProjectRoot -RunId $RunId
+    if ($Scope -eq "run") {
+        return (Join-Path $root "artifacts\archive\run\$Phase")
+    }
+
+    if ([string]::IsNullOrWhiteSpace($TaskId)) {
+        throw "TaskId is required when resolving task-scoped archive roots."
+    }
+
+    return (Join-Path $root "artifacts\archive\tasks\$TaskId\$Phase")
+}
+
+function New-ArtifactArchiveSnapshotId {
+    $snapshotId = (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssfffffffZ")
+    if ([string]::IsNullOrWhiteSpace($snapshotId)) {
+        return [guid]::NewGuid().ToString("N")
+    }
+
+    return $snapshotId
+}
+
+function Archive-PhaseArtifacts {
+    param(
+        [Parameter(Mandatory)][string]$ProjectRoot,
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][ValidateSet("run", "task")][string]$Scope,
+        [Parameter(Mandatory)][string]$Phase,
+        [string]$TaskId,
+        [string]$Reason = "rerun_before_dispatch",
+        [string]$PreviousJobId
+    )
+
+    $phaseDirectory = Get-ArtifactPhaseDirectory -ProjectRoot $ProjectRoot -RunId $RunId -Scope $Scope -Phase $Phase -TaskId $TaskId
+    if (-not (Test-Path $phaseDirectory)) {
+        return [ordered]@{
+            archived = $false
+            reason = "phase_directory_missing"
+            phase_directory = $phaseDirectory
+            scope = $Scope
+            phase = $Phase
+            task_id = $TaskId
+        }
+    }
+
+    $items = @(Get-ChildItem -LiteralPath $phaseDirectory -Force -ErrorAction SilentlyContinue)
+    if ($items.Count -eq 0) {
+        return [ordered]@{
+            archived = $false
+            reason = "phase_directory_empty"
+            phase_directory = $phaseDirectory
+            scope = $Scope
+            phase = $Phase
+            task_id = $TaskId
+        }
+    }
+
+    $archiveRoot = Get-ArchivedArtifactPhaseRoot -ProjectRoot $ProjectRoot -RunId $RunId -Scope $Scope -Phase $Phase -TaskId $TaskId
+    if (-not (Test-Path $archiveRoot)) {
+        New-Item -ItemType Directory -Path $archiveRoot -Force | Out-Null
+    }
+
+    $snapshotId = New-ArtifactArchiveSnapshotId
+    $snapshotPath = Join-Path $archiveRoot $snapshotId
+    if (Test-Path $snapshotPath) {
+        $snapshotId = "{0}-{1}" -f $snapshotId, ([guid]::NewGuid().ToString("N").Substring(0, 8))
+        $snapshotPath = Join-Path $archiveRoot $snapshotId
+    }
+
+    New-Item -ItemType Directory -Path $snapshotPath -Force | Out-Null
+
+    $archivedArtifacts = New-Object System.Collections.Generic.List[object]
+    foreach ($item in $items) {
+        $destination = Join-Path $snapshotPath $item.Name
+        Move-Item -LiteralPath $item.FullName -Destination $destination -Force
+        $archivedArtifacts.Add([ordered]@{
+            artifact_id = $item.Name
+            kind = if ($item.PSIsContainer) { "directory" } else { "file" }
+            path = $destination
+        }) | Out-Null
+    }
+
+    $metadata = [ordered]@{
+        run_id = $RunId
+        scope = $Scope
+        phase = $Phase
+        task_id = $TaskId
+        reason = $Reason
+        previous_job_id = $PreviousJobId
+        archived_at = (Get-Date).ToString("o")
+        source_phase_directory = $phaseDirectory
+        archived_artifacts = @($archivedArtifacts.ToArray())
+    }
+    $metadataPath = Join-Path $snapshotPath "metadata.json"
+    Set-Content -Path $metadataPath -Value ($metadata | ConvertTo-Json -Depth 20) -Encoding UTF8
+
+    return [ordered]@{
+        archived = $true
+        reason = $Reason
+        snapshot_id = $snapshotId
+        snapshot_path = $snapshotPath
+        metadata_path = $metadataPath
+        phase_directory = $phaseDirectory
+        archive_root = $archiveRoot
+        scope = $Scope
+        phase = $Phase
+        task_id = $TaskId
+        archived_artifacts = @($archivedArtifacts.ToArray())
+    }
+}
+
+function Get-LatestArchivedPhaseSnapshot {
+    param(
+        [Parameter(Mandatory)][string]$ProjectRoot,
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][ValidateSet("run", "task")][string]$Scope,
+        [Parameter(Mandatory)][string]$Phase,
+        [string]$TaskId
+    )
+
+    $archiveRoot = Get-ArchivedArtifactPhaseRoot -ProjectRoot $ProjectRoot -RunId $RunId -Scope $Scope -Phase $Phase -TaskId $TaskId
+    if (-not (Test-Path $archiveRoot)) {
+        return $null
+    }
+
+    $snapshotDirectories = @(Get-ChildItem -LiteralPath $archiveRoot -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending)
+    foreach ($directory in $snapshotDirectories) {
+        $metadataPath = Join-Path $directory.FullName "metadata.json"
+        $metadata = $null
+        if (Test-Path $metadataPath) {
+            try {
+                $metadata = ConvertTo-RelayHashtable -InputObject ((Get-Content -Path $metadataPath -Raw -Encoding UTF8) | ConvertFrom-Json)
+            }
+            catch {
+                $metadata = $null
+            }
+        }
+
+        return [ordered]@{
+            snapshot_id = $directory.Name
+            snapshot_path = $directory.FullName
+            metadata = $metadata
+        }
+    }
+
+    return $null
+}
+
+function Get-LatestArchivedPhaseJsonArtifacts {
+    param(
+        [Parameter(Mandatory)][string]$ProjectRoot,
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][ValidateSet("run", "task")][string]$Scope,
+        [Parameter(Mandatory)][string]$Phase,
+        [string]$TaskId
+    )
+
+    $snapshot = ConvertTo-RelayHashtable -InputObject (Get-LatestArchivedPhaseSnapshot -ProjectRoot $ProjectRoot -RunId $RunId -Scope $Scope -Phase $Phase -TaskId $TaskId)
+    if (-not $snapshot) {
+        return @()
+    }
+
+    $metadata = ConvertTo-RelayHashtable -InputObject $snapshot["metadata"]
+    $archivedAt = if ($metadata -and $metadata["archived_at"]) { [string]$metadata["archived_at"] } else { $null }
+    $jsonFiles = @(Get-ChildItem -LiteralPath ([string]$snapshot["snapshot_path"]) -File -Filter "*.json" -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne "metadata.json" } | Sort-Object Name)
+    $artifacts = New-Object System.Collections.Generic.List[object]
+    foreach ($file in $jsonFiles) {
+        $artifacts.Add([ordered]@{
+            artifact_id = $file.Name
+            path = $file.FullName
+            snapshot_id = [string]$snapshot["snapshot_id"]
+            archived_at = $archivedAt
+            scope = $Scope
+            phase = $Phase
+            task_id = $TaskId
+        }) | Out-Null
+    }
+
+    return @($artifacts.ToArray())
 }
 
 function Save-Artifact {
@@ -388,6 +759,74 @@ function Save-Artifact {
     return $path
 }
 
+function Read-ArtifactContentFromPath {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path $Path)) {
+        return $null
+    }
+
+    $raw = Get-Content -Path $Path -Raw -Encoding UTF8
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        return $null
+    }
+
+    if ($Path.ToLowerInvariant().EndsWith(".json")) {
+        return (ConvertTo-RelayHashtable -InputObject ($raw | ConvertFrom-Json))
+    }
+
+    return $raw
+}
+
+function Commit-PhaseOutputArtifacts {
+    param(
+        [Parameter(Mandatory)][string]$ProjectRoot,
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)]$MaterializedArtifacts
+    )
+
+    $committedArtifacts = New-Object System.Collections.Generic.List[object]
+    foreach ($artifactRaw in @($MaterializedArtifacts)) {
+        $artifact = ConvertTo-RelayHashtable -InputObject $artifactRaw
+        $scope = if ($artifact["scope"]) { [string]$artifact["scope"] } else { "run" }
+        $phase = [string]$artifact["phase"]
+        $artifactId = [string]$artifact["artifact_id"]
+        $taskId = [string]$artifact["task_id"]
+        $asJson = $false
+        if ($artifact.ContainsKey("as_json")) {
+            $asJson = [bool]$artifact["as_json"]
+        }
+
+        $saveParams = @{
+            ProjectRoot = $ProjectRoot
+            RunId = $RunId
+            Scope = $scope
+            Phase = $phase
+            ArtifactId = $artifactId
+            Content = $artifact["content"]
+            AsJson = $asJson
+        }
+        if ($scope -eq "task") {
+            $saveParams["TaskId"] = $taskId
+        }
+
+        $destinationPath = Save-Artifact @saveParams
+        $committedArtifacts.Add([ordered]@{
+            artifact_id = $artifactId
+            scope = $scope
+            phase = $phase
+            task_id = $taskId
+            source_path = [string]$artifact["path"]
+            destination_path = $destinationPath
+            as_json = $asJson
+        }) | Out-Null
+    }
+
+    return [ordered]@{
+        committed = @($committedArtifacts.ToArray())
+    }
+}
+
 function Read-Artifact {
     param(
         [Parameter(Mandatory)][string]$ProjectRoot,
@@ -406,20 +845,7 @@ function Read-Artifact {
         Get-ArtifactPath -ProjectRoot $ProjectRoot -RunId $RunId -Scope $Scope -Phase $Phase -ArtifactId $ArtifactId -TaskId $TaskId
     }
 
-    if (-not (Test-Path $path)) {
-        return $null
-    }
-
-    $raw = Get-Content -Path $path -Raw -Encoding UTF8
-    if ([string]::IsNullOrWhiteSpace($raw)) {
-        return $null
-    }
-
-    if ($path.ToLowerInvariant().EndsWith(".json")) {
-        return (ConvertTo-RelayHashtable -InputObject ($raw | ConvertFrom-Json))
-    }
-
-    return $raw
+    return (Read-ArtifactContentFromPath -Path $path)
 }
 
 function Resolve-ArtifactRef {

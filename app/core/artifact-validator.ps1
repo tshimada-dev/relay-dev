@@ -1021,7 +1021,7 @@ function Test-Phase8ReleaseArtifact {
     return (Test-GenericCollectionArtifact -Artifact $Artifact -ArtifactId "phase8_release.json" -StringFields @("final_verdict", "release_decision") -ArrayFields @("residual_risks", "follow_up_actions"))
 }
 
-function Test-ArtifactContract {
+function Get-ArtifactValidationSnapshot {
     param(
         [Parameter(Mandatory)][string]$ArtifactId,
         [Parameter(Mandatory)]$Artifact,
@@ -1068,7 +1068,61 @@ function Test-ArtifactContract {
         $validationResult["warnings"] = @($validationResult["warnings"]) + $normalizationWarnings
     }
 
-    return $validationResult
+    return [ordered]@{
+        artifact_id = $ArtifactId
+        phase = $Phase
+        original_artifact = $Artifact
+        artifact = $normalizedArtifact
+        normalization = [ordered]@{
+            changed = [bool]$normalization["changed"]
+            warnings = $normalizationWarnings
+        }
+        validation = $validationResult
+    }
+}
+
+function Test-ArtifactContract {
+    param(
+        [Parameter(Mandatory)][string]$ArtifactId,
+        [Parameter(Mandatory)]$Artifact,
+        [string]$Phase
+    )
+
+    $snapshot = ConvertTo-RelayHashtable -InputObject (Get-ArtifactValidationSnapshot -ArtifactId $ArtifactId -Artifact $Artifact -Phase $Phase)
+    return (ConvertTo-RelayHashtable -InputObject $snapshot["validation"])
+}
+
+function Get-ArtifactRefValidationSnapshot {
+    param(
+        [Parameter(Mandatory)][string]$ProjectRoot,
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)]$ArtifactRef
+    )
+
+    $ref = ConvertTo-RelayHashtable -InputObject $ArtifactRef
+    $artifact = Read-Artifact -ProjectRoot $ProjectRoot -RunId $RunId -ArtifactRef $ref
+    if ($null -eq $artifact) {
+        return [ordered]@{
+            artifact_ref = $ref
+            artifact_id = [string]$ref["artifact_id"]
+            phase = [string]$ref["phase"]
+            original_artifact = $null
+            artifact = $null
+            normalization = [ordered]@{
+                changed = $false
+                warnings = @()
+            }
+            validation = [ordered]@{
+                valid = $false
+                errors = @("Artifact could not be loaded from reference.")
+                warnings = @()
+            }
+        }
+    }
+
+    $snapshot = ConvertTo-RelayHashtable -InputObject (Get-ArtifactValidationSnapshot -ArtifactId ([string]$ref["artifact_id"]) -Artifact $artifact -Phase ([string]$ref["phase"]))
+    $snapshot["artifact_ref"] = $ref
+    return $snapshot
 }
 
 function Test-ArtifactRef {
@@ -1078,15 +1132,6 @@ function Test-ArtifactRef {
         [Parameter(Mandatory)]$ArtifactRef
     )
 
-    $artifact = Read-Artifact -ProjectRoot $ProjectRoot -RunId $RunId -ArtifactRef $ArtifactRef
-    if ($null -eq $artifact) {
-        return [ordered]@{
-            valid = $false
-            errors = @("Artifact could not be loaded from reference.")
-            warnings = @()
-        }
-    }
-
-    $ref = ConvertTo-RelayHashtable -InputObject $ArtifactRef
-    return (Test-ArtifactContract -ArtifactId $ref["artifact_id"] -Artifact $artifact -Phase $ref["phase"])
+    $snapshot = ConvertTo-RelayHashtable -InputObject (Get-ArtifactRefValidationSnapshot -ProjectRoot $ProjectRoot -RunId $RunId -ArtifactRef $ArtifactRef)
+    return (ConvertTo-RelayHashtable -InputObject $snapshot["validation"])
 }

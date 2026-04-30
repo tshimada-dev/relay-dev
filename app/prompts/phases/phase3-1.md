@@ -37,9 +37,9 @@
 - `evidence`
 - `review_checks`
 
-`must_fix` と `warnings` は配列で、各要素は具体的な修正指示または懸念事項にすること。`evidence` には参照した設計項目や確認根拠を入れること。
+`must_fix` と `warnings` は配列で、各要素は具体的な修正指示または懸念事項にすること。`evidence` には参照した設計項目や確認根拠を入れること。`evidence` は 1 件だけでも文字列ではなく JSON 配列にすること。
 
-`review_checks[]` は以下の `check_id` をすべて含む固定チェック配列で、各要素は `check_id`、`status`、`notes`、`evidence` を持つこと。
+`review_checks[]` は以下の `check_id` をすべて含む固定チェック配列で、各要素は `check_id`、`status`、`notes`、`evidence` を持つこと。`review_checks[].evidence` も必ず JSON 配列にすること。
 `status` は `pass`、`warning`、`fail` のいずれかにすること。
 
 - `module_boundaries`

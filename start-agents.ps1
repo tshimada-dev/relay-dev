@@ -157,6 +157,12 @@ function Stop-RelayDevManagedProcesses {
     return @($managedRoots)
 }
 
+function ConvertTo-EncodedPwshCommand {
+    param([Parameter(Mandatory)][string]$CommandText)
+
+    return [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($CommandText))
+}
+
 # Resolve project directory (where code is generated)
 $ProjectDirRaw = Get-DefaultValue $Config["paths.project_dir"] ""
 if ($ProjectDirRaw -and $ProjectDirRaw -ne "" -and $ProjectDirRaw -ne ".") {
@@ -377,9 +383,11 @@ else {
 
 Write-Host "Launching visible terminal..." -ForegroundColor Green
 
-$WtArgs = "new-tab -d `"$ProjectDir`" pwsh -NoLogo -NoProfile -NoExit -Command `"$WorkerCmd`""
+$WorkerEncodedCommand = ConvertTo-EncodedPwshCommand -CommandText $WorkerCmd
+$WtArgs = "new-tab -d `"$ProjectDir`" pwsh -NoLogo -NoProfile -NoExit -EncodedCommand $WorkerEncodedCommand"
 if (-not $NoMonitor) {
-    $WtArgs += " ; new-tab -d `"$ProjectDir`" pwsh -NoLogo -NoProfile -NoExit -Command `"$MonitorCmd`""
+    $MonitorEncodedCommand = ConvertTo-EncodedPwshCommand -CommandText $MonitorCmd
+    $WtArgs += " ; new-tab -d `"$ProjectDir`" pwsh -NoLogo -NoProfile -NoExit -EncodedCommand $MonitorEncodedCommand"
 }
 Start-Process -FilePath "wt.exe" -ArgumentList $WtArgs
 

@@ -31,6 +31,11 @@ Set-Location $script:ProjectRoot
 . (Join-Path $script:ProjectRoot "app/core/event-store.ps1")
 . (Join-Path $script:ProjectRoot "app/core/artifact-repository.ps1")
 . (Join-Path $script:ProjectRoot "app/core/artifact-validator.ps1")
+. (Join-Path $script:ProjectRoot "app/core/job-context-builder.ps1")
+. (Join-Path $script:ProjectRoot "app/core/attempt-preparation.ps1")
+. (Join-Path $script:ProjectRoot "app/core/phase-validation-pipeline.ps1")
+. (Join-Path $script:ProjectRoot "app/core/phase-completion-committer.ps1")
+. (Join-Path $script:ProjectRoot "app/core/phase-execution-transaction.ps1")
 . (Join-Path $script:ProjectRoot "app/core/job-result-policy.ps1")
 . (Join-Path $script:ProjectRoot "app/core/transition-resolver.ps1")
 . (Join-Path $script:ProjectRoot "app/approval/approval-manager.ps1")
@@ -183,9 +188,11 @@ function Repair-RecoverableFailedRunState {
             recovery_event = $null
         }
     }
+
     $state["status"] = "running"
     $state["feedback"] = ""
     $state["updated_at"] = (Get-Date).ToString("o")
+    $state = Clear-RunStateActiveAttempt -RunState $state -Status "recovered" -Result "retry_same_phase"
     $state = Restart-CurrentPhaseHistoryForRecovery -RunState $state
 
     return @{
@@ -330,7 +337,11 @@ function Resolve-ContractArtifactPath {
         [Parameter(Mandatory)][string]$RunId,
         [Parameter(Mandatory)][string]$PhaseName,
         [Parameter(Mandatory)]$ContractItem,
-        [string]$TaskId
+        [string]$TaskId,
+        [string]$JobId,
+        [string]$AttemptId,
+        [ValidateSet("canonical", "job", "attempt")][string]$StorageScope = "canonical",
+        [switch]$PreferJobArtifacts
     )
 
     $item = ConvertTo-RelayHashtable -InputObject $ContractItem
@@ -345,8 +356,29 @@ function Resolve-ContractArtifactPath {
     }
 
     $sourcePhase = if ($item["phase"]) { [string]$item["phase"] } else { $PhaseName }
+    $useJobArtifacts = (
+        $PreferJobArtifacts -and
+        -not [string]::IsNullOrWhiteSpace($JobId) -and
+        $sourcePhase -eq $PhaseName
+    )
     if ($scope -eq "task") {
+        if ($StorageScope -ne "canonical" -and $sourcePhase -eq $PhaseName) {
+            return (Resolve-StagedArtifactPath -ProjectRoot $script:ProjectRoot -RunId $RunId -StorageScope $StorageScope -Scope $scope -Phase $sourcePhase -ArtifactId ([string]$item["artifact_id"]) -TaskId $TaskId -JobId $JobId -AttemptId $AttemptId)
+        }
+
+        if ($useJobArtifacts) {
+            return (Resolve-StagedArtifactPath -ProjectRoot $script:ProjectRoot -RunId $RunId -StorageScope "job" -Scope $scope -Phase $sourcePhase -ArtifactId ([string]$item["artifact_id"]) -TaskId $TaskId -JobId $JobId)
+        }
+
         return (Get-ArtifactPath -ProjectRoot $script:ProjectRoot -RunId $RunId -Scope $scope -Phase $sourcePhase -ArtifactId ([string]$item["artifact_id"]) -TaskId $TaskId)
+    }
+
+    if ($StorageScope -ne "canonical" -and $sourcePhase -eq $PhaseName) {
+        return (Resolve-StagedArtifactPath -ProjectRoot $script:ProjectRoot -RunId $RunId -StorageScope $StorageScope -Scope $scope -Phase $sourcePhase -ArtifactId ([string]$item["artifact_id"]) -JobId $JobId -AttemptId $AttemptId)
+    }
+
+    if ($useJobArtifacts) {
+        return (Resolve-StagedArtifactPath -ProjectRoot $script:ProjectRoot -RunId $RunId -StorageScope "job" -Scope $scope -Phase $sourcePhase -ArtifactId ([string]$item["artifact_id"]) -JobId $JobId)
     }
 
     return (Get-ArtifactPath -ProjectRoot $script:ProjectRoot -RunId $RunId -Scope $scope -Phase $sourcePhase -ArtifactId ([string]$item["artifact_id"]))
@@ -390,68 +422,14 @@ function Sync-PhaseOutputArtifacts {
         [Parameter(Mandatory)][string]$RunId,
         [Parameter(Mandatory)][string]$PhaseName,
         [Parameter(Mandatory)]$PhaseDefinition,
-        [string]$TaskId
+        [string]$TaskId,
+        [string]$JobId,
+        [string]$AttemptId,
+        [ValidateSet("canonical", "job", "attempt")][string]$StorageScope = "canonical",
+        [AllowNull()][datetime]$AttemptStartedAtUtc
     )
 
-    $definition = ConvertTo-RelayHashtable -InputObject $PhaseDefinition
-    $materialized = @()
-    $missingRequired = @()
-    $readErrors = @()
-
-    foreach ($contractItem in @($definition["output_contract"])) {
-        $item = ConvertTo-RelayHashtable -InputObject $contractItem
-        $scope = if ($item["scope"]) { [string]$item["scope"] } else { "run" }
-        $artifactId = [string]$item["artifact_id"]
-        $format = [string]$item["format"]
-        $required = $false
-        if ($item.ContainsKey("required")) {
-            $required = [bool]$item["required"]
-        }
-
-        $path = Resolve-ContractArtifactPath -RunId $RunId -PhaseName $PhaseName -ContractItem $item -TaskId $TaskId
-        if (-not (Test-Path $path)) {
-            if ($required) {
-                $missingRequired += $artifactId
-            }
-            continue
-        }
-
-        try {
-            if ($format -eq "json" -or $artifactId.ToLowerInvariant().EndsWith(".json")) {
-                $content = ConvertTo-RelayHashtable -InputObject ((Get-Content -Path $path -Raw -Encoding UTF8) | ConvertFrom-Json)
-                if ($scope -eq "task") {
-                    Write-CompatibilityArtifactProjection -ProjectRoot $script:ProjectRoot -RunId $RunId -Scope $scope -Phase $PhaseName -ArtifactId $artifactId -Content $content -TaskId $TaskId -AsJson | Out-Null
-                }
-                else {
-                    Write-CompatibilityArtifactProjection -ProjectRoot $script:ProjectRoot -RunId $RunId -Scope $scope -Phase $PhaseName -ArtifactId $artifactId -Content $content -AsJson | Out-Null
-                }
-            }
-            else {
-                $content = Get-Content -Path $path -Raw -Encoding UTF8
-                if ($scope -eq "task") {
-                    Write-CompatibilityArtifactProjection -ProjectRoot $script:ProjectRoot -RunId $RunId -Scope $scope -Phase $PhaseName -ArtifactId $artifactId -Content $content -TaskId $TaskId | Out-Null
-                }
-                else {
-                    Write-CompatibilityArtifactProjection -ProjectRoot $script:ProjectRoot -RunId $RunId -Scope $scope -Phase $PhaseName -ArtifactId $artifactId -Content $content | Out-Null
-                }
-            }
-
-            $materialized += @{
-                artifact_id = $artifactId
-                scope = $scope
-                path = $path
-            }
-        }
-        catch {
-            $readErrors += "Failed to materialize artifact '$artifactId': $_"
-        }
-    }
-
-    return @{
-        materialized = $materialized
-        missing_required = $missingRequired
-        read_errors = $readErrors
-    }
+    return (Get-PhaseMaterializedArtifacts -ProjectRoot $script:ProjectRoot -RunId $RunId -PhaseName $PhaseName -PhaseDefinition $PhaseDefinition -TaskId $TaskId -JobId $JobId -AttemptId $AttemptId -StorageScope $StorageScope -AttemptStartedAtUtc $AttemptStartedAtUtc)
 }
 
 function Get-CurrentPhaseHistoryEntry {
@@ -512,6 +490,10 @@ function Resolve-ArtifactCompletionCutoffUtc {
     return $AttemptStartedAtUtc
 }
 
+function Get-RelayAttemptPromptToken {
+    return "__RELAY_ATTEMPT_ID__"
+}
+
 function Write-ArtifactProbeTrace {
     param([AllowNull()]$Payload)
 
@@ -535,6 +517,8 @@ function Test-PhaseArtifactCompletion {
         [Parameter(Mandatory)][string]$RunId,
         [Parameter(Mandatory)][string]$PhaseName,
         [Parameter(Mandatory)]$PhaseDefinition,
+        [string]$JobId,
+        [string]$AttemptId,
         [string]$TaskId,
         [AllowNull()][datetime]$PhaseStartedAtUtc,
         [AllowNull()][datetime]$AttemptStartedAtUtc
@@ -555,7 +539,7 @@ function Test-PhaseArtifactCompletion {
             continue
         }
 
-        $path = Resolve-ContractArtifactPath -RunId $RunId -PhaseName $PhaseName -ContractItem $item -TaskId $TaskId
+        $path = Resolve-ContractArtifactPath -RunId $RunId -PhaseName $PhaseName -ContractItem $item -TaskId $TaskId -JobId $JobId -AttemptId $AttemptId -StorageScope $(if (-not [string]::IsNullOrWhiteSpace($AttemptId)) { "attempt" } elseif (-not [string]::IsNullOrWhiteSpace($JobId)) { "job" } else { "canonical" }) -PreferJobArtifacts:([bool](-not [string]::IsNullOrWhiteSpace($JobId)))
         $resolvedPaths[$artifactId] = $path
 
         $required = $false
@@ -616,13 +600,29 @@ function Test-PhaseArtifactCompletion {
             foreach ($contractItem in @($definition["output_contract"])) {
                 $item = ConvertTo-RelayHashtable -InputObject $contractItem
                 if ([string]$item["artifact_id"] -eq $validatorArtifactId) {
-                    $validatorPath = Resolve-ContractArtifactPath -RunId $RunId -PhaseName $PhaseName -ContractItem $item -TaskId $TaskId
+                    $validatorPath = Resolve-ContractArtifactPath -RunId $RunId -PhaseName $PhaseName -ContractItem $item -TaskId $TaskId -JobId $JobId -AttemptId $AttemptId -StorageScope $(if (-not [string]::IsNullOrWhiteSpace($AttemptId)) { "attempt" } elseif (-not [string]::IsNullOrWhiteSpace($JobId)) { "job" } else { "canonical" }) -PreferJobArtifacts:([bool](-not [string]::IsNullOrWhiteSpace($JobId)))
                     break
                 }
             }
 
             if ([string]::IsNullOrWhiteSpace($validatorPath)) {
-                if ([string]$validatorRef["scope"] -eq "task") {
+                if (-not [string]::IsNullOrWhiteSpace($AttemptId)) {
+                    if ([string]$validatorRef["scope"] -eq "task") {
+                        $validatorPath = Get-AttemptArtifactPath -ProjectRoot $script:ProjectRoot -RunId $RunId -JobId $JobId -AttemptId $AttemptId -Scope "task" -Phase ([string]$validatorRef["phase"]) -ArtifactId $validatorArtifactId -TaskId ([string]$validatorRef["task_id"])
+                    }
+                    else {
+                        $validatorPath = Get-AttemptArtifactPath -ProjectRoot $script:ProjectRoot -RunId $RunId -JobId $JobId -AttemptId $AttemptId -Scope ([string]$validatorRef["scope"]) -Phase ([string]$validatorRef["phase"]) -ArtifactId $validatorArtifactId
+                    }
+                }
+                elseif (-not [string]::IsNullOrWhiteSpace($JobId)) {
+                    if ([string]$validatorRef["scope"] -eq "task") {
+                        $validatorPath = Get-JobArtifactPath -ProjectRoot $script:ProjectRoot -RunId $RunId -JobId $JobId -Scope "task" -Phase ([string]$validatorRef["phase"]) -ArtifactId $validatorArtifactId -TaskId ([string]$validatorRef["task_id"])
+                    }
+                    else {
+                        $validatorPath = Get-JobArtifactPath -ProjectRoot $script:ProjectRoot -RunId $RunId -JobId $JobId -Scope ([string]$validatorRef["scope"]) -Phase ([string]$validatorRef["phase"]) -ArtifactId $validatorArtifactId
+                    }
+                }
+                elseif ([string]$validatorRef["scope"] -eq "task") {
                     $validatorPath = Get-ArtifactPath -ProjectRoot $script:ProjectRoot -RunId $RunId -Scope "task" -Phase ([string]$validatorRef["phase"]) -ArtifactId $validatorArtifactId -TaskId ([string]$validatorRef["task_id"])
                 }
                 else {
@@ -672,8 +672,9 @@ function Test-PhaseArtifactCompletion {
         }
 
         try {
-            $validation = ConvertTo-RelayHashtable -InputObject (Test-ArtifactRef -ProjectRoot $script:ProjectRoot -RunId $RunId -ArtifactRef $validatorRef)
-            $artifact = Read-Artifact -ProjectRoot $script:ProjectRoot -RunId $RunId -ArtifactRef $validatorRef
+            $artifact = Read-ArtifactContentFromPath -Path $validatorPath
+            $validationSnapshot = ConvertTo-RelayHashtable -InputObject (Get-ArtifactValidationSnapshot -ArtifactId $validatorArtifactId -Artifact $artifact -Phase $PhaseName)
+            $validation = ConvertTo-RelayHashtable -InputObject $validationSnapshot["validation"]
         }
         catch {
             $result = [ordered]@{
@@ -742,7 +743,8 @@ function Invoke-PhaseArtifactCompletionProbe {
 
     try {
         $attemptStartedAtUtc = Convert-RelayDateTimeToUtc -Value ([string]$probe["started_at"])
-        return (Test-PhaseArtifactCompletion -RunId ([string]$probeState["run_id"]) -PhaseName ([string]$probeState["phase_name"]) -PhaseDefinition $probeState["phase_definition"] -TaskId ([string]$probeState["task_id"]) -PhaseStartedAtUtc $probeState["phase_started_at_utc"] -AttemptStartedAtUtc $attemptStartedAtUtc)
+        $attemptId = if ($probe["attempt"]) { Get-ExecutionAttemptId -Attempt ([int]$probe["attempt"]) } else { $null }
+        return (Test-PhaseArtifactCompletion -RunId ([string]$probeState["run_id"]) -PhaseName ([string]$probeState["phase_name"]) -PhaseDefinition $probeState["phase_definition"] -JobId ([string]$probeState["job_id"]) -AttemptId $attemptId -TaskId ([string]$probeState["task_id"]) -PhaseStartedAtUtc $probeState["phase_started_at_utc"] -AttemptStartedAtUtc $attemptStartedAtUtc)
     }
     catch {
         Write-ArtifactProbeTrace -Payload @{
@@ -765,80 +767,7 @@ function Resolve-StepValidation {
         [string]$TaskId
     )
 
-    $validatorRef = Resolve-PhaseValidatorArtifactRef -PhaseDefinition $PhaseDefinition -PhaseName $PhaseName -TaskId $TaskId
-    if (-not $validatorRef) {
-        return @{
-            validator_ref = $null
-            validation = $null
-            artifact = $null
-        }
-    }
-
-    $syncResult = ConvertTo-RelayHashtable -InputObject $OutputSyncResult
-    $errors = @()
-    if (@($syncResult["missing_required"]).Count -gt 0) {
-        $errors += @($syncResult["missing_required"] | ForEach-Object { "Required artifact '$_' was not produced." })
-    }
-    if (@($syncResult["read_errors"]).Count -gt 0) {
-        $errors += @($syncResult["read_errors"])
-    }
-
-    if ($errors.Count -gt 0) {
-        return @{
-            validator_ref = $validatorRef
-            validation = @{
-                valid = $false
-                errors = $errors
-                warnings = @()
-            }
-            artifact = $null
-        }
-    }
-
-    $artifact = Read-Artifact -ProjectRoot $script:ProjectRoot -RunId $RunId -ArtifactRef $validatorRef
-    if ($null -eq $artifact) {
-        return @{
-            validator_ref = $validatorRef
-            validation = @{
-                valid = $false
-                errors = @("Validator artifact '$($validatorRef['artifact_id'])' could not be loaded.")
-                warnings = @()
-            }
-            artifact = $null
-        }
-    }
-
-    $artifactId = [string]$validatorRef["artifact_id"]
-    $normalization = ConvertTo-RelayHashtable -InputObject (Normalize-ArtifactForValidation -ArtifactId $artifactId -Artifact $artifact)
-    $artifact = $normalization["artifact"]
-    $normalizationWarnings = @($normalization["warnings"])
-    if ([bool]$normalization["changed"]) {
-        $saveParams = @{
-            ProjectRoot = $script:ProjectRoot
-            RunId = $RunId
-            Scope = [string]$validatorRef["scope"]
-            Phase = [string]$validatorRef["phase"]
-            ArtifactId = $artifactId
-            Content = $artifact
-            AsJson = $true
-        }
-        if ([string]$validatorRef["scope"] -eq "task") {
-            $saveParams["TaskId"] = [string]$validatorRef["task_id"]
-        }
-
-        Save-Artifact @saveParams | Out-Null
-    }
-
-    $validation = ConvertTo-RelayHashtable -InputObject (Test-ArtifactContract -ArtifactId $artifactId -Artifact $artifact -Phase $PhaseName)
-    if ($normalizationWarnings.Count -gt 0) {
-        $validation["warnings"] = @($validation["warnings"]) + $normalizationWarnings
-    }
-
-    return @{
-        validator_ref = $validatorRef
-        validation = $validation
-        artifact = $artifact
-    }
+    return (Invoke-PhaseValidationPipeline -PhaseName $PhaseName -PhaseDefinition $PhaseDefinition -MaterializedArtifacts @($OutputSyncResult["materialized"]) -MissingRequired @($OutputSyncResult["missing_required"]) -StaleRequired @($OutputSyncResult["stale_required"]) -ReadErrors @($OutputSyncResult["read_errors"]) -TaskId $TaskId)
 }
 
 function Format-ContractPromptLines {
@@ -847,6 +776,9 @@ function Format-ContractPromptLines {
         [Parameter(Mandatory)][string]$PhaseName,
         [Parameter(Mandatory)]$ContractItems,
         [string]$TaskId,
+        [string]$JobId,
+        [string]$AttemptId,
+        [ValidateSet("canonical", "job", "attempt")][string]$StorageScope = "canonical",
         [switch]$OutputMode
     )
 
@@ -862,12 +794,40 @@ function Format-ContractPromptLines {
             $lines.Add("- [$requiredLabel][$scope][$format] $artifactId => <task artifact unavailable: no current task> ($status)")
             continue
         }
-        $path = Resolve-ContractArtifactPath -RunId $RunId -PhaseName $PhaseName -ContractItem $item -TaskId $TaskId
+        $path = Resolve-ContractArtifactPath -RunId $RunId -PhaseName $PhaseName -ContractItem $item -TaskId $TaskId -JobId $JobId -AttemptId $AttemptId -StorageScope $StorageScope -PreferJobArtifacts:([bool]($OutputMode -and -not [string]::IsNullOrWhiteSpace($JobId)))
         $status = if ($OutputMode) { "write" } else { if (Test-Path $path) { "exists" } else { "missing" } }
         $lines.Add("- [$requiredLabel][$scope][$format] $artifactId => $path ($status)")
     }
 
     return @($lines)
+}
+
+function Format-ArchivedPhaseJsonContextLines {
+    param(
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][string]$PhaseName,
+        [string]$TaskId,
+        $ArchivedContext
+    )
+
+    $context = if ($PSBoundParameters.ContainsKey("ArchivedContext") -and $null -ne $ArchivedContext) {
+        ConvertTo-RelayHashtable -InputObject $ArchivedContext
+    }
+    else {
+        $scope = if (Test-TaskScopedPhase -Phase $PhaseName) { "task" } else { "run" }
+        if ($scope -eq "task" -and [string]::IsNullOrWhiteSpace($TaskId)) {
+            return @()
+        }
+
+        ConvertTo-RelayHashtable -InputObject (Get-LatestArchivedJsonContext -ProjectRoot $script:ProjectRoot -RunId $RunId -Scope $scope -Phase $PhaseName -TaskId $TaskId)
+    }
+
+    $refs = @($context["archived_context_refs"])
+    if ($refs.Count -eq 0) {
+        return @()
+    }
+
+    return @(Format-ArchivedJsonContextPromptLines -ArchivedContext $context)
 }
 
 function New-EnginePromptText {
@@ -921,7 +881,16 @@ function New-EnginePromptText {
         $sections.Add("## Input Artifacts$promptLineBreak$($inputLines -join $promptLineBreak)")
     }
 
-    $outputLines = Format-ContractPromptLines -RunId ([string]$job["run_id"]) -PhaseName ([string]$job["phase"]) -ContractItems $definition["output_contract"] -TaskId ([string]$job["task_id"]) -OutputMode
+    $archivedContextLines = Format-ArchivedPhaseJsonContextLines -RunId ([string]$job["run_id"]) -PhaseName ([string]$job["phase"]) -TaskId ([string]$job["task_id"]) -ArchivedContext $job["archived_context"]
+    if ($archivedContextLines.Count -gt 0) {
+        $archivedContextIntro = @(
+            "These are the most recent archived JSON artifacts for this same phase from before the current rerun."
+            "Read them as prior-version context only. Do not treat them as the current required outputs."
+        )
+        $sections.Add("## Archived Phase JSON Context$promptLineBreak$($archivedContextIntro -join $promptLineBreak)$promptLineBreak$($archivedContextLines -join $promptLineBreak)")
+    }
+
+    $outputLines = Format-ContractPromptLines -RunId ([string]$job["run_id"]) -PhaseName ([string]$job["phase"]) -ContractItems $definition["output_contract"] -TaskId ([string]$job["task_id"]) -JobId ([string]$job["job_id"]) -AttemptId ([string]$job["attempt_id"]) -StorageScope $(if (-not [string]::IsNullOrWhiteSpace([string]$job["attempt_id"])) { "attempt" } elseif (-not [string]::IsNullOrWhiteSpace([string]$job["job_id"])) { "job" } else { "canonical" }) -OutputMode
     if ($outputLines.Count -gt 0) {
         $sections.Add("## Required Outputs$promptLineBreak$($outputLines -join $promptLineBreak)")
     }
@@ -1119,13 +1088,22 @@ function Sync-RunStateFromCanonicalArtifacts {
 
     $state = ConvertTo-RelayHashtable -InputObject $RunState
 
-    $plannedTasksArtifact = Read-Artifact -ProjectRoot $script:ProjectRoot -RunId $RunId -Scope run -Phase "Phase4" -ArtifactId "phase4_tasks.json"
-    if ($plannedTasksArtifact) {
-        $state = Register-PlannedTasks -RunState $state -TasksArtifact $plannedTasksArtifact
+    $plannedTasksSnapshot = ConvertTo-RelayHashtable -InputObject (Get-ArtifactRefValidationSnapshot -ProjectRoot $script:ProjectRoot -RunId $RunId -ArtifactRef @{
+        scope = "run"
+        phase = "Phase4"
+        artifact_id = "phase4_tasks.json"
+    })
+    if ($plannedTasksSnapshot["artifact"] -and [bool]$plannedTasksSnapshot["validation"]["valid"]) {
+        $state = Register-PlannedTasks -RunState $state -TasksArtifact $plannedTasksSnapshot["artifact"]
     }
 
-    $phase7VerdictArtifact = Read-Artifact -ProjectRoot $script:ProjectRoot -RunId $RunId -Scope run -Phase "Phase7" -ArtifactId "phase7_verdict.json"
-    if ($phase7VerdictArtifact -and [string]$phase7VerdictArtifact["verdict"] -eq "conditional_go") {
+    $phase7VerdictSnapshot = ConvertTo-RelayHashtable -InputObject (Get-ArtifactRefValidationSnapshot -ProjectRoot $script:ProjectRoot -RunId $RunId -ArtifactRef @{
+        scope = "run"
+        phase = "Phase7"
+        artifact_id = "phase7_verdict.json"
+    })
+    $phase7VerdictArtifact = $phase7VerdictSnapshot["artifact"]
+    if ($phase7VerdictArtifact -and [bool]$phase7VerdictSnapshot["validation"]["valid"] -and [string]$phase7VerdictArtifact["verdict"] -eq "conditional_go") {
         $state = Register-RepairTasksFromVerdict -RunState $state -VerdictArtifact $phase7VerdictArtifact -OriginPhase "Phase7"
     }
 
@@ -1173,6 +1151,7 @@ function Append-RunStatusChangedEvent {
         current_role = $state["current_role"]
         current_task_id = $state["current_task_id"]
         active_job_id = $state["active_job_id"]
+        active_attempt = (ConvertTo-RelayHashtable -InputObject $state["active_attempt"])
         pending_approval = (ConvertTo-RelayHashtable -InputObject $state["pending_approval"])
         open_requirements = @($state["open_requirements"])
         task_order = @($state["task_order"])
@@ -1194,6 +1173,7 @@ function Invoke-ManualStep {
         phase = $Phase
         role = $Role
         attempt = 1
+        attempt_id = Get-RelayAttemptPromptToken
         provider = $providerSpec["provider"]
         command = $providerSpec["command"]
         flags = $providerSpec["flags"]
@@ -1216,6 +1196,7 @@ function Invoke-EngineStep {
         $recoveredMetadata = ConvertTo-RelayHashtable -InputObject $staleRepair["job_metadata"]
         $recoveredJobId = [string]$runState["active_job_id"]
         $runState = ConvertTo-RelayHashtable -InputObject $staleRepair["run_state"]
+        $runState = Clear-RunStateActiveAttempt -RunState $runState -Status "recovered" -Result ([string]$staleRepair["reason"])
         Write-RunState -ProjectRoot $script:ProjectRoot -RunState $runState | Out-Null
         Append-RunStatusChangedEvent -RunId $ResolvedRunId -RunState $runState
         Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event @{
@@ -1247,6 +1228,7 @@ function Invoke-EngineStep {
             $taskId = [string]$nextAction["task_id"]
             $providerSpec = Resolve-RoleProviderSpec -ResolvedRole $resolvedRole -ProviderName $Provider -ExplicitCommand $ProviderCommand -ExplicitFlags $ProviderFlags
             $phaseDefinition = Get-PhaseDefinition -ProjectRoot $script:ProjectRoot -Phase $phaseName -Provider ([string]$providerSpec["provider"])
+            $dispatchPreparation = ConvertTo-RelayHashtable -InputObject (Prepare-PhaseAttemptDispatchMetadata -RunState $runState -ProjectRoot $script:ProjectRoot -PhaseName $phaseName -TaskId $taskId -ArchiveIfNeeded)
 
             $jobSpec = @{
                 run_id = $ResolvedRunId
@@ -1255,19 +1237,27 @@ function Invoke-EngineStep {
                 role = $resolvedRole
                 task_id = $taskId
                 attempt = 1
+                attempt_id = Get-RelayAttemptPromptToken
                 provider = $providerSpec["provider"]
                 command = $providerSpec["command"]
                 flags = $providerSpec["flags"]
                 prompt_package = $phaseDefinition["prompt_package"]
                 selected_task = $nextAction["selected_task"]
+                archived_context = $dispatchPreparation["archived_context"]
             }
 
             $dispatchState = ConvertTo-RelayHashtable -InputObject $runState
             $dispatchState["status"] = "running"
             $dispatchState["active_job_id"] = $jobSpec["job_id"]
             $dispatchState = Set-RunStateCursor -RunState $dispatchState -Phase $phaseName -TaskId $taskId
+            $archiveResult = ConvertTo-RelayHashtable -InputObject $dispatchPreparation["archive_result"]
+            $archivePath = if ($archiveResult) { [string]$archiveResult["snapshot_path"] } else { $null }
+            $dispatchState = Start-RunStateActiveAttempt -RunState $dispatchState -AttemptId ([string]$jobSpec["attempt_id"]) -Phase $phaseName -Stage "dispatching" -Status "running" -TaskId $taskId -JobId ([string]$jobSpec["job_id"]) -ArchivePath $archivePath
             $dispatchState = Sync-RunStatePhaseHistory -RunState $dispatchState
             Write-RunState -ProjectRoot $script:ProjectRoot -RunState $dispatchState | Out-Null
+            if ($dispatchPreparation["archive_event"]) {
+                Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event $dispatchPreparation["archive_event"]
+            }
             Append-RunStatusChangedEvent -RunId $ResolvedRunId -RunState $dispatchState
 
             if (-not [string]::IsNullOrWhiteSpace($taskId)) {
@@ -1289,23 +1279,44 @@ function Invoke-EngineStep {
                 New-EnginePromptText -RunState $dispatchState -Action $nextAction -JobSpec $jobSpec -PhaseDefinition $phaseDefinition
             }
 
+            $dispatchState = Update-RunStateActiveAttempt -RunState $dispatchState -Stage "running" -Status "running" -TaskId $taskId -JobId ([string]$jobSpec["job_id"])
+            Write-RunState -ProjectRoot $script:ProjectRoot -RunState $dispatchState | Out-Null
+            Append-RunStatusChangedEvent -RunId $ResolvedRunId -RunState $dispatchState
+
             $phaseHistoryEntry = Get-CurrentPhaseHistoryEntry -RunState $dispatchState -PhaseName $phaseName -Role $resolvedRole
-            $phaseStartedAtUtc = Convert-RelayDateTimeToUtc -Value ([string]$phaseHistoryEntry["started"])
+            $phaseStartedAtUtc = if ($phaseHistoryEntry) {
+                Convert-RelayDateTimeToUtc -Value ([string]$phaseHistoryEntry["started"])
+            }
+            elseif ($dispatchState["active_attempt"]) {
+                $activeAttempt = ConvertTo-RelayHashtable -InputObject $dispatchState["active_attempt"]
+                Convert-RelayDateTimeToUtc -Value ([string]$activeAttempt["started_at"])
+            }
+            else {
+                $null
+            }
             $script:ArtifactCompletionProbeState = @{
                 run_id = $ResolvedRunId
+                job_id = [string]$jobSpec["job_id"]
                 phase_name = $phaseName
                 phase_definition = $phaseDefinition
                 task_id = $taskId
                 phase_started_at_utc = $phaseStartedAtUtc
             }
             try {
-                $executionResult = Invoke-ExecutionRunner -JobSpec $jobSpec -PromptText $promptText -ProjectRoot $script:ProjectRoot -WorkingDirectory $script:ProjectDir -TimeoutPolicy (Get-StepTimeoutPolicy) -ArtifactCompletionProbe ${function:Invoke-PhaseArtifactCompletionProbe}
+                $transactionResult = ConvertTo-RelayHashtable -InputObject (Invoke-PhaseExecutionTransaction -JobSpec $jobSpec -PromptText $promptText -ProjectRoot $script:ProjectRoot -WorkingDirectory $script:ProjectDir -TimeoutPolicy (Get-StepTimeoutPolicy) -RunId $ResolvedRunId -PhaseName $phaseName -PhaseDefinition $phaseDefinition -ArtifactCompletionProbe ${function:Invoke-PhaseArtifactCompletionProbe} -TaskId $taskId -PhaseStartedAtUtc $phaseStartedAtUtc)
             }
             finally {
                 $script:ArtifactCompletionProbeState = $null
             }
-            $outputSync = Sync-PhaseOutputArtifacts -RunId $ResolvedRunId -PhaseName $phaseName -PhaseDefinition $phaseDefinition -TaskId $taskId
-            $validationResult = Resolve-StepValidation -RunId $ResolvedRunId -PhaseName $phaseName -PhaseDefinition $phaseDefinition -OutputSyncResult $outputSync -TaskId $taskId
+            $outputSync = ConvertTo-RelayHashtable -InputObject $transactionResult["output_sync_result"]
+            $validationResult = ConvertTo-RelayHashtable -InputObject $transactionResult["validation_result"]
+            $commitResult = ConvertTo-RelayHashtable -InputObject $transactionResult["commit_result"]
+            $executionResult = ConvertTo-RelayHashtable -InputObject $transactionResult["raw_execution_result"]
+            $effectiveExecutionResult = ConvertTo-RelayHashtable -InputObject $transactionResult["effective_execution_result"]
+            $attemptId = [string]$transactionResult["resolved_attempt_id"]
+            $dispatchState = Update-RunStateActiveAttempt -RunState $dispatchState -AttemptId $attemptId -Stage "committing" -Status "running" -TaskId $taskId -JobId ([string]$jobSpec["job_id"]) -Result ([string]$effectiveExecutionResult["result_status"])
+            Write-RunState -ProjectRoot $script:ProjectRoot -RunState $dispatchState | Out-Null
+            Append-RunStatusChangedEvent -RunId $ResolvedRunId -RunState $dispatchState
 
             if ($validationResult["validator_ref"]) {
                 $validatorRef = ConvertTo-RelayHashtable -InputObject $validationResult["validator_ref"]
@@ -1319,11 +1330,24 @@ function Invoke-EngineStep {
                     errors = if ($validatorStatus) { @($validatorStatus["errors"]) } else { @() }
                     warnings = if ($validatorStatus) { @($validatorStatus["warnings"]) } else { @() }
                 }
+                if ($commitResult -and @($commitResult["committed"]).Count -gt 0) {
+                    Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event @{
+                        type = "phase.artifacts_committed"
+                        phase = $phaseName
+                        task_id = $taskId
+                        job_id = $jobSpec["job_id"]
+                        artifact_ids = @(
+                            @($commitResult["committed"]) |
+                                ForEach-Object {
+                                    $committedArtifact = ConvertTo-RelayHashtable -InputObject $_
+                                    [string]$committedArtifact["artifact_id"]
+                                }
+                        )
+                    }
+                }
             }
 
-            $effectiveResultResolution = Resolve-EffectiveExecutionResult -ExecutionResult $executionResult -ValidationResult $validationResult["validation"]
-            $effectiveExecutionResult = ConvertTo-RelayHashtable -InputObject $effectiveResultResolution["execution_result"]
-            if ([bool]$effectiveResultResolution["recovered_from_timeout"]) {
+            if ([bool]$transactionResult["recovered_from_timeout"]) {
                 Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event @{
                     type = "job.timeout_recovered"
                     job_id = $jobSpec["job_id"]
@@ -1343,10 +1367,19 @@ function Invoke-EngineStep {
 
             $mutation = Apply-JobResult -RunState $dispatchState -JobResult $effectiveExecutionResult -ValidationResult $validationResult["validation"] -Artifact $validationResult["artifact"] -ProjectRoot $script:ProjectRoot -ApprovalPhases $script:HumanReviewPhases
             $nextRunState = ConvertTo-RelayHashtable -InputObject $mutation["run_state"]
+            $mutationAction = ConvertTo-RelayHashtable -InputObject $mutation["action"]
+            $attemptTerminalStatus = if ([string]$mutationAction["type"] -eq "FailRun") { "failed" } else { "completed" }
+            $attemptTerminalResult = switch ([string]$mutationAction["type"]) {
+                "FailRun" { [string]$mutationAction["reason"] }
+                "RequestApproval" { "waiting_approval" }
+                "Continue" { "phase_transitioned" }
+                "CompleteRun" { "run_completed" }
+                default { [string]$mutationAction["type"] }
+            }
+            $nextRunState = Clear-RunStateActiveAttempt -RunState $nextRunState -Status $attemptTerminalStatus -Result $attemptTerminalResult
             Write-RunState -ProjectRoot $script:ProjectRoot -RunState $nextRunState | Out-Null
             Append-RunStatusChangedEvent -RunId $ResolvedRunId -RunState $nextRunState
 
-            $mutationAction = ConvertTo-RelayHashtable -InputObject $mutation["action"]
             foreach ($spawnedTask in @($mutation["spawned_tasks"])) {
                 $spawnedTaskObject = ConvertTo-RelayHashtable -InputObject $spawnedTask
                 $spawnedTaskState = $null

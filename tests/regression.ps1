@@ -92,6 +92,47 @@ function New-ChecklistEntry {
     }
 }
 
+function Convert-EntryFieldToScalar {
+    param(
+        [Parameter(Mandatory)]$Entries,
+        [string]$FieldName = "evidence"
+    )
+
+    $normalizedEntries = New-Object System.Collections.Generic.List[object]
+    foreach ($entryRaw in @($Entries)) {
+        $entry = ConvertTo-RelayHashtable -InputObject $entryRaw
+        if ($entry -is [System.Collections.IDictionary]) {
+            $copy = [ordered]@{}
+            foreach ($key in $entry.Keys) {
+                $copy[[string]$key] = $entry[$key]
+            }
+
+            if ($copy.Keys -contains $FieldName) {
+                $fieldValue = $copy[$FieldName]
+                if ($null -eq $fieldValue) {
+                    $items = @()
+                }
+                elseif ($fieldValue -is [string]) {
+                    $items = @([string]$fieldValue)
+                }
+                else {
+                    $items = @($fieldValue)
+                }
+
+                $items = [object[]]@($items)
+                $copy[$FieldName] = if ($items.Count -gt 0) { [string]$items[0] } else { "" }
+            }
+
+            $normalizedEntries.Add($copy)
+        }
+        else {
+            $normalizedEntries.Add($entryRaw)
+        }
+    }
+
+    return @($normalizedEntries.ToArray())
+}
+
 function New-ChecklistSet {
     param(
         [string[]]$CheckIds,
@@ -351,6 +392,8 @@ try {
     $runId = New-RunId -Now ([datetime]"2026-03-24T12:34:56+09:00")
     $defaultRunState = New-RunState -RunId "run-default" -ProjectRoot $tempRoot
     Assert-Equal $defaultRunState["current_phase"] "Phase0" "New-RunState should default to Phase0"
+    Assert-True ($defaultRunState.Keys -contains "active_attempt") "New-RunState should initialize active_attempt"
+    Assert-True ($null -eq $defaultRunState["active_attempt"]) "New-RunState should default active_attempt to null"
     $runState = New-RunState -RunId $runId -ProjectRoot $tempRoot -CurrentPhase "Phase3" -CurrentRole "implementer"
     Write-RunState -ProjectRoot $tempRoot -RunState $runState | Out-Null
     Set-CurrentRunPointer -ProjectRoot $tempRoot -RunId $runId | Out-Null
@@ -360,12 +403,29 @@ try {
     $readState = Read-RunState -ProjectRoot $tempRoot -RunId $runId
     Assert-Equal $readState["current_phase"] "Phase3" "Read-RunState should preserve current_phase"
     Assert-Equal @($readState["open_requirements"]).Count 0 "Read-RunState should preserve empty arrays"
+    Assert-True ($readState.Keys -contains "active_attempt") "Read-RunState should preserve active_attempt compatibility field"
     Assert-Equal (Resolve-ActiveRunId -ProjectRoot $tempRoot) $runId "Resolve-ActiveRunId should use current-run pointer"
     Assert-Equal @((Get-Events -ProjectRoot $tempRoot -RunId $runId)).Count 2 "Get-Events should return appended events"
     Assert-Equal (Get-LastEvent -ProjectRoot $tempRoot -RunId $runId -Type "job.finished")["job_id"] "job-1" "Get-LastEvent should return the latest matching event"
     $statusProjection = Get-Content -Path (Join-Path $tempRoot "queue/status.yaml") -Raw -Encoding UTF8
     Assert-Contains $statusProjection 'current_phase: "Phase3"' "Write-RunState should project current_phase to status.yaml"
     Assert-Contains $statusProjection 'assigned_to: "implementer"' "Write-RunState should project assigned_to to status.yaml"
+
+    $attemptState = Start-RunStateActiveAttempt -RunState $readState -AttemptId "attempt-0001" -Phase "Phase3" -Stage "dispatching" -Status "running" -TaskId "T-01" -JobId "job-1"
+    $attemptState = Update-RunStateActiveAttempt -RunState $attemptState -AttemptId "attempt-0002" -Stage "committing" -Result "succeeded"
+    Assert-Equal $attemptState["active_attempt"]["attempt_id"] "attempt-0002" "Update-RunStateActiveAttempt should allow replacing the active attempt id"
+    Assert-Equal $attemptState["active_attempt"]["stage"] "committing" "Update-RunStateActiveAttempt should update the active attempt stage"
+    $attemptState = Clear-RunStateActiveAttempt -RunState $attemptState -Status "completed" -Result "phase_transitioned"
+    Assert-True ($null -eq $attemptState["active_attempt"]) "Clear-RunStateActiveAttempt should clear active_attempt"
+
+    $taskHistoryState = New-RunState -RunId "run-history" -ProjectRoot $tempRoot -CurrentPhase "Phase5" -CurrentRole "implementer"
+    $taskHistoryState["current_task_id"] = "T-01"
+    $taskHistoryState["phase_history"] = @()
+    $taskHistoryState = Sync-RunStatePhaseHistory -RunState $taskHistoryState
+    Assert-Equal $taskHistoryState["phase_history"][0]["task_id"] "T-01" "Sync-RunStatePhaseHistory should record task_id on new phase entries"
+    $taskHistoryState["current_task_id"] = "T-02"
+    $taskHistoryState = Sync-RunStatePhaseHistory -RunState $taskHistoryState
+    Assert-Equal @($taskHistoryState["phase_history"]).Count 2 "Sync-RunStatePhaseHistory should open a new entry when the task id changes within a task-scoped phase"
 
     $lockHandle = $null
     $reacquiredLock = $null
@@ -447,6 +507,9 @@ Assert-Contains $copilotArguments '-p "hello world"' "Copilot execution should a
 
 $copilotDisplayArguments = Get-ExecutionArgumentsForAttempt -InvocationSpec $copilotInvocation -PromptText "hello world" -ForDisplay
 Assert-Contains $copilotDisplayArguments "-p <prompt>" "Copilot execution logs should redact the raw prompt text"
+$copilotArgumentList = @(Get-ExecutionArgumentListForAttempt -InvocationSpec $copilotInvocation -PromptText "hello`nworld")
+Assert-Equal $copilotArgumentList[$copilotArgumentList.Count - 2] "-p" "Copilot execution should append the prompt flag as a dedicated token"
+Assert-Equal $copilotArgumentList[$copilotArgumentList.Count - 1] "hello`nworld" "Copilot execution should keep a multiline prompt as a single argument token"
 
 $timeoutRecovery = Resolve-EffectiveExecutionResult -ExecutionResult @{
     result_status = "failed"
@@ -481,6 +544,37 @@ try {
 }
 finally {
     Remove-Item -Path $tempScriptCommand -Force -ErrorAction SilentlyContinue
+}
+
+$tempArgvScriptCommand = Join-Path ([System.IO.Path]::GetTempPath()) ("relay-dev-argv-command-" + [guid]::NewGuid().ToString("N") + ".ps1")
+try {
+    @'
+$result = [ordered]@{
+    count = $args.Count
+    flag = if ($args.Count -ge 2) { [string]$args[$args.Count - 2] } else { "" }
+    prompt = if ($args.Count -ge 1) { [string]$args[$args.Count - 1] } else { "" }
+}
+$result | ConvertTo-Json -Compress
+'@ | Set-Content -Path $tempArgvScriptCommand -Encoding UTF8
+
+    $argvAttempt = Invoke-ExecutionAttempt -InvocationSpec @{
+        provider = "test-cli"
+        command = $tempArgvScriptCommand
+        arguments = "--alpha"
+        prompt_mode = "argv"
+        prompt_flag = "-p"
+    } -PromptText "line1`nline2" -WorkingDirectory $repoRoot -Attempt 1 -TimeoutPolicy @{
+        warn_after_sec = 0
+        retry_after_sec = 0
+        abort_after_sec = 0
+    }
+    $argvPayload = ConvertTo-RelayHashtable -InputObject (($argvAttempt["stdout"] | ConvertFrom-Json))
+    Assert-Equal $argvPayload["count"] 3 "Execution runner should preserve argv prompt transport for .ps1 commands without splitting multiline prompts"
+    Assert-Equal $argvPayload["flag"] "-p" "Execution runner should pass the argv prompt flag as a dedicated argument"
+    Assert-Equal $argvPayload["prompt"] "line1`nline2" "Execution runner should pass multiline argv prompts as a single argument"
+}
+finally {
+    Remove-Item -Path $tempArgvScriptCommand -Force -ErrorAction SilentlyContinue
 }
 
 Write-Host "[5/11] Testing typed artifacts and validator..."
@@ -641,6 +735,54 @@ try {
     $legacyPhase4Validation = Test-ArtifactContract -ArtifactId "phase4_tasks.json" -Artifact $legacyPhase4Tasks -Phase "Phase4"
     Assert-True ([bool]$legacyPhase4Validation["valid"]) "Legacy task visual_contract maps should validate after normalization in Phase4"
     Assert-Contains (@($legacyPhase4Validation["warnings"]) -join "`n") "tasks[T-legacy].visual_contract.component_patterns" "Phase4 normalization warnings should include the task path"
+
+    $archiveRunId = "run-archive-phase"
+    Write-RunState -ProjectRoot $tempArtifactRoot -RunState (New-RunState -RunId $archiveRunId -ProjectRoot $tempArtifactRoot -CurrentPhase "Phase3" -CurrentRole "implementer") | Out-Null
+    Save-Artifact -ProjectRoot $tempArtifactRoot -RunId $archiveRunId -Scope run -Phase "Phase3" -ArtifactId "phase3_design.md" -Content "# Archived Phase3" | Out-Null
+    Save-Artifact -ProjectRoot $tempArtifactRoot -RunId $archiveRunId -Scope run -Phase "Phase3" -ArtifactId "phase3_design.json" -Content @{
+        feature_list = @("archive-test")
+        api_definitions = @("GET /archive")
+        entities = @("ArchiveEntity")
+        constraints = @("Archive before rerun")
+        state_transitions = @("none")
+        reuse_decisions = @("reuse")
+        module_boundaries = @("src/archive")
+        public_interfaces = @("archive()")
+        allowed_dependencies = @("archive -> shared")
+        forbidden_dependencies = @("archive -> db direct")
+        side_effect_boundaries = @("archive boundary")
+        state_ownership = @("archive owner")
+        visual_contract = (New-VisualContract -Mode "not_applicable")
+    } -AsJson | Out-Null
+    $phaseArchiveResult = Archive-PhaseArtifacts -ProjectRoot $tempArtifactRoot -RunId $archiveRunId -Scope run -Phase "Phase3" -Reason "test_rerun_archive"
+    Assert-True ([bool]$phaseArchiveResult["archived"]) "Archive-PhaseArtifacts should move existing run-scoped phase outputs before rerun"
+    Assert-True (-not (Test-Path (Get-ArtifactPath -ProjectRoot $tempArtifactRoot -RunId $archiveRunId -Scope run -Phase "Phase3" -ArtifactId "phase3_design.json"))) "Archived run-scoped phase JSON should no longer remain in the active phase directory"
+    Assert-True (Test-Path (Join-Path ([string]$phaseArchiveResult["snapshot_path"]) "metadata.json")) "Archive-PhaseArtifacts should record snapshot metadata"
+    $latestArchivedPhaseJson = @(Get-LatestArchivedPhaseJsonArtifacts -ProjectRoot $tempArtifactRoot -RunId $archiveRunId -Scope run -Phase "Phase3")
+    Assert-Equal $latestArchivedPhaseJson.Count 1 "Get-LatestArchivedPhaseJsonArtifacts should return the latest archived phase JSON files"
+    Assert-Equal ([string]$latestArchivedPhaseJson[0]["artifact_id"]) "phase3_design.json" "Archived phase JSON context should surface the archived artifact id"
+
+    $archiveTaskRunId = "run-archive-task"
+    Write-RunState -ProjectRoot $tempArtifactRoot -RunState (New-RunState -RunId $archiveTaskRunId -ProjectRoot $tempArtifactRoot -CurrentPhase "Phase5" -CurrentRole "implementer" -TaskId "T-archive") | Out-Null
+    Save-Artifact -ProjectRoot $tempArtifactRoot -RunId $archiveTaskRunId -Scope task -TaskId "T-archive" -Phase "Phase6" -ArtifactId "phase6_result.json" -Content @{
+        task_id = "T-archive"
+        test_command = "npm test"
+        lint_command = "npm run lint"
+        tests_passed = 1
+        tests_failed = 0
+        coverage_line = 80
+        coverage_branch = 70
+        verdict = "go"
+        conditional_go_reasons = @()
+        verification_checks = New-Phase6VerificationChecks
+        open_requirements = @()
+        resolved_requirement_ids = @()
+    } -AsJson | Out-Null
+    $taskArchiveResult = Archive-PhaseArtifacts -ProjectRoot $tempArtifactRoot -RunId $archiveTaskRunId -Scope task -Phase "Phase6" -TaskId "T-archive" -Reason "test_task_rerun_archive"
+    Assert-True ([bool]$taskArchiveResult["archived"]) "Archive-PhaseArtifacts should move existing task-scoped phase outputs before rerun"
+    $latestArchivedTaskJson = @(Get-LatestArchivedPhaseJsonArtifacts -ProjectRoot $tempArtifactRoot -RunId $archiveTaskRunId -Scope task -Phase "Phase6" -TaskId "T-archive")
+    Assert-Equal $latestArchivedTaskJson.Count 1 "Get-LatestArchivedPhaseJsonArtifacts should return the latest archived task-scoped JSON files"
+    Assert-Contains ([string]$latestArchivedTaskJson[0]["path"]) "T-archive" "Archived task-scoped JSON context should preserve the task scope path"
     Assert-True (Test-Path (Join-Path $tempArtifactRoot "outputs/req-compat/phase3_design.md")) "Run-scoped markdown should be projected to outputs/"
     Assert-True (Test-Path (Join-Path $tempArtifactRoot "outputs/req-compat/tasks/T-01/phase6_result.json")) "Task-scoped JSON should be projected to outputs/"
     Assert-True (Test-Path (Join-Path $tempArtifactRoot "outputs/req-compat/.tasks/T-01_completed.md")) "Phase6 verdict should create compatibility completion marker"
@@ -694,6 +836,91 @@ try {
     } -Phase "Phase3-1"
     Assert-True (-not [bool]$invalidPhase31["valid"]) "go verdict with non-pass design boundary review check should be invalid"
     Assert-Contains ($invalidPhase31["errors"] -join "`n") "design contract review_checks" "Phase3-1 validator should enforce fixed design contract review checks"
+
+    $legacyPhase31Verdict = [ordered]@{
+        verdict = "conditional_go"
+        rollback_phase = ""
+        must_fix = "Clarify design boundary issue"
+        warnings = "Track the remaining review warning"
+        evidence = "phase3_design.json"
+        review_checks = Convert-EntryFieldToScalar -Entries (New-Phase31ReviewChecks -StatusOverrides @{
+            dependency_rules = "warning"
+        })
+    }
+    $legacyPhase31Normalization = Normalize-ArtifactForValidation -ArtifactId "phase3-1_verdict.json" -Artifact $legacyPhase31Verdict
+    $legacyPhase31NormalizedArtifact = ConvertTo-RelayHashtable -InputObject $legacyPhase31Normalization["artifact"]
+    Assert-True ([bool]$legacyPhase31Normalization["changed"]) "Legacy Phase3-1 scalar evidence should be normalized before validation"
+    Assert-Contains (@($legacyPhase31Normalization["warnings"]) -join "`n") "review_checks[0].evidence" "Phase3-1 normalization warnings should point to checklist evidence"
+    Assert-True ($legacyPhase31NormalizedArtifact["review_checks"][0]["evidence"] -is [System.Collections.IEnumerable] -and -not ($legacyPhase31NormalizedArtifact["review_checks"][0]["evidence"] -is [string])) "Normalized Phase3-1 checklist evidence should become an array"
+    $legacyPhase31Validation = Test-ArtifactContract -ArtifactId "phase3-1_verdict.json" -Artifact $legacyPhase31Verdict -Phase "Phase3-1"
+    Assert-True ([bool]$legacyPhase31Validation["valid"]) "Legacy Phase3-1 scalar evidence should validate after normalization"
+    $legacySnapshotRunId = "run-validation-snapshot"
+    Write-RunState -ProjectRoot $tempArtifactRoot -RunState (New-RunState -RunId $legacySnapshotRunId -ProjectRoot $tempArtifactRoot -CurrentPhase "Phase3-1" -CurrentRole "reviewer") | Out-Null
+    $legacySnapshotPath = Save-Artifact -ProjectRoot $tempArtifactRoot -RunId $legacySnapshotRunId -Scope run -Phase "Phase3-1" -ArtifactId "phase3-1_verdict.json" -Content $legacyPhase31Verdict -AsJson
+    $legacySnapshotBefore = Get-Content -Path $legacySnapshotPath -Raw -Encoding UTF8
+    $legacySnapshotValidation = ConvertTo-RelayHashtable -InputObject (Get-ArtifactRefValidationSnapshot -ProjectRoot $tempArtifactRoot -RunId $legacySnapshotRunId -ArtifactRef @{
+        scope = "run"
+        phase = "Phase3-1"
+        artifact_id = "phase3-1_verdict.json"
+    })
+    Assert-True ([bool]$legacySnapshotValidation["validation"]["valid"]) "Artifact ref validation snapshot should validate legacy reviewer artifacts in memory"
+    Assert-True ([bool]$legacySnapshotValidation["normalization"]["changed"]) "Artifact ref validation snapshot should report in-memory normalization"
+    Assert-True ($legacySnapshotValidation["artifact"]["review_checks"][0]["evidence"] -is [System.Collections.IEnumerable] -and -not ($legacySnapshotValidation["artifact"]["review_checks"][0]["evidence"] -is [string])) "Artifact ref validation snapshot should expose normalized array fields without rewriting canonical JSON"
+    $legacySnapshotStoredArtifact = Get-Content -Path $legacySnapshotPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    Assert-True ($legacySnapshotStoredArtifact.review_checks[0].evidence -is [string]) "Read-only validation should not rewrite canonical reviewer artifacts on disk"
+    Assert-Equal (Get-Content -Path $legacySnapshotPath -Raw -Encoding UTF8) $legacySnapshotBefore "Read-only validation should leave the stored artifact bytes unchanged"
+
+    $legacyPhase51Verdict = [ordered]@{
+        task_id = "T-legacy"
+        verdict = "reject"
+        rollback_phase = "Phase5"
+        must_fix = "Repair the failed acceptance criterion"
+        warnings = "Reviewer warning"
+        evidence = "phase5_result.json"
+        acceptance_criteria_checks = @(
+            [ordered]@{
+                criterion = "API exists"
+                status = "fail"
+                notes = "Acceptance criterion failed."
+                evidence = "phase5_result.json"
+            }
+        )
+        review_checks = Convert-EntryFieldToScalar -Entries (New-Phase51ReviewChecks -StatusOverrides @{
+            changed_files_audit = "fail"
+        })
+    }
+    $legacyPhase51Validation = Test-ArtifactContract -ArtifactId "phase5-1_verdict.json" -Artifact $legacyPhase51Verdict -Phase "Phase5-1"
+    Assert-True ([bool]$legacyPhase51Validation["valid"]) "Legacy Phase5-1 scalar evidence should validate after normalization"
+    Assert-Contains (@($legacyPhase51Validation["warnings"]) -join "`n") "acceptance_criteria_checks[0].evidence" "Phase5-1 normalization warnings should include acceptance criteria evidence"
+
+    $legacyPhase7Verdict = [ordered]@{
+        verdict = "conditional_go"
+        rollback_phase = ""
+        must_fix = "Address the final review issue"
+        warnings = "Hold for a small follow-up"
+        evidence = "phase7_pr_review.md"
+        review_checks = Convert-EntryFieldToScalar -Entries (New-Phase7ReviewChecks -StatusOverrides @{
+            maintainability = "warning"
+        })
+        human_review = [ordered]@{
+            recommendation = "recommended"
+            reasons = "Human spot-check before merge"
+            focus_points = "Critical path behavior"
+        }
+        resolved_requirement_ids = "REQ-01"
+        follow_up_tasks = [ordered]@{
+            task_id = "T-fix"
+            purpose = "Address the flagged issue"
+            changed_files = "src/app.ts"
+            acceptance_criteria = "Fix the flagged issue"
+            depends_on = "T-01"
+            verification = "npm test"
+            source_evidence = "phase7_verdict.json"
+        }
+    }
+    $legacyPhase7Validation = Test-ArtifactContract -ArtifactId "phase7_verdict.json" -Artifact $legacyPhase7Verdict -Phase "Phase7"
+    Assert-True ([bool]$legacyPhase7Validation["valid"]) "Legacy Phase7 scalar arrays should validate after normalization"
+    Assert-Contains (@($legacyPhase7Validation["warnings"]) -join "`n") "human_review.reasons" "Phase7 normalization warnings should include nested human_review arrays"
 
     $phaseDefinition = Get-PhaseDefinition -ProjectRoot $tempArtifactRoot -Phase "Phase6" -Provider "codex-cli"
     Assert-Equal $phaseDefinition["validator"]["artifact_id"] "phase6_result.json" "Phase definition should expose validator artifact id"
@@ -1457,7 +1684,9 @@ $phase0PromptText = Get-Content -Path $phase0PromptPath -Raw -Encoding UTF8
 Assert-Contains $implementerSystemPromptText "write them in Japanese by default" "Implementer system prompt should require Japanese markdown outputs"
 Assert-Contains $implementerSystemPromptText '`Selected Task` includes a `boundary_contract`' "Implementer system prompt should enforce task boundary contracts"
 Assert-Contains $implementerSystemPromptText '`Selected Task` includes a `visual_contract`' "Implementer system prompt should enforce task visual contracts"
+Assert-Contains $implementerSystemPromptText "Archived Phase JSON Context" "Implementer system prompt should describe archived phase rerun context"
 Assert-Contains $reviewerSystemPromptText "write them in Japanese by default" "Reviewer system prompt should require Japanese markdown outputs"
+Assert-Contains $reviewerSystemPromptText "Archived Phase JSON Context" "Reviewer system prompt should describe archived phase rerun context"
 Assert-Contains $phase0PromptText "人間向けドキュメントとして日本語で記述すること" "Phase0 prompt should require Japanese markdown output"
 Assert-Contains $phase0PromptText "design_inputs" "Phase0 prompt should capture design input summaries"
 
@@ -1468,6 +1697,8 @@ Assert-Equal $phase7PromptRef $expectedPhase7PromptRef "Phase7 prompt should res
 Assert-True (Test-Path $phase7PromptRef) "Resolved Phase7 prompt should exist"
 $phase7PromptText = Get-Content -Path $phase7PromptRef -Raw -Encoding UTF8
 Assert-Contains $phase7PromptText "前段 review を鵜呑みにせず、盲点を補うこと" "Phase7 prompt should preserve phase-specific review guidance"
+Assert-Contains $phase7PromptText "review_checks[].evidence" "Phase7 prompt should require checklist evidence arrays explicitly"
+Assert-Contains $phase7PromptText "human_review.reasons" "Phase7 prompt should require nested human review arrays explicitly"
 Assert-True (-not $phase7PromptText.Contains("queue/status.yaml")) "Phase7 prompt should not expose queue/status.yaml instructions"
 Assert-True (-not $phase7PromptText.Contains("assigned_to:")) "Phase7 prompt should not expose legacy YAML update lines"
 Assert-True (-not $phase7PromptText.Contains("outputs/{要件名}")) "Phase7 prompt should not expose legacy output paths"
@@ -1515,6 +1746,12 @@ $phase51PromptRef = [string]$phase51Definition["prompt_package"]["phase_prompt_r
 $phase51PromptText = Get-Content -Path $phase51PromptRef -Raw -Encoding UTF8
 Assert-True (-not $phase51PromptText.Contains("fix_contract.yaml")) "Phase5-1 prompt should review repair tasks from Selected Task instead of legacy fix contracts"
 Assert-Contains $phase51PromptText "差し戻し先: Phase5" "Phase5-1 prompt should only allow Phase5 as a reject target"
+Assert-Contains $phase51PromptText "acceptance_criteria_checks[].evidence" "Phase5-1 prompt should require acceptance criteria evidence arrays explicitly"
+
+$phase31Definition = Get-PhaseDefinition -ProjectRoot $repoRoot -Phase "Phase3-1" -Provider "codex-cli"
+$phase31PromptRef = [string]$phase31Definition["prompt_package"]["phase_prompt_ref"]
+$phase31PromptText = Get-Content -Path $phase31PromptRef -Raw -Encoding UTF8
+Assert-Contains $phase31PromptText "review_checks[].evidence" "Phase3-1 prompt should require checklist evidence arrays explicitly"
 
 $startAgentsShPath = Join-Path $repoRoot "start-agents.sh"
 $startAgentsShText = Get-Content -Path $startAgentsShPath -Raw -Encoding UTF8
@@ -1546,6 +1783,7 @@ $cliRecoverResumeRunId = "run-cli-resume-recover-" + [guid]::NewGuid().ToString(
 $cliRecoverStepRunId = "run-cli-step-recover-" + [guid]::NewGuid().ToString("N")
 $cliRecoverInvalidArtifactRunId = "run-cli-invalid-artifact-recover-" + [guid]::NewGuid().ToString("N")
 $cliNonRecoverableRunId = "run-cli-no-recover-" + [guid]::NewGuid().ToString("N")
+$cliSyncRunId = "run-cli-sync-" + [guid]::NewGuid().ToString("N")
 $currentRunPointerPath = Get-CurrentRunPointerPath -ProjectRoot $repoRoot
 $originalPointerRaw = if (Test-Path $currentRunPointerPath) { Get-Content -Path $currentRunPointerPath -Raw -Encoding UTF8 } else { $null }
 $cliOutputDir = Join-Path $repoRoot "outputs/req-cli-step"
@@ -1631,8 +1869,33 @@ Use the seeded Phase0 fixture.
         warnings = @()
         evidence = @("tasks reviewed")
     } -AsJson | Out-Null
+    $cliPhase41ProviderScriptPath = Join-Path (Get-RunRootPath -ProjectRoot $repoRoot -RunId $cliRunId) "phase41-provider.ps1"
+    @'
+[Console]::InputEncoding = [System.Text.Encoding]::UTF8
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+$prompt = [Console]::In.ReadToEnd()
+$reviewMatch = [regex]::Match($prompt, '(?m)^- \[required\]\[run\]\[markdown\] phase4-1_task_review\.md => (?<path>.+?) \(write\)$')
+$verdictMatch = [regex]::Match($prompt, '(?m)^- \[required\]\[run\]\[json\] phase4-1_verdict\.json => (?<path>.+?) \(write\)$')
+if (-not $reviewMatch.Success -or -not $verdictMatch.Success) {
+    throw 'Phase4-1 required outputs were not present in the prompt'
+}
+$reviewPath = $reviewMatch.Groups['path'].Value.Trim()
+$verdictPath = $verdictMatch.Groups['path'].Value.Trim()
+New-Item -ItemType Directory -Path (Split-Path -Parent $reviewPath) -Force | Out-Null
+New-Item -ItemType Directory -Path (Split-Path -Parent $verdictPath) -Force | Out-Null
+Set-Content -Path $reviewPath -Value '# Phase4-1 review' -Encoding UTF8
+([ordered]@{
+    verdict = 'go'
+    rollback_phase = $null
+    must_fix = @()
+    warnings = @()
+    evidence = @('tasks reviewed')
+} | ConvertTo-Json -Depth 20) | Set-Content -Path $verdictPath -Encoding UTF8
+Write-Output 'phase4-1 outputs written'
+'@ | Set-Content -Path $cliPhase41ProviderScriptPath -Encoding UTF8
 
-    $step1Raw = & $pwshPath -NoLogo -NoProfile -File $cliScriptPath step -ConfigFile $configPath -RunId $cliRunId -Provider fake-provider
+    $step1Raw = & $pwshPath -NoLogo -NoProfile -File $cliScriptPath step -ConfigFile $configPath -RunId $cliRunId -Provider generic-cli -ProviderCommand $cliPhase41ProviderScriptPath
     $step1Json = @($step1Raw | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Last 1) | Select-Object -Last 1
     $step1 = ConvertTo-RelayHashtable -InputObject ($step1Json | ConvertFrom-Json)
     Assert-Equal $step1["mutation_action"]["type"] "RequestApproval" "CLI step should request approval after Phase4-1 go"
@@ -1684,8 +1947,58 @@ Use the seeded Phase0 fixture.
             }
         )
     } -AsJson | Out-Null
+    $cliPhase7ProviderScriptPath = Join-Path (Get-RunRootPath -ProjectRoot $repoRoot -RunId $cliSpawnRunId) "phase7-provider.ps1"
+    @'
+[Console]::InputEncoding = [System.Text.Encoding]::UTF8
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+$prompt = [Console]::In.ReadToEnd()
+$reviewMatch = [regex]::Match($prompt, '(?m)^- \[required\]\[run\]\[markdown\] phase7_pr_review\.md => (?<path>.+?) \(write\)$')
+$verdictMatch = [regex]::Match($prompt, '(?m)^- \[required\]\[run\]\[json\] phase7_verdict\.json => (?<path>.+?) \(write\)$')
+if (-not $reviewMatch.Success -or -not $verdictMatch.Success) {
+    throw 'Phase7 required outputs were not present in the prompt'
+}
+$reviewPath = $reviewMatch.Groups['path'].Value.Trim()
+$verdictPath = $verdictMatch.Groups['path'].Value.Trim()
+New-Item -ItemType Directory -Path (Split-Path -Parent $reviewPath) -Force | Out-Null
+New-Item -ItemType Directory -Path (Split-Path -Parent $verdictPath) -Force | Out-Null
+Set-Content -Path $reviewPath -Value '# Phase7 review' -Encoding UTF8
+([ordered]@{
+    verdict = 'conditional_go'
+    rollback_phase = $null
+    must_fix = @('Add a null guard before merge')
+    warnings = @()
+    evidence = @('src/app.ts:42')
+    review_checks = @(
+        [ordered]@{ check_id = 'requirements_alignment'; status = 'pass'; notes = 'phase7 requirements_alignment pass'; evidence = @('phase7:requirements_alignment') }
+        [ordered]@{ check_id = 'correctness_and_edge_cases'; status = 'warning'; notes = 'phase7 correctness_and_edge_cases warning'; evidence = @('phase7:correctness_and_edge_cases') }
+        [ordered]@{ check_id = 'security_and_privacy'; status = 'pass'; notes = 'phase7 security_and_privacy pass'; evidence = @('phase7:security_and_privacy') }
+        [ordered]@{ check_id = 'test_quality'; status = 'pass'; notes = 'phase7 test_quality pass'; evidence = @('phase7:test_quality') }
+        [ordered]@{ check_id = 'maintainability'; status = 'pass'; notes = 'phase7 maintainability pass'; evidence = @('phase7:maintainability') }
+        [ordered]@{ check_id = 'performance_and_operations'; status = 'pass'; notes = 'phase7 performance_and_operations pass'; evidence = @('phase7:performance_and_operations') }
+    )
+    human_review = [ordered]@{
+        recommendation = 'recommended'
+        reasons = @('Human spot review is recommended for final sign-off.')
+        focus_points = @('Critical issue handling')
+    }
+    resolved_requirement_ids = @()
+    follow_up_tasks = @(
+        [ordered]@{
+            task_id = 'repair-01'
+            purpose = 'Add a null guard'
+            changed_files = @('src/app.ts')
+            acceptance_criteria = @('Null guard is added')
+            depends_on = @()
+            verification = @('npm test')
+            source_evidence = @('src/app.ts:42')
+        }
+    )
+} | ConvertTo-Json -Depth 20) | Set-Content -Path $verdictPath -Encoding UTF8
+Write-Output 'phase7 outputs written'
+'@ | Set-Content -Path $cliPhase7ProviderScriptPath -Encoding UTF8
 
-    $spawnStepRaw = & $pwshPath -NoLogo -NoProfile -File $cliScriptPath step -ConfigFile $configPath -RunId $cliSpawnRunId -Provider fake-provider
+    $spawnStepRaw = & $pwshPath -NoLogo -NoProfile -File $cliScriptPath step -ConfigFile $configPath -RunId $cliSpawnRunId -Provider generic-cli -ProviderCommand $cliPhase7ProviderScriptPath
     $spawnStepJson = @($spawnStepRaw | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Last 1) | Select-Object -Last 1
     $spawnStep = ConvertTo-RelayHashtable -InputObject ($spawnStepJson | ConvertFrom-Json)
     Assert-Equal $spawnStep["mutation_action"]["type"] "RequestApproval" "CLI step should request approval after Phase7 conditional_go repair spawning"
@@ -1800,14 +2113,81 @@ Use the seeded Phase0 fixture.
         evidence = @("retry review")
     } -AsJson | Out-Null
 
-    $recoverStepRaw = & $pwshPath -NoLogo -NoProfile -File $cliScriptPath step -ConfigFile $configPath -RunId $cliRecoverStepRunId -Provider fake-provider
+    $recoverReviewPath = Get-ArtifactPath -ProjectRoot $repoRoot -RunId $cliRecoverStepRunId -Scope run -Phase "Phase4-1" -ArtifactId "phase4-1_task_review.md"
+    $recoverVerdictPath = Get-ArtifactPath -ProjectRoot $repoRoot -RunId $cliRecoverStepRunId -Scope run -Phase "Phase4-1" -ArtifactId "phase4-1_verdict.json"
+    $recoverPromptCapturePath = Join-Path (Get-RunRootPath -ProjectRoot $repoRoot -RunId $cliRecoverStepRunId) "recover-phase41-prompt.txt"
+    $recoverProviderScriptPath = Join-Path (Get-RunRootPath -ProjectRoot $repoRoot -RunId $cliRecoverStepRunId) "recover-phase41-provider.ps1"
+    $escapedRecoverPromptCapturePath = $recoverPromptCapturePath.Replace("'", "''")
+    $escapedRecoverReviewPath = $recoverReviewPath.Replace("'", "''")
+    $escapedRecoverVerdictPath = $recoverVerdictPath.Replace("'", "''")
+    @'
+[Console]::InputEncoding = [System.Text.Encoding]::UTF8
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+$prompt = [Console]::In.ReadToEnd()
+Set-Content -Path '__PROMPT_CAPTURE_PATH__' -Value $prompt -Encoding UTF8
+$match = [regex]::Match($prompt, '(?m)^- \[archived\]\[run\]\[json\] phase4-1_verdict\.json => (?<path>.+?) \(latest snapshot: (?<snapshot>[^\)]+)\)$')
+if (-not $match.Success) {
+    throw 'Archived Phase JSON Context did not include phase4-1_verdict.json'
+}
+$reviewOutputMatch = [regex]::Match($prompt, '(?m)^- \[required\]\[run\]\[markdown\] phase4-1_task_review\.md => (?<path>.+?) \(write\)$')
+if (-not $reviewOutputMatch.Success) {
+    throw 'Required Outputs did not include phase4-1_task_review.md'
+}
+$verdictOutputMatch = [regex]::Match($prompt, '(?m)^- \[required\]\[run\]\[json\] phase4-1_verdict\.json => (?<path>.+?) \(write\)$')
+if (-not $verdictOutputMatch.Success) {
+    throw 'Required Outputs did not include phase4-1_verdict.json'
+}
+$reviewOutputPath = $reviewOutputMatch.Groups['path'].Value.Trim()
+$verdictOutputPath = $verdictOutputMatch.Groups['path'].Value.Trim()
+$reviewOutputDir = Split-Path -Parent $reviewOutputPath
+if (-not (Test-Path $reviewOutputDir)) {
+    New-Item -ItemType Directory -Path $reviewOutputDir -Force | Out-Null
+}
+$verdictOutputDir = Split-Path -Parent $verdictOutputPath
+if (-not (Test-Path $verdictOutputDir)) {
+    New-Item -ItemType Directory -Path $verdictOutputDir -Force | Out-Null
+}
+$archivedVerdictPath = $match.Groups['path'].Value.Trim()
+$archivedVerdict = Get-Content -Path $archivedVerdictPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$nextEvidence = @()
+if ($null -ne $archivedVerdict.evidence) {
+    $nextEvidence += @($archivedVerdict.evidence)
+}
+$nextEvidence += 'rerun-regenerated'
+$nextVerdict = [ordered]@{
+    verdict = [string]$archivedVerdict.verdict
+    rollback_phase = $archivedVerdict.rollback_phase
+    must_fix = @($archivedVerdict.must_fix)
+    warnings = @($archivedVerdict.warnings)
+    evidence = @($nextEvidence)
+}
+Set-Content -Path $reviewOutputPath -Value ('# Phase4-1 review rerun' + [Environment]::NewLine + [Environment]::NewLine + 'Archived snapshot: ' + $match.Groups['snapshot'].Value) -Encoding UTF8
+$nextVerdict | ConvertTo-Json -Depth 20 | Set-Content -Path $verdictOutputPath -Encoding UTF8
+Write-Output 'rerun regenerated phase4-1 artifacts'
+'@.Replace('__PROMPT_CAPTURE_PATH__', $escapedRecoverPromptCapturePath) | Set-Content -Path $recoverProviderScriptPath -Encoding UTF8
+
+    $recoverStepRaw = & $pwshPath -NoLogo -NoProfile -File $cliScriptPath step -ConfigFile $configPath -RunId $cliRecoverStepRunId -Provider generic-cli -ProviderCommand $recoverProviderScriptPath
     $recoverStepJson = @($recoverStepRaw | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Last 1) | Select-Object -Last 1
     $recoverStep = ConvertTo-RelayHashtable -InputObject ($recoverStepJson | ConvertFrom-Json)
-    Assert-Equal $recoverStep["mutation_action"]["type"] "RequestApproval" "CLI step should recover retriable failed runs before dispatching the same phase"
+    Assert-Equal $recoverStep["mutation_action"]["type"] "RequestApproval" "CLI step should recover retriable failed runs, archive stale outputs, and re-request approval for the rerun"
     $cliRecoveredStepState = Read-RunState -ProjectRoot $repoRoot -RunId $cliRecoverStepRunId
     Assert-Equal $cliRecoveredStepState["status"] "waiting_approval" "Recovered failed step should continue the workflow instead of remaining failed"
     $cliStepRecoveryEvent = ConvertTo-RelayHashtable -InputObject ((Get-Events -ProjectRoot $repoRoot -RunId $cliRecoverStepRunId | Where-Object { $_["type"] -eq "run.recovered" } | Select-Object -Last 1))
     Assert-Equal $cliStepRecoveryEvent["recovery_source"] "step" "CLI step should record when it recovered a failed run"
+    $cliRecoverArchiveEvent = ConvertTo-RelayHashtable -InputObject ((Get-Events -ProjectRoot $repoRoot -RunId $cliRecoverStepRunId | Where-Object { $_["type"] -eq "phase.artifacts_archived" } | Select-Object -Last 1))
+    Assert-Equal $cliRecoverArchiveEvent["phase"] "Phase4-1" "Recovered reruns should archive the stale artifacts for the retried phase"
+    Assert-Contains (Get-Content -Path $recoverPromptCapturePath -Raw -Encoding UTF8) "## Archived Phase JSON Context" "Recovered rerun prompts should include archived JSON context"
+    Assert-Contains (Get-Content -Path $recoverPromptCapturePath -Raw -Encoding UTF8) "phase4-1_verdict.json" "Recovered rerun prompts should point the agent at the archived verdict JSON"
+    Assert-Contains (Get-Content -Path $recoverPromptCapturePath -Raw -Encoding UTF8) "\jobs\job-" "Recovered rerun prompts should direct outputs into the job-scoped staging area"
+    Assert-True (Test-Path $recoverReviewPath) "Committed canonical Phase4-1 review should exist after staged rerun commit"
+    Assert-True (Test-Path $recoverVerdictPath) "Committed canonical Phase4-1 verdict should exist after staged rerun commit"
+    if (Test-Path $recoverReviewPath) {
+        Assert-Contains (Get-Content -Path $recoverReviewPath -Raw -Encoding UTF8) "# Phase4-1 review rerun" "Committed canonical Phase4-1 review should come from the staged rerun output"
+    }
+    if (Test-Path $recoverVerdictPath) {
+        Assert-Contains (Get-Content -Path $recoverVerdictPath -Raw -Encoding UTF8) "rerun-regenerated" "Committed canonical Phase4-1 verdict should come from the staged rerun output"
+    }
 
     $cliRecoverInvalidArtifactState = New-RunState -RunId $cliRecoverInvalidArtifactRunId -ProjectRoot $repoRoot -TaskId "req-cli-invalid-artifact-recover" -CurrentPhase "Phase5-2" -CurrentRole "reviewer"
     $cliRecoverInvalidArtifactState["status"] = "failed"
@@ -1831,11 +2211,16 @@ Use the seeded Phase0 fixture.
         failure_class = $null
         result_status = "succeeded"
     }
-    Append-Event -ProjectRoot $repoRoot -RunId $cliRecoverInvalidArtifactRunId -Event @{ type = "run.failed"; reason = "invalid_artifact"; failure_class = $null }
+    Append-Event -ProjectRoot $repoRoot -RunId $cliRecoverInvalidArtifactRunId -Event @{
+        type = "run.failed"
+        reason = "invalid_artifact"
+        failure_class = $null
+    }
 
     $recoverInvalidArtifactRaw = & $pwshPath -NoLogo -NoProfile -File $cliScriptPath resume -ConfigFile $configPath -RunId $cliRecoverInvalidArtifactRunId
     $recoverInvalidArtifactRunId = @($recoverInvalidArtifactRaw | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Last 1) | Select-Object -Last 1
     Assert-Equal $recoverInvalidArtifactRunId $cliRecoverInvalidArtifactRunId "CLI resume should return the invalid-artifact recovery run id"
+
     $cliRecoveredInvalidArtifactState = Read-RunState -ProjectRoot $repoRoot -RunId $cliRecoverInvalidArtifactRunId
     Assert-Equal $cliRecoveredInvalidArtifactState["status"] "running" "CLI resume should recover invalid_artifact failures when the underlying job succeeded"
     Assert-True (@($cliRecoveredInvalidArtifactState["phase_history"]).Count -ge 2) "Recovered invalid_artifact runs should retain history and append a retry entry"
@@ -1867,6 +2252,56 @@ Use the seeded Phase0 fixture.
     $cliStillFailedState = Read-RunState -ProjectRoot $repoRoot -RunId $cliNonRecoverableRunId
     Assert-Equal $cliStillFailedState["status"] "failed" "CLI resume should not recover non-retriable failed runs"
     Assert-Equal @((Get-Events -ProjectRoot $repoRoot -RunId $cliNonRecoverableRunId | Where-Object { $_["type"] -eq "run.recovered" })).Count 0 "Non-retriable failures should not append run.recovered events"
+
+    $cliSyncState = New-RunState -RunId $cliSyncRunId -ProjectRoot $repoRoot -TaskId "req-cli-sync" -CurrentPhase "Phase7" -CurrentRole "reviewer"
+    Write-RunState -ProjectRoot $repoRoot -RunState $cliSyncState | Out-Null
+    Save-Artifact -ProjectRoot $repoRoot -RunId $cliSyncRunId -Scope run -Phase "Phase7" -ArtifactId "phase7_verdict.json" -Content @{
+        verdict = "conditional_go"
+        rollback_phase = $null
+        must_fix = @("Repair the approval edge case")
+        warnings = "Reviewer warning"
+        evidence = "src/approval.ts:18"
+        review_checks = (Convert-EntryFieldToScalar -Entries (New-Phase7ReviewChecks -StatusOverrides @{
+            correctness_and_edge_cases = "warning"
+        }))
+        human_review = @{
+            recommendation = "recommended"
+            reasons = "approval edge case remains"
+            focus_points = "verify repair task registration"
+        }
+        resolved_requirement_ids = @()
+        follow_up_tasks = @{
+            task_id = "repair-sync"
+            purpose = "Repair approval edge case"
+            changed_files = "src/approval.ts"
+            acceptance_criteria = "Repair task is registered from canonical Phase7 output"
+            depends_on = ""
+            verification = "npm test"
+            source_evidence = "src/approval.ts:18"
+        }
+    } -AsJson | Out-Null
+    $syncProbeScriptPath = Join-Path (Get-RunRootPath -ProjectRoot $repoRoot -RunId $cliSyncRunId) "sync-state-probe.ps1"
+    @'
+$null = . '__CLI_SCRIPT_PATH__' show -ConfigFile '__CONFIG_PATH__' -RunId '__RUN_ID__'
+$state = Read-RunState -ProjectRoot $script:ProjectRoot -RunId '__RUN_ID__'
+$synced = Sync-RunStateFromCanonicalArtifacts -RunId '__RUN_ID__' -RunState $state
+$taskState = $null
+if ($synced["task_states"].ContainsKey("repair-sync")) {
+    $taskState = $synced["task_states"]["repair-sync"]
+}
+[ordered]@{
+    has_repair_task = $null -ne $taskState
+    task_state = $taskState
+} | ConvertTo-Json -Depth 20 -Compress
+'@.Replace('__CLI_SCRIPT_PATH__', $cliScriptPath.Replace("'", "''")).Replace('__CONFIG_PATH__', $configPath.Replace("'", "''")).Replace('__RUN_ID__', $cliSyncRunId) | Set-Content -Path $syncProbeScriptPath -Encoding UTF8
+    $syncProbeRaw = & $pwshPath -NoLogo -NoProfile -File $syncProbeScriptPath
+    $syncProbeJson = @($syncProbeRaw | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Last 1) | Select-Object -Last 1
+    $syncProbe = ConvertTo-RelayHashtable -InputObject ($syncProbeJson | ConvertFrom-Json)
+    Assert-True ([bool]$syncProbe["has_repair_task"]) "Sync-RunStateFromCanonicalArtifacts should register repair tasks from legacy Phase7 artifacts without rewriting canonical JSON"
+    if ($syncProbe["task_state"]) {
+        Assert-Equal $syncProbe["task_state"]["task_contract_ref"]["item_id"] "repair-sync" "Synced repair task should preserve the follow-up task id"
+        Assert-Equal @(@($syncProbe["task_state"]["depends_on"]) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }).Count 0 "Synced repair task should normalize empty depends_on into an empty dependency list"
+    }
 }
 finally {
     Remove-Item -Path (Get-RunRootPath -ProjectRoot $repoRoot -RunId $cliSeedRunId) -Recurse -Force -ErrorAction SilentlyContinue
@@ -1878,6 +2313,7 @@ finally {
     Remove-Item -Path (Get-RunRootPath -ProjectRoot $repoRoot -RunId $cliRecoverStepRunId) -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -Path (Get-RunRootPath -ProjectRoot $repoRoot -RunId $cliRecoverInvalidArtifactRunId) -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -Path (Get-RunRootPath -ProjectRoot $repoRoot -RunId $cliNonRecoverableRunId) -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path (Get-RunRootPath -ProjectRoot $repoRoot -RunId $cliSyncRunId) -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -Path $cliOutputDir -Recurse -Force -ErrorAction SilentlyContinue
 
     if ($null -ne $originalPhase0SeedMarkdown) {

@@ -1,0 +1,306 @@
+{
+  "document_id": "phase-transition-refactor-plan",
+  "version": 1,
+  "generated_at": "2026-04-28T16:35:00+09:00",
+  "project": "relay-dev",
+  "objective": "Make phase progression depend on validated attempt artifacts, archive active artifacts before reruns, pass latest archived JSON as structured rerun context, and keep phase transitions consistent.",
+  "goals": [
+    "Force-advance to the next phase when required markdown and JSON artifacts are produced and validation passes.",
+    "Archive active artifacts before rollback or same-phase rerun.",
+    "Pass the latest archived JSON artifacts to the agent as rerun context.",
+    "Keep approval, rollback, retry, and normal phase transitions consistent across run-scoped and task-scoped phases."
+  ],
+  "root_findings": [
+    {
+      "id": "F-01",
+      "title": "cli.ps1 is a control-plane monolith",
+      "severity": "critical",
+      "evidence": [
+        "Invoke-EngineStep orchestrates recovery, archive, prompt assembly, execution, validation, and event/state commits.",
+        "Test-PhaseArtifactCompletion, Resolve-StepValidation, New-EnginePromptText, and Sync-RunStateFromCanonicalArtifacts live in the same entrypoint file."
+      ],
+      "impact": [
+        "Small changes couple transition logic, artifact handling, and provider invocation.",
+        "Phase-transition bugs are hard to isolate and test."
+      ]
+    },
+    {
+      "id": "F-02",
+      "title": "Phase success is decided by inconsistent mechanisms",
+      "severity": "critical",
+      "evidence": [
+        "Live success detection uses Test-PhaseArtifactCompletion.",
+        "Post-run validation uses Resolve-StepValidation on canonical artifacts.",
+        "Final mutation still depends on Apply-JobResult(job.result_status, validation.valid)."
+      ],
+      "impact": [
+        "Valid artifacts can still lead to failed runs.",
+        "Provider fast-exit and timeout paths behave differently."
+      ]
+    },
+    {
+      "id": "F-03",
+      "title": "Canonical active artifacts are both work-in-progress and source of truth",
+      "severity": "critical",
+      "evidence": [
+        "Providers write directly into runs/<run>/artifacts/run or tasks.",
+        "Validators and output sync logic read the same active paths."
+      ],
+      "impact": [
+        "Partial writes and stale artifacts can contaminate decisions.",
+        "Archive-before-rerun reduces risk but does not create attempt isolation."
+      ]
+    },
+    {
+      "id": "F-04",
+      "title": "Validation mutates canonical artifacts",
+      "severity": "high",
+      "evidence": [
+        "Resolve-StepValidation normalizes artifacts and writes them back with Save-Artifact."
+      ],
+      "impact": [
+        "Validation is not pure.",
+        "Provider mistakes and engine repairs are hard to distinguish."
+      ]
+    },
+    {
+      "id": "F-05",
+      "title": "Archived rerun context is prompt text, not structured state",
+      "severity": "high",
+      "evidence": [
+        "Format-ArchivedPhaseJsonContextLines only emits path lines.",
+        "There is no first-class archived_context_refs object in job state."
+      ],
+      "impact": [
+        "Agents must parse prompt text to find rerun context.",
+        "The exact archived snapshot used by a rerun is not tracked structurally."
+      ]
+    },
+    {
+      "id": "F-06",
+      "title": "Provider transport is brittle and string-concatenation based",
+      "severity": "critical",
+      "evidence": [
+        "execution-runner.ps1 builds a single ProcessStartInfo.Arguments string.",
+        "copilot provider uses argv prompt transport with -p.",
+        "Current runtime failure: too many arguments. Expected 0 arguments but got 66."
+      ],
+      "impact": [
+        "Prompt quoting and size issues block normal phase execution.",
+        "Transport failures leak into phase-transition behavior."
+      ]
+    },
+    {
+      "id": "F-07",
+      "title": "Phase cursor is advanced around dispatch rather than commit",
+      "severity": "high",
+      "evidence": [
+        "Approval resolution updates the run cursor to the proposed dispatch target.",
+        "Dispatch writes running state and active_job_id before phase completion is committed."
+      ],
+      "impact": [
+        "run-state, events, and user-facing status can describe different realities.",
+        "Phase history is harder to interpret."
+      ]
+    },
+    {
+      "id": "F-08",
+      "title": "Compatibility projection is coupled to canonical commit",
+      "severity": "medium",
+      "evidence": [
+        "Save-Artifact always writes outputs/ projection.",
+        "Sync-PhaseOutputArtifacts also reprojects artifacts."
+      ],
+      "impact": [
+        "Atomic commit boundaries stay blurry.",
+        "Legacy compatibility paths interfere with canonical workflow logic."
+      ]
+    }
+  ],
+  "target_architecture": {
+    "principles": [
+      "Validated attempt artifacts are the source of truth for phase success.",
+      "Provider exit is a transport signal, not the primary completion signal.",
+      "Canonical active artifacts contain only committed outputs.",
+      "Rerun context is structured data, not path text embedded in prompts."
+    ],
+    "components": [
+      {
+        "name": "PhaseAttemptStore",
+        "responsibility": "Allocate attempt-scoped staging directories and attempt metadata."
+      },
+      {
+        "name": "PhaseArchiveService",
+        "responsibility": "Archive active artifacts before rerun and record snapshot metadata."
+      },
+      {
+        "name": "PhaseValidationPipeline",
+        "responsibility": "Validate required artifacts in staging and return normalized outputs without mutating canonical state."
+      },
+      {
+        "name": "PhaseCompletionCommitter",
+        "responsibility": "Promote validated staging artifacts to canonical active storage atomically and emit completion events."
+      },
+      {
+        "name": "JobContextBuilder",
+        "responsibility": "Assemble selected task, open requirements, input refs, and archived rerun context into structured job context."
+      },
+      {
+        "name": "ProviderTransportAdapter",
+        "responsibility": "Expose prompt transport capabilities such as stdin, argv, temp_file, or protocol."
+      }
+    ]
+  },
+  "workstreams": [
+    {
+      "id": "WS-01",
+      "title": "Split orchestration logic out of cli.ps1",
+      "priority": "P0",
+      "deliverables": [
+        "engine-step-runner module",
+        "attempt-preparation module",
+        "job-context-builder module",
+        "phase-validation-pipeline module",
+        "phase-completion-committer module"
+      ],
+      "files": [
+        "app/cli.ps1",
+        "app/core/workflow-engine.ps1",
+        "app/core/run-state-store.ps1"
+      ]
+    },
+    {
+      "id": "WS-02",
+      "title": "Introduce attempt-scoped staging and atomic commit",
+      "priority": "P0",
+      "deliverables": [
+        "attempt artifact storage layout",
+        "staging reads and writes",
+        "atomic promotion to canonical active paths"
+      ],
+      "files": [
+        "app/core/artifact-repository.ps1",
+        "app/core/artifact-validator.ps1",
+        "app/core/job-result-policy.ps1"
+      ]
+    },
+    {
+      "id": "WS-03",
+      "title": "Make archive-before-rerun deterministic",
+      "priority": "P0",
+      "deliverables": [
+        "archive decision policy based on attempt creation",
+        "archive metadata with previous_job_id and previous_attempt_id",
+        "empty active directory before rerun dispatch"
+      ],
+      "files": [
+        "app/core/artifact-repository.ps1",
+        "app/core/run-state-store.ps1",
+        "app/cli.ps1"
+      ]
+    },
+    {
+      "id": "WS-04",
+      "title": "Turn archived JSON rerun data into structured context",
+      "priority": "P0",
+      "deliverables": [
+        "jobSpec.archived_context_refs[]",
+        "prompt rendering from structured rerun context",
+        "traceability from rerun attempt to archive snapshot"
+      ],
+      "files": [
+        "app/cli.ps1",
+        "app/core/artifact-repository.ps1",
+        "app/prompts/system/implementer.md",
+        "app/prompts/system/reviewer.md"
+      ]
+    },
+    {
+      "id": "WS-05",
+      "title": "Refactor provider transport and fix Copilot execution",
+      "priority": "P0",
+      "deliverables": [
+        "argument_list-based invocation",
+        "prompt transport capability model",
+        "Copilot adapter redesign"
+      ],
+      "files": [
+        "app/execution/execution-runner.ps1",
+        "app/execution/provider-adapter.ps1",
+        "app/execution/providers/generic-cli.ps1",
+        "app/execution/providers/copilot.ps1"
+      ]
+    },
+    {
+      "id": "WS-06",
+      "title": "Make validation read-only",
+      "priority": "P1",
+      "deliverables": [
+        "normalization without canonical write-back",
+        "pre-commit normalized artifact handling",
+        "separate validation and commit phases"
+      ],
+      "files": [
+        "app/core/artifact-validator.ps1",
+        "app/cli.ps1",
+        "app/core/artifact-repository.ps1"
+      ]
+    },
+    {
+      "id": "WS-07",
+      "title": "Clarify the phase state machine",
+      "priority": "P1",
+      "deliverables": [
+        "explicit in-flight attempt state",
+        "clear distinction between current committed phase and dispatched phase",
+        "phase history based on attempt lifecycle"
+      ],
+      "files": [
+        "app/core/run-state-store.ps1",
+        "app/core/workflow-engine.ps1",
+        "app/cli.ps1"
+      ]
+    },
+    {
+      "id": "WS-08",
+      "title": "Expand scenario-based regression coverage",
+      "priority": "P0",
+      "deliverables": [
+        "valid artifacts + failed provider exit still advances phase",
+        "rerun archives old outputs and passes archived JSON context",
+        "task-scoped rerun scenarios",
+        "provider transport regression tests"
+      ],
+      "files": [
+        "tests/regression.ps1"
+      ]
+    }
+  ],
+  "implementation_order": [
+    "WS-05",
+    "WS-02",
+    "WS-06",
+    "WS-03",
+    "WS-04",
+    "WS-07",
+    "WS-01",
+    "WS-08"
+  ],
+  "acceptance_criteria": [
+    "When required markdown and JSON artifacts exist in staging and validation is valid, the run advances to the next phase even if the provider exits non-zero.",
+    "Before rollback or same-phase rerun, existing active canonical artifacts are archived and removed from the active phase directory.",
+    "Rerun job metadata contains structured archived_context_refs pointing to the latest archived JSON snapshot.",
+    "Validator does not mutate canonical artifacts directly.",
+    "show, run-state.json, and events.jsonl describe the same phase progression."
+  ],
+  "recommended_new_modules": [
+    "app/core/attempt-preparation.ps1",
+    "app/core/phase-attempt-store.ps1",
+    "app/core/phase-validation-pipeline.ps1",
+    "app/core/phase-completion-committer.ps1",
+    "app/core/job-context-builder.ps1",
+    "app/execution/prompt-transport.ps1"
+  ],
+  "primary_risk": "Applying archive-before-rerun alone without attempt-scoped staging and commit semantics will keep reintroducing stale-read and fast-exit inconsistencies.",
+  "conclusion": "The fundamental fix is to combine attempt-scoped staging, validation-before-commit, structured archived context, and provider transport refactoring. Without these together, the same transition inconsistencies will recur."
+}

@@ -38,7 +38,7 @@
 - `acceptance_criteria_checks`
 - `review_checks`
 
-`must_fix` は Phase5 で直せる具体的な修正項目にすること。`evidence` には参照したファイル、コマンド、差分の根拠を入れること。
+`must_fix` は Phase5 で直せる具体的な修正項目にすること。`evidence` には参照したファイル、コマンド、差分の根拠を入れること。`evidence` は 1 件だけでも文字列ではなく JSON 配列にすること。
 
 `acceptance_criteria_checks[]` は各 acceptance criterion ごとの固定チェック配列で、各要素は以下のキーを持つこと。
 
@@ -47,7 +47,9 @@
 - `notes`
 - `evidence`
 
-`review_checks[]` は以下の `check_id` をすべて含む固定チェック配列で、各要素は `check_id`、`status`、`notes`、`evidence` を持つこと。
+`acceptance_criteria_checks[].evidence` は必ず JSON 配列にすること。
+
+`review_checks[]` は以下の `check_id` をすべて含む固定チェック配列で、各要素は `check_id`、`status`、`notes`、`evidence` を持つこと。`review_checks[].evidence` も必ず JSON 配列にすること。
 
 - `selected_task_alignment`
 - `acceptance_criteria_coverage`

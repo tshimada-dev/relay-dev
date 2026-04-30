@@ -190,6 +190,7 @@ function Sync-RunStatePhaseHistory {
 
     $state = ConvertTo-RelayHashtable -InputObject $RunState
     $now = (Get-Date).ToString("o")
+    $currentTaskId = [string]$state["current_task_id"]
     $history = @($state["phase_history"])
 
     if ($history.Count -eq 0) {
@@ -197,6 +198,7 @@ function Sync-RunStatePhaseHistory {
             [ordered]@{
                 phase = $state["current_phase"]
                 agent = $state["current_role"]
+                task_id = $currentTaskId
                 started = $state["created_at"]
                 completed = ""
                 result = ""
@@ -206,7 +208,11 @@ function Sync-RunStatePhaseHistory {
     else {
         $lastIndex = $history.Count - 1
         $lastEntry = ConvertTo-RelayHashtable -InputObject $history[$lastIndex]
-        if ($lastEntry["phase"] -ne $state["current_phase"] -or $lastEntry["agent"] -ne $state["current_role"]) {
+        if (
+            $lastEntry["phase"] -ne $state["current_phase"] -or
+            $lastEntry["agent"] -ne $state["current_role"] -or
+            [string]$lastEntry["task_id"] -ne $currentTaskId
+        ) {
             if ([string]::IsNullOrWhiteSpace([string]$lastEntry["completed"])) {
                 $lastEntry["completed"] = $now
             }
@@ -218,6 +224,7 @@ function Sync-RunStatePhaseHistory {
                 [ordered]@{
                     phase = $state["current_phase"]
                     agent = $state["current_role"]
+                    task_id = $currentTaskId
                     started = $now
                     completed = ""
                     result = ""
@@ -225,10 +232,15 @@ function Sync-RunStatePhaseHistory {
             )
         }
         elseif ($state["status"] -in @("completed", "failed", "blocked")) {
+            $lastEntry["task_id"] = $currentTaskId
             if ([string]::IsNullOrWhiteSpace([string]$lastEntry["completed"])) {
                 $lastEntry["completed"] = $now
             }
             $lastEntry["result"] = [string]$state["status"]
+            $history[$lastIndex] = $lastEntry
+        }
+        else {
+            $lastEntry["task_id"] = $currentTaskId
             $history[$lastIndex] = $lastEntry
         }
     }
@@ -297,6 +309,7 @@ function Write-CompatibilityStatusProjection {
         $historyEntry = ConvertTo-RelayHashtable -InputObject $entry
         $yaml += "  - phase: `"$((ConvertTo-CompatibilityYamlDoubleQuoted -Value ([string]$historyEntry['phase'])))`""
         $yaml += "    agent: `"$((ConvertTo-CompatibilityYamlDoubleQuoted -Value ([string]$historyEntry['agent'])))`""
+        $yaml += "    task_id: `"$((ConvertTo-CompatibilityYamlDoubleQuoted -Value ([string]$historyEntry['task_id'])))`""
         $yaml += "    started: `"$((ConvertTo-CompatibilityYamlDoubleQuoted -Value ([string]$historyEntry['started'])))`""
         $yaml += "    completed: `"$((ConvertTo-CompatibilityYamlDoubleQuoted -Value ([string]$historyEntry['completed'])))`""
         $yaml += "    result: `"$((ConvertTo-CompatibilityYamlDoubleQuoted -Value ([string]$historyEntry['result'])))`""
@@ -309,6 +322,17 @@ function Write-CompatibilityStatusProjection {
     }
     Move-Item -Path $tempPath -Destination $statusPath -Force
     return $statusPath
+}
+
+function Initialize-RunStateActiveAttempt {
+    param([Parameter(Mandatory)]$RunState)
+
+    $state = ConvertTo-RelayHashtable -InputObject $RunState
+    if (-not $state.ContainsKey("active_attempt")) {
+        $state["active_attempt"] = $null
+    }
+
+    return $state
 }
 
 function New-RunState {
@@ -331,6 +355,7 @@ function New-RunState {
         current_role = $CurrentRole
         current_task_id = $null
         active_job_id = $null
+        active_attempt = $null
         pending_approval = $null
         open_requirements = @()
         task_order = @()
@@ -340,6 +365,7 @@ function New-RunState {
             [ordered]@{
                 phase = $CurrentPhase
                 agent = $CurrentRole
+                task_id = $null
                 started = $now
                 completed = ""
                 result = ""
@@ -350,13 +376,130 @@ function New-RunState {
     }
 }
 
+function Start-RunStateActiveAttempt {
+    param(
+        [Parameter(Mandatory)]$RunState,
+        [Parameter(Mandatory)][string]$AttemptId,
+        [string]$Phase,
+        [string]$Stage,
+        [string]$Status = "running",
+        [string]$TaskId,
+        [string]$JobId,
+        [string]$ArchivePath
+    )
+
+    $state = Initialize-RunStateActiveAttempt -RunState $RunState
+    $now = (Get-Date).ToString("o")
+    $state["active_attempt"] = [ordered]@{
+        attempt_id = $AttemptId
+        phase = if ($PSBoundParameters.ContainsKey("Phase")) { $Phase } else { [string]$state["current_phase"] }
+        stage = $Stage
+        status = $Status
+        task_id = $TaskId
+        job_id = $JobId
+        archive_path = $ArchivePath
+        started_at = $now
+        updated_at = $now
+        completed_at = $null
+        result = $null
+    }
+
+    return $state
+}
+
+function Update-RunStateActiveAttempt {
+    param(
+        [Parameter(Mandatory)]$RunState,
+        [string]$AttemptId,
+        [string]$Phase,
+        [string]$Stage,
+        [string]$Status,
+        [string]$TaskId,
+        [string]$JobId,
+        [string]$ArchivePath,
+        [string]$Result
+    )
+
+    $state = Initialize-RunStateActiveAttempt -RunState $RunState
+    $attempt = ConvertTo-RelayHashtable -InputObject $state["active_attempt"]
+    if ($null -eq $attempt) {
+        throw "Cannot update active_attempt because no attempt is active."
+    }
+
+    if ($PSBoundParameters.ContainsKey("Phase")) {
+        $attempt["phase"] = $Phase
+    }
+    if ($PSBoundParameters.ContainsKey("AttemptId")) {
+        $attempt["attempt_id"] = $AttemptId
+    }
+    if ($PSBoundParameters.ContainsKey("Stage")) {
+        $attempt["stage"] = $Stage
+    }
+    if ($PSBoundParameters.ContainsKey("Status")) {
+        $attempt["status"] = $Status
+    }
+    if ($PSBoundParameters.ContainsKey("TaskId")) {
+        $attempt["task_id"] = $TaskId
+    }
+    if ($PSBoundParameters.ContainsKey("JobId")) {
+        $attempt["job_id"] = $JobId
+    }
+    if ($PSBoundParameters.ContainsKey("ArchivePath")) {
+        $attempt["archive_path"] = $ArchivePath
+    }
+    if ($PSBoundParameters.ContainsKey("Result")) {
+        $attempt["result"] = $Result
+    }
+
+    $attempt["updated_at"] = (Get-Date).ToString("o")
+    $state["active_attempt"] = $attempt
+    return $state
+}
+
+function Clear-RunStateActiveAttempt {
+    param(
+        [Parameter(Mandatory)]$RunState,
+        [string]$Status,
+        [string]$Result,
+        [string]$ArchivePath,
+        [switch]$PassThruAttempt
+    )
+
+    $state = Initialize-RunStateActiveAttempt -RunState $RunState
+    $attempt = ConvertTo-RelayHashtable -InputObject $state["active_attempt"]
+    if ($null -eq $attempt) {
+        return $(if ($PassThruAttempt) { $null } else { $state })
+    }
+
+    if ($PSBoundParameters.ContainsKey("Status")) {
+        $attempt["status"] = $Status
+    }
+    if ($PSBoundParameters.ContainsKey("Result")) {
+        $attempt["result"] = $Result
+    }
+    if ($PSBoundParameters.ContainsKey("ArchivePath")) {
+        $attempt["archive_path"] = $ArchivePath
+    }
+
+    $now = (Get-Date).ToString("o")
+    $attempt["updated_at"] = $now
+    $attempt["completed_at"] = $now
+    $state["active_attempt"] = $null
+
+    if ($PassThruAttempt) {
+        return $attempt
+    }
+
+    return $state
+}
+
 function Write-RunState {
     param(
         [Parameter(Mandatory)][string]$ProjectRoot,
         [Parameter(Mandatory)]$RunState
     )
 
-    $state = ConvertTo-RelayHashtable -InputObject $RunState
+    $state = Initialize-RunStateActiveAttempt -RunState $RunState
     $runId = $state["run_id"]
     if (-not $runId) {
         throw "run_id is required to write run-state.json"
@@ -394,7 +537,7 @@ function Read-RunState {
         return $null
     }
 
-    return (ConvertTo-RelayHashtable -InputObject ($raw | ConvertFrom-Json))
+    return (Initialize-RunStateActiveAttempt -RunState ($raw | ConvertFrom-Json))
 }
 
 function Set-CurrentRunPointer {

@@ -175,6 +175,12 @@ function Resolve-TaskContract {
         return $null
     }
 
+    $artifactSnapshot = ConvertTo-RelayHashtable -InputObject (Get-ArtifactValidationSnapshot -ArtifactId ([string]$taskContractRef["artifact_id"]) -Artifact $artifact -Phase ([string]$taskContractRef["phase"]))
+    $artifact = $artifactSnapshot["artifact"]
+    if (-not ($artifact -is [System.Collections.IDictionary])) {
+        return $null
+    }
+
     switch ([string]$taskState["kind"]) {
         "repair" {
             foreach ($item in @($artifact["follow_up_tasks"])) {

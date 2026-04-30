@@ -42,7 +42,9 @@
 - `human_review`
 - `resolved_requirement_ids`
 
-`review_checks[]` は以下の `check_id` をすべて含む固定チェック配列で、各要素は `check_id`、`status`、`notes`、`evidence` を持つこと。
+`must_fix`、`warnings`、`evidence`、`resolved_requirement_ids` はすべて JSON 配列にすること。
+
+`review_checks[]` は以下の `check_id` をすべて含む固定チェック配列で、各要素は `check_id`、`status`、`notes`、`evidence` を持つこと。`review_checks[].evidence` も必ず JSON 配列にすること。
 
 - `requirements_alignment`
 - `correctness_and_edge_cases`
@@ -59,6 +61,8 @@
 - `reasons`
 - `focus_points`
 
+`human_review.reasons` と `human_review.focus_points` は JSON 配列にすること。
+
 `resolved_requirement_ids[]` には、`Open Requirements` に出てきた未解決条件のうち、今回の PR review で解消済みと判断した `item_id` を列挙すること。`go` を選ぶ場合は、未解決条件を残さないこと。
 
 `conditional_go` の場合、`follow_up_tasks` は 1 件以上必須で、各要素は次のキーを持つこと。
@@ -71,7 +75,7 @@
 - `verification`
 - `source_evidence`
 
-`follow_up_tasks[]` は repair task の正本になる。人が読んで実装できる粒度で書くこと。
+`follow_up_tasks[]` は repair task の正本になる。人が読んで実装できる粒度で書くこと。`changed_files`、`acceptance_criteria`、`depends_on`、`verification`、`source_evidence` はすべて JSON 配列にすること。
 
 ## 品質基準
 

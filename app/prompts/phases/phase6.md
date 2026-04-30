@@ -47,7 +47,7 @@
 
 `tests_passed`、`tests_failed`、`coverage_line`、`coverage_branch` は数値にすること。coverage を取得できない場合でも数値を入れ、markdown で理由を補足すること。
 
-`verification_checks[]` は以下の `check_id` をすべて含む固定チェック配列で、各要素は `check_id`、`status`、`notes`、`evidence` を持つこと。
+`verification_checks[]` は以下の `check_id` をすべて含む固定チェック配列で、各要素は `check_id`、`status`、`notes`、`evidence` を持つこと。`verification_checks[].evidence` は 1 件だけでも文字列ではなく JSON 配列にすること。
 
 - `lint_static_analysis`
 - `automated_tests`
@@ -66,7 +66,7 @@
 - `verify_in_phase`
 - `required_artifacts`
 
-`source_phase` は `Phase6`、`source_task_id` は現在の task id を入れること。`verify_in_phase` には、この条件を再確認すべき phase を書くこと。`required_artifacts` には確認に使う artifact id を列挙すること。
+`source_phase` は `Phase6`、`source_task_id` は現在の task id を入れること。`verify_in_phase` には、この条件を再確認すべき phase を書くこと。`required_artifacts` には確認に使う artifact id を列挙すること。`required_artifacts` も JSON 配列にすること。
 
 `resolved_requirement_ids[]` には、過去の `open_requirements` のうち今回の test/review で解消済みと判断した `item_id` を列挙すること。該当がなければ空配列にすること。
 

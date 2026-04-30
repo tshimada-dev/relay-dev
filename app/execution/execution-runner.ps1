@@ -8,6 +8,21 @@ function New-ExecutionJobId {
     return "job-{0}-{1}-{2}" -f $Now.ToString("yyyyMMddHHmmss"), $Phase.ToLowerInvariant(), $Role.ToLowerInvariant()
 }
 
+function Get-ExecutionAttemptId {
+    param([Parameter(Mandatory)][int]$Attempt)
+
+    return ("attempt-{0}" -f $Attempt.ToString("0000"))
+}
+
+function Resolve-ExecutionPromptTextForAttempt {
+    param(
+        [Parameter(Mandatory)][string]$PromptText,
+        [Parameter(Mandatory)][string]$AttemptId
+    )
+
+    return $PromptText.Replace("__RELAY_ATTEMPT_ID__", $AttemptId)
+}
+
 function Get-ExecutionJobDirectory {
     param(
         [Parameter(Mandatory)][string]$ProjectRoot,
@@ -80,6 +95,65 @@ function Quote-ExecutionArgument {
     return $builder.ToString()
 }
 
+function Split-ExecutionArgumentString {
+    param([AllowNull()][string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return @()
+    }
+
+    $tokens = New-Object System.Collections.Generic.List[string]
+    $current = [System.Text.StringBuilder]::new()
+    $quoteChar = [char]0
+    $insideQuote = $false
+
+    for ($index = 0; $index -lt $Value.Length; $index++) {
+        $character = $Value[$index]
+
+        if ($insideQuote) {
+            if ($character -eq $quoteChar) {
+                $insideQuote = $false
+                $quoteChar = [char]0
+                continue
+            }
+
+            if ($character -eq '\' -and $quoteChar -eq '"' -and ($index + 1) -lt $Value.Length) {
+                $nextCharacter = $Value[$index + 1]
+                if ($nextCharacter -eq '"' -or $nextCharacter -eq '\') {
+                    $null = $current.Append($nextCharacter)
+                    $index++
+                    continue
+                }
+            }
+
+            $null = $current.Append($character)
+            continue
+        }
+
+        if ([char]::IsWhiteSpace($character)) {
+            if ($current.Length -gt 0) {
+                $tokens.Add($current.ToString()) | Out-Null
+                $current.Clear() | Out-Null
+            }
+            continue
+        }
+
+        if ($character -eq '"' -or $character -eq "'") {
+            $insideQuote = $true
+            $quoteChar = $character
+            continue
+        }
+
+        $null = $current.Append($character)
+    }
+
+    if ($current.Length -gt 0) {
+        $tokens.Add($current.ToString()) | Out-Null
+    }
+
+    return @($tokens.ToArray())
+}
+
 function Get-ExecutionPromptMode {
     param([Parameter(Mandatory)]$InvocationSpec)
 
@@ -123,6 +197,27 @@ function Get-ExecutionArgumentsForAttempt {
             (Get-ExecutionPromptFlag -InvocationSpec $spec)
             $promptToken
         ))
+}
+
+function Get-ExecutionArgumentListForAttempt {
+    param(
+        [Parameter(Mandatory)]$InvocationSpec,
+        [Parameter(Mandatory)][string]$PromptText
+    )
+
+    $spec = ConvertTo-RelayHashtable -InputObject $InvocationSpec
+    $argumentList = New-Object System.Collections.Generic.List[string]
+
+    foreach ($token in @(Split-ExecutionArgumentString -Value ([string]$spec["arguments"]))) {
+        $argumentList.Add([string]$token) | Out-Null
+    }
+
+    if ((Get-ExecutionPromptMode -InvocationSpec $spec) -eq "argv") {
+        $argumentList.Add((Get-ExecutionPromptFlag -InvocationSpec $spec)) | Out-Null
+        $argumentList.Add($PromptText) | Out-Null
+    }
+
+    return @($argumentList.ToArray())
 }
 
 function Apply-ExecutionEnvironmentOverrides {
@@ -439,11 +534,19 @@ function Invoke-ExecutionAttempt {
 
     $resolvedInvocation = Resolve-ProcessInvocationSpec -InvocationSpec $InvocationSpec
     $promptMode = Get-ExecutionPromptMode -InvocationSpec $resolvedInvocation
+    $executionArgumentList = @(Get-ExecutionArgumentListForAttempt -InvocationSpec $resolvedInvocation -PromptText $PromptText)
     $executionArguments = Get-ExecutionArgumentsForAttempt -InvocationSpec $resolvedInvocation -PromptText $PromptText
     $displayArguments = Get-ExecutionArgumentsForAttempt -InvocationSpec $resolvedInvocation -PromptText $PromptText -ForDisplay
     $processInfo = New-Object System.Diagnostics.ProcessStartInfo
     $processInfo.FileName = $resolvedInvocation["command"]
-    $processInfo.Arguments = $executionArguments
+    if ($processInfo.PSObject.Properties.Name -contains "ArgumentList") {
+        foreach ($argument in $executionArgumentList) {
+            [void]$processInfo.ArgumentList.Add([string]$argument)
+        }
+    }
+    else {
+        $processInfo.Arguments = $executionArguments
+    }
     $processInfo.WorkingDirectory = $WorkingDirectory
     $processInfo.UseShellExecute = $false
     $processInfo.RedirectStandardInput = $promptMode -eq "stdin"
@@ -729,11 +832,13 @@ function Invoke-ExecutionRunner {
     $resultStatus = "failed"
     $failureClass = $null
     $firstStartedAt = $null
+    $finalAttemptStartedAt = $null
     $finalFinishedAt = $null
     $finalExitCode = 1
     $wasEscalated = $false
     $recoveredFromArtifacts = $false
     $artifactCompletion = $null
+    $currentAttemptId = Get-ExecutionAttemptId -Attempt $attempt
 
     if ($runId) {
         Append-Event -ProjectRoot $ProjectRoot -RunId $runId -Event @{
@@ -742,6 +847,7 @@ function Invoke-ExecutionRunner {
             phase = $job["phase"]
             role = $job["role"]
             attempt = $attempt
+            attempt_id = $currentAttemptId
             provider = $invocationSpec["provider"]
         }
         Write-JobMetadata -ProjectRoot $ProjectRoot -RunId $runId -JobId $jobId -Metadata @{
@@ -753,6 +859,7 @@ function Invoke-ExecutionRunner {
             command = $invocationSpec["command"]
             arguments = $invocationSpec["arguments"]
             attempt = $attempt
+            attempt_id = $currentAttemptId
             status = "dispatched"
             dispatched_at = (Get-Date).ToString("o")
         } | Out-Null
@@ -762,6 +869,8 @@ function Invoke-ExecutionRunner {
     Set-Content -Path $stderrPath -Value "" -Encoding UTF8
 
     while ($true) {
+        $attemptId = Get-ExecutionAttemptId -Attempt $attempt
+        $currentAttemptId = $attemptId
         if ($runId) {
             Append-Event -ProjectRoot $ProjectRoot -RunId $runId -Event @{
                 type = "job.started"
@@ -769,11 +878,13 @@ function Invoke-ExecutionRunner {
                 phase = $job["phase"]
                 role = $job["role"]
                 attempt = $attempt
+                attempt_id = $attemptId
                 provider = $invocationSpec["provider"]
             }
         }
 
-        $attemptResult = Invoke-ExecutionAttempt -InvocationSpec $invocationSpec -PromptText $PromptText -WorkingDirectory $WorkingDirectory -Attempt $attempt -TimeoutPolicy $TimeoutPolicy -ArtifactCompletionProbe $ArtifactCompletionProbe -ArtifactCompletionStabilitySec $ArtifactCompletionStabilitySec -OnStarted {
+        $attemptPromptText = Resolve-ExecutionPromptTextForAttempt -PromptText $PromptText -AttemptId $attemptId
+        $attemptResult = Invoke-ExecutionAttempt -InvocationSpec $invocationSpec -PromptText $attemptPromptText -WorkingDirectory $WorkingDirectory -Attempt $attempt -TimeoutPolicy $TimeoutPolicy -ArtifactCompletionProbe $ArtifactCompletionProbe -ArtifactCompletionStabilitySec $ArtifactCompletionStabilitySec -OnStarted {
             param($StartedInfo)
 
             if ($runId) {
@@ -786,15 +897,18 @@ function Invoke-ExecutionRunner {
                     command = $invocationSpec["command"]
                     arguments = $invocationSpec["arguments"]
                     attempt = $attempt
+                    attempt_id = $attemptId
                     status = "running"
                     pid = $StartedInfo["pid"]
                     started_at = $StartedInfo["started_at"]
                 } | Out-Null
             }
         } -OnWarn $OnWarn -OnRetry $OnRetry -OnAbort $OnAbort
+        $attemptResult["attempt_id"] = $attemptId
         if (-not $firstStartedAt) {
             $firstStartedAt = $attemptResult["started_at"]
         }
+        $finalAttemptStartedAt = $attemptResult["started_at"]
         $finalFinishedAt = $attemptResult["finished_at"]
         $finalExitCode = [int]$attemptResult["exit_code"]
 
@@ -847,6 +961,7 @@ function Invoke-ExecutionRunner {
             phase = $job["phase"]
             role = $job["role"]
             attempt = $attempt
+            attempt_id = $currentAttemptId
             exit_code = $finalExitCode
             result_status = $resultStatus
             failure_class = $failureClass
@@ -861,6 +976,7 @@ function Invoke-ExecutionRunner {
             command = $invocationSpec["command"]
             arguments = $invocationSpec["arguments"]
             attempt = $attempt
+            attempt_id = $currentAttemptId
             status = "finished"
             pid = $attemptResult["process_id"]
             started_at = $firstStartedAt
@@ -878,9 +994,11 @@ function Invoke-ExecutionRunner {
         job_id = $jobId
         run_id = $runId
         attempt = $attempt
+        attempt_id = $currentAttemptId
         exit_code = $finalExitCode
         result_status = $resultStatus
         started_at = $firstStartedAt
+        final_attempt_started_at = $finalAttemptStartedAt
         finished_at = $finalFinishedAt
         stdout_path = $stdoutPath
         stderr_path = $stderrPath
