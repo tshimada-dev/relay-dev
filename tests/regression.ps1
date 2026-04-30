@@ -2177,9 +2177,10 @@ Write-Output 'rerun regenerated phase4-1 artifacts'
     Assert-Equal $cliStepRecoveryEvent["recovery_source"] "step" "CLI step should record when it recovered a failed run"
     $cliRecoverArchiveEvent = ConvertTo-RelayHashtable -InputObject ((Get-Events -ProjectRoot $repoRoot -RunId $cliRecoverStepRunId | Where-Object { $_["type"] -eq "phase.artifacts_archived" } | Select-Object -Last 1))
     Assert-Equal $cliRecoverArchiveEvent["phase"] "Phase4-1" "Recovered reruns should archive the stale artifacts for the retried phase"
-    Assert-Contains (Get-Content -Path $recoverPromptCapturePath -Raw -Encoding UTF8) "## Archived Phase JSON Context" "Recovered rerun prompts should include archived JSON context"
-    Assert-Contains (Get-Content -Path $recoverPromptCapturePath -Raw -Encoding UTF8) "phase4-1_verdict.json" "Recovered rerun prompts should point the agent at the archived verdict JSON"
-    Assert-Contains (Get-Content -Path $recoverPromptCapturePath -Raw -Encoding UTF8) "\jobs\job-" "Recovered rerun prompts should direct outputs into the job-scoped staging area"
+    $recoverPromptText = Get-Content -Path $recoverPromptCapturePath -Raw -Encoding UTF8
+    Assert-Contains $recoverPromptText "## Archived Phase JSON Context" "Recovered rerun prompts should include archived JSON context"
+    Assert-Contains $recoverPromptText "phase4-1_verdict.json" "Recovered rerun prompts should point the agent at the archived verdict JSON"
+    Assert-True ($recoverPromptText -match '[\\/]+attempts[\\/]+attempt-\d{4}[\\/]') "Recovered rerun prompts should direct outputs into the attempt-scoped staging area"
     Assert-True (Test-Path $recoverReviewPath) "Committed canonical Phase4-1 review should exist after staged rerun commit"
     Assert-True (Test-Path $recoverVerdictPath) "Committed canonical Phase4-1 verdict should exist after staged rerun commit"
     if (Test-Path $recoverReviewPath) {
