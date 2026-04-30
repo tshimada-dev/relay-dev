@@ -1303,7 +1303,23 @@ function Invoke-EngineStep {
                 phase_started_at_utc = $phaseStartedAtUtc
             }
             try {
-                $transactionResult = ConvertTo-RelayHashtable -InputObject (Invoke-PhaseExecutionTransaction -JobSpec $jobSpec -PromptText $promptText -ProjectRoot $script:ProjectRoot -WorkingDirectory $script:ProjectDir -TimeoutPolicy (Get-StepTimeoutPolicy) -RunId $ResolvedRunId -PhaseName $phaseName -PhaseDefinition $phaseDefinition -ArtifactCompletionProbe ${function:Invoke-PhaseArtifactCompletionProbe} -TaskId $taskId -PhaseStartedAtUtc $phaseStartedAtUtc)
+                $transactionResult = ConvertTo-RelayHashtable -InputObject (Invoke-PhaseExecutionTransaction -JobSpec $jobSpec -PromptText $promptText -ProjectRoot $script:ProjectRoot -WorkingDirectory $script:ProjectDir -TimeoutPolicy (Get-StepTimeoutPolicy) -RunId $ResolvedRunId -PhaseName $phaseName -PhaseDefinition $phaseDefinition -ArtifactCompletionProbe ${function:Invoke-PhaseArtifactCompletionProbe} -TaskId $taskId -PhaseStartedAtUtc $phaseStartedAtUtc -OnRepairStart {
+                        param($RepairContext)
+
+                        $repairState = ConvertTo-RelayHashtable -InputObject $RepairContext
+                        $dispatchState = Update-RunStateActiveAttempt -RunState $dispatchState -Stage "repairing" -Status "running" -TaskId $taskId -JobId ([string]$jobSpec["job_id"]) -Result ([string]$repairState["decision"]["reason"])
+                        Write-RunState -ProjectRoot $script:ProjectRoot -RunState $dispatchState | Out-Null
+                        Append-RunStatusChangedEvent -RunId $ResolvedRunId -RunState $dispatchState
+                        Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event @{
+                            type = "artifact.repair_requested"
+                            phase = $phaseName
+                            task_id = $taskId
+                            job_id = $jobSpec["job_id"]
+                            repair_job_id = $repairState["repair_job_id"]
+                            artifact_id = $repairState["validator_ref"]["artifact_id"]
+                            repair_decision = (ConvertTo-RelayHashtable -InputObject $repairState["decision"])
+                        }
+                    })
             }
             finally {
                 $script:ArtifactCompletionProbeState = $null
@@ -1311,12 +1327,30 @@ function Invoke-EngineStep {
             $outputSync = ConvertTo-RelayHashtable -InputObject $transactionResult["output_sync_result"]
             $validationResult = ConvertTo-RelayHashtable -InputObject $transactionResult["validation_result"]
             $commitResult = ConvertTo-RelayHashtable -InputObject $transactionResult["commit_result"]
+            $repairResult = ConvertTo-RelayHashtable -InputObject $transactionResult["repair_result"]
             $executionResult = ConvertTo-RelayHashtable -InputObject $transactionResult["raw_execution_result"]
             $effectiveExecutionResult = ConvertTo-RelayHashtable -InputObject $transactionResult["effective_execution_result"]
             $attemptId = [string]$transactionResult["resolved_attempt_id"]
             $dispatchState = Update-RunStateActiveAttempt -RunState $dispatchState -AttemptId $attemptId -Stage "committing" -Status "running" -TaskId $taskId -JobId ([string]$jobSpec["job_id"]) -Result ([string]$effectiveExecutionResult["result_status"])
             Write-RunState -ProjectRoot $script:ProjectRoot -RunState $dispatchState | Out-Null
             Append-RunStatusChangedEvent -RunId $ResolvedRunId -RunState $dispatchState
+
+            if ($repairResult -and [bool]$repairResult["attempted"]) {
+                $repairExecutionResult = ConvertTo-RelayHashtable -InputObject $repairResult["repair_execution_result"]
+                $repairEventType = if ([string]$repairResult["outcome"] -eq "repaired") { "artifact.repair_completed" } else { "artifact.repair_failed" }
+                Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event @{
+                    type = $repairEventType
+                    phase = $phaseName
+                    task_id = $taskId
+                    job_id = $jobSpec["job_id"]
+                    repair_job_id = if ($repairExecutionResult) { [string]$repairExecutionResult["job_id"] } else { "" }
+                    artifact_id = $validationResult["validator_ref"]["artifact_id"]
+                    outcome = [string]$repairResult["outcome"]
+                    error = [string]$repairResult["error"]
+                    repair_decision = (ConvertTo-RelayHashtable -InputObject $repairResult["decision"])
+                    diff_guard = (ConvertTo-RelayHashtable -InputObject $repairResult["diff_guard_result"])
+                }
+            }
 
             if ($validationResult["validator_ref"]) {
                 $validatorRef = ConvertTo-RelayHashtable -InputObject $validationResult["validator_ref"]

@@ -13,6 +13,9 @@ if (-not (Get-Command Get-PhaseMaterializedArtifacts -ErrorAction SilentlyContin
 if (-not (Get-Command Complete-PhaseOutputCommit -ErrorAction SilentlyContinue)) {
     . (Join-Path $PSScriptRoot "phase-completion-committer.ps1")
 }
+if (-not (Get-Command Invoke-ArtifactRepairTransaction -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "artifact-repair-transaction.ps1")
+}
 if (-not (Get-Command Invoke-ExecutionRunner -ErrorAction SilentlyContinue)) {
     . (Join-Path (Join-Path $PSScriptRoot "..\execution") "execution-runner.ps1")
 }
@@ -100,7 +103,8 @@ function Invoke-PhaseExecutionTransaction {
         [string]$PreviousJobId,
         [scriptblock]$OnWarn,
         [scriptblock]$OnRetry,
-        [scriptblock]$OnAbort
+        [scriptblock]$OnAbort,
+        [scriptblock]$OnRepairStart
     )
 
     $job = ConvertTo-RelayHashtable -InputObject $JobSpec
@@ -179,9 +183,43 @@ function Invoke-PhaseExecutionTransaction {
     $outputSyncResult = ConvertTo-RelayHashtable -InputObject (Get-PhaseMaterializedArtifacts @outputSyncParams)
 
     $validationResult = ConvertTo-RelayHashtable -InputObject (Invoke-PhaseValidationPipeline -PhaseName $PhaseName -PhaseDefinition $PhaseDefinition -MaterializedArtifacts @($outputSyncResult["materialized"]) -MissingRequired @($outputSyncResult["missing_required"]) -StaleRequired @($outputSyncResult["stale_required"]) -ReadErrors @($outputSyncResult["read_errors"]) -TaskId $TaskId)
+    $repairResult = $null
+    $validatorStatus = ConvertTo-RelayHashtable -InputObject $validationResult["validation"]
+    if ($validatorStatus -and -not [bool]$validatorStatus["valid"]) {
+        $repairParams = @{
+            ProjectRoot = $ProjectRoot
+            WorkingDirectory = $WorkingDirectory
+            TimeoutPolicy = $TimeoutPolicy
+            RunId = $RunId
+            PhaseName = $PhaseName
+            PhaseDefinition = $PhaseDefinition
+            OriginalJobSpec = $job
+            OutputSyncResult = $outputSyncResult
+            ValidationResult = $validationResult
+            AttemptId = $attemptId
+            TaskId = $TaskId
+            ArchivedContext = $archivedContext
+            RepairBudgetLimit = 1
+        }
+        if ($OnRepairStart) {
+            $repairParams["OnRepairStart"] = $OnRepairStart
+        }
+        $repairResult = ConvertTo-RelayHashtable -InputObject (Invoke-ArtifactRepairTransaction @repairParams)
+        if ($repairResult -and [bool]$repairResult["attempted"]) {
+            $repairedOutputSync = ConvertTo-RelayHashtable -InputObject $repairResult["output_sync_result"]
+            if ($repairedOutputSync) {
+                $outputSyncResult = $repairedOutputSync
+            }
+
+            $repairedValidation = ConvertTo-RelayHashtable -InputObject $repairResult["validation_result"]
+            if ($repairedValidation) {
+                $validationResult = $repairedValidation
+                $validatorStatus = ConvertTo-RelayHashtable -InputObject $validationResult["validation"]
+            }
+        }
+    }
 
     $commitResult = $null
-    $validatorStatus = ConvertTo-RelayHashtable -InputObject $validationResult["validation"]
     if ($validatorStatus -and [bool]$validatorStatus["valid"]) {
         try {
             $commitResult = ConvertTo-RelayHashtable -InputObject (Complete-PhaseOutputCommit -ProjectRoot $ProjectRoot -RunId $RunId -MaterializedArtifacts @($outputSyncResult["materialized"]))
@@ -222,6 +260,7 @@ function Invoke-PhaseExecutionTransaction {
         output_sync_result = $outputSyncResult
         validation_result = $validationResult
         commit_result = $commitResult
+        repair_result = $repairResult
         effective_execution_result = $effectiveExecutionResult
         recovered_from_timeout = [bool]$effectiveResultResolution["recovered_from_timeout"]
     }

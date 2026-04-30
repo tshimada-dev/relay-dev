@@ -1,0 +1,233 @@
+{
+  "document_id": "repairer-implementation-plan",
+  "version": 1,
+  "generated_at": "2026-04-30T15:07:00+09:00",
+  "project": "relay-dev",
+  "objective": "Introduce a repair-only role that keeps runs moving after repairable artifact validation failures without allowing code edits or review decisions.",
+  "goals": [
+    "Route repairable invalid_artifact failures into a same-phase repair lane.",
+    "Limit the repairer to staged required artifacts for the current phase only.",
+    "Forbid the repairer from modifying product code, tests, configs, canonical artifacts, or run-state files.",
+    "Forbid the repairer from making review decisions such as verdict, must-fix, approval, or security status changes.",
+    "Commit repaired artifacts and continue phase progression without stopping the run when revalidation succeeds."
+  ],
+  "hard_constraints": [
+    {
+      "id": "C-01",
+      "title": "Repairer must never edit product code",
+      "rules": [
+        "Only current staged required artifacts may be edited.",
+        "src/, app/, prisma/, tests/, package.json, canonical artifacts, archive artifacts, run-state, and event logs are off limits."
+      ]
+    },
+    {
+      "id": "C-02",
+      "title": "Repairer must never act as a reviewer",
+      "rules": [
+        "Do not decide verdict values.",
+        "Do not generate or reinterpret must_fix items.",
+        "Do not replace approval, reject, or rollback decisions.",
+        "Do not re-evaluate security_checks statuses."
+      ]
+    },
+    {
+      "id": "C-03",
+      "title": "Repairer must avoid semantic rewrites",
+      "rules": [
+        "Limit fixes to syntax, materialization, and schema-shape issues.",
+        "Immutable fields in reviewer artifacts must not change.",
+        "Meaningful content changes require a normal phase rerun or terminal failure."
+      ]
+    }
+  ],
+  "findings": [
+    {
+      "id": "F-01",
+      "title": "Validation failure currently becomes run failure immediately",
+      "severity": "critical",
+      "impact": [
+        "Provider jobs can succeed while the run still stops.",
+        "Self-running workflows are interrupted by small artifact defects."
+      ]
+    },
+    {
+      "id": "F-02",
+      "title": "Syntax errors and semantic errors are treated the same",
+      "severity": "critical",
+      "impact": [
+        "Cheap syntax fixes trigger expensive full reruns or manual resume.",
+        "UX is worse than necessary for parse-only failures."
+      ]
+    },
+    {
+      "id": "F-03",
+      "title": "Same-phase reruns are token-expensive",
+      "severity": "high",
+      "impact": [
+        "The full phase prompt and evidence are resent even for local escape issues.",
+        "Latency and provider cost increase unnecessarily."
+      ]
+    }
+  ],
+  "repairability_policy": {
+    "repairable": [
+      "JSON parse errors",
+      "Bad escape sequences",
+      "Trailing commas",
+      "BOM or encoding contamination",
+      "Known schema shape mismatches",
+      "Materialization failures with recoverable raw staged text"
+    ],
+    "terminal": [
+      "Missing required artifacts",
+      "Semantic invariant violations",
+      "Meaning-level contradictions between markdown and JSON",
+      "Evidence gaps that would require new judgment"
+    ]
+  },
+  "target_behavior": {
+    "flow": [
+      "Provider writes staged artifacts.",
+      "Validation and materialization run.",
+      "Errors are classified as repairable or terminal.",
+      "Repairable failures enter a same-phase repair lane instead of failing the run.",
+      "Repairer edits staged artifacts only.",
+      "Artifacts are revalidated.",
+      "If valid, the normal commit and next-phase transition continue.",
+      "If repair budget is exhausted or the error is terminal, the run fails."
+    ],
+    "run_state": {
+      "status": "Keep running during repair when possible.",
+      "current_phase": "Unchanged during repair.",
+      "current_task_id": "Unchanged during repair.",
+      "role_or_stage": "Use current_role=repairer or active_attempt.stage=repairing."
+    }
+  },
+  "role_design": {
+    "role": "repairer",
+    "prompt_file": "app/prompts/system/repairer.md",
+    "allowed_inputs": [
+      "validator errors",
+      "materialization errors",
+      "current staged artifacts",
+      "immutable field definitions",
+      "required output schema excerpt",
+      "latest archived JSON context",
+      "current phase and task metadata"
+    ],
+    "forbidden_actions": [
+      "editing repo code",
+      "performing new review",
+      "adding new evidence from unrelated files",
+      "writing canonical or archived artifacts directly"
+    ]
+  },
+  "proposed_components": [
+    {
+      "name": "ArtifactRepairPolicy",
+      "responsibility": "Classify failures, define immutable fields, and manage repair budget."
+    },
+    {
+      "name": "ArtifactRepairTransaction",
+      "responsibility": "Run the repair lane and revalidation for the same phase."
+    },
+    {
+      "name": "RepairPromptBuilder",
+      "responsibility": "Build a repair-only prompt from validation context and staged artifacts."
+    },
+    {
+      "name": "RepairDiffGuard",
+      "responsibility": "Block immutable field changes and semantic drift."
+    }
+  ],
+  "workstreams": [
+    {
+      "id": "WS-01",
+      "title": "Add validation failure classification",
+      "priority": "P0",
+      "files": [
+        "app/core/workflow-engine.ps1",
+        "app/core/phase-validation-pipeline.ps1",
+        "app/core/artifact-validator.ps1"
+      ]
+    },
+    {
+      "id": "WS-02",
+      "title": "Add repairer role and prompt",
+      "priority": "P0",
+      "files": [
+        "app/phases/phase-registry.ps1",
+        "app/prompts/system/repairer.md",
+        "app/cli.ps1"
+      ]
+    },
+    {
+      "id": "WS-03",
+      "title": "Integrate repair transaction into phase execution",
+      "priority": "P0",
+      "files": [
+        "app/core/phase-execution-transaction.ps1",
+        "app/core/job-context-builder.ps1",
+        "app/core/run-state-store.ps1"
+      ]
+    },
+    {
+      "id": "WS-04",
+      "title": "Add immutable field guard",
+      "priority": "P0",
+      "files": [
+        "app/core/repair-diff-guard.ps1",
+        "app/core/artifact-validator.ps1",
+        "tests/regression.ps1"
+      ]
+    },
+    {
+      "id": "WS-05",
+      "title": "Add deterministic pre-fix before invoking repairer",
+      "priority": "P1",
+      "files": [
+        "app/core/artifact-validator.ps1",
+        "app/core/artifact-repair-policy.ps1"
+      ]
+    },
+    {
+      "id": "WS-06",
+      "title": "Add repair budget and circuit breaker",
+      "priority": "P1",
+      "files": [
+        "app/core/run-state-store.ps1",
+        "app/core/artifact-repair-policy.ps1",
+        "app/cli.ps1"
+      ]
+    }
+  ],
+  "tests": [
+    "Repairable bad-escape JSON error is fixed without failing the run.",
+    "Repairer cannot mutate immutable reviewer fields such as verdict or security status.",
+    "Terminal semantic invariant violations bypass the repair lane and fail normally.",
+    "Reviewer artifact syntax-only repair preserves verdict and status fields.",
+    "Known implementer schema-shape mismatches can be repaired without semantic changes.",
+    "Repeated identical repair failures hit the repair budget and stop."
+  ],
+  "rollout": [
+    {
+      "phase": "A",
+      "scope": "Deterministic pre-fix only, no repairer yet."
+    },
+    {
+      "phase": "B",
+      "scope": "Artifact-only repairer for JSON and schema repairs with immutable field guards."
+    },
+    {
+      "phase": "C",
+      "scope": "Dashboard/event visibility and repair metrics."
+    }
+  ],
+  "success_metrics": [
+    "Repairable invalid_artifact failures no longer require manual resume in common cases.",
+    "run.failed with reason=invalid_artifact decreases materially.",
+    "Same-phase full reruns become less frequent for syntax-only failures.",
+    "No reviewer semantic drift incidents caused by repair."
+  ],
+  "conclusion": "A third role is worthwhile only as a narrow artifact-repair lane. The engine must enforce that the repairer never edits product code and never performs review decisions."
+}

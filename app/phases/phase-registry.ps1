@@ -42,6 +42,17 @@ function Resolve-PhaseRole {
     }
 }
 
+function Resolve-SystemPromptRole {
+    param([Parameter(Mandatory)][string]$Role)
+
+    switch ($Role.ToLowerInvariant()) {
+        "implementer" { return "implementer" }
+        "reviewer" { return "reviewer" }
+        "repairer" { return "repairer" }
+        default { return "implementer" }
+    }
+}
+
 function Get-DefaultTransitionRules {
     param([Parameter(Mandatory)][string]$Phase)
 
@@ -71,7 +82,8 @@ function Resolve-PromptPackage {
         [string]$Provider = "generic-cli"
     )
 
-    $systemFile = Join-Path $ProjectRoot "app\prompts\system\$Role.md"
+    $resolvedRole = Resolve-SystemPromptRole -Role $Role
+    $systemFile = Join-Path $ProjectRoot "app\prompts\system\$resolvedRole.md"
     if (-not (Test-Path $systemFile)) {
         $systemFile = Join-Path $ProjectRoot "app\prompts\system\implementer.md"
     }

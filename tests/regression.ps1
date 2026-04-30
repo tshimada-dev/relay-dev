@@ -92,6 +92,25 @@ function New-ChecklistEntry {
     }
 }
 
+function Assert-Skipped {
+    param([string]$Message)
+
+    Write-Host "  - skipped: $Message" -ForegroundColor DarkYellow
+}
+
+function Resolve-OptionalFunction {
+    param([Parameter(Mandatory)][string[]]$Names)
+
+    foreach ($name in $Names) {
+        $command = Get-Command -Name $name -ErrorAction SilentlyContinue
+        if ($command) {
+            return $command
+        }
+    }
+
+    return $null
+}
+
 function Convert-EntryFieldToScalar {
     param(
         [Parameter(Mandatory)]$Entries,
@@ -580,6 +599,8 @@ finally {
 Write-Host "[5/11] Testing typed artifacts and validator..."
 . (Join-Path $repoRoot "app/core/artifact-repository.ps1")
 . (Join-Path $repoRoot "app/core/artifact-validator.ps1")
+. (Join-Path $repoRoot "app/core/artifact-repair-policy.ps1")
+. (Join-Path $repoRoot "app/core/repair-diff-guard.ps1")
 . (Join-Path $repoRoot "app/phases/phase-registry.ps1")
 
 $claudePromptPackage = Resolve-PromptPackage -ProjectRoot $repoRoot -Phase "Phase1" -Role "implementer" -Provider "claude-code"
@@ -921,6 +942,95 @@ try {
     $legacyPhase7Validation = Test-ArtifactContract -ArtifactId "phase7_verdict.json" -Artifact $legacyPhase7Verdict -Phase "Phase7"
     Assert-True ([bool]$legacyPhase7Validation["valid"]) "Legacy Phase7 scalar arrays should validate after normalization"
     Assert-Contains (@($legacyPhase7Validation["warnings"]) -join "`n") "human_review.reasons" "Phase7 normalization warnings should include nested human_review arrays"
+
+    $repairerClassifier = Resolve-OptionalFunction -Names @("Get-ArtifactRepairDecision", "Get-RepairableArtifactClassification")
+    if ($repairerClassifier) {
+        $semanticInvariantArtifact = @{
+            task_id = "T-01"
+            verdict = "conditional_go"
+            rollback_phase = $null
+            must_fix = @("Need remediation")
+            warnings = @()
+            evidence = @("phase5-2_security_check.md")
+            security_checks = New-Phase52SecurityChecks -StatusOverrides @{
+                dangerous_side_effects = "fail"
+                dependency_surface = "warning"
+            }
+            open_requirements = @(New-Phase52OpenRequirements -TaskId "T-01")
+            resolved_requirement_ids = @()
+        }
+        $semanticInvariantValidation = Test-ArtifactContract -ArtifactId "phase5-2_verdict.json" -Artifact $semanticInvariantArtifact -Phase "Phase5-2"
+
+        $badJsonEscapeClassification = & $repairerClassifier.Name `
+            -ArtifactId "phase7_verdict.json" `
+            -Phase "Phase7" `
+            -ValidationResult @{ errors = @("Invalid JSON escape sequence '\q'.") } `
+            -MaterializationResult @{ errors = @() } `
+            -ExecutionResult $null `
+            -ArtifactOnlyRepair
+        Assert-Equal ([string]$badJsonEscapeClassification["classification"]) "repairable" "Bad JSON escape should classify as repairable"
+        Assert-Equal ([string]$badJsonEscapeClassification["reason"]) "bad_json_escape" "Bad JSON escape should report a focused repairability reason"
+
+        $missingRequiredArtifactClassification = & $repairerClassifier.Name `
+            -ArtifactId "phase7_verdict.json" `
+            -Phase "Phase7" `
+            -ValidationResult @{ errors = @("Required artifact 'phase7_verdict.json' was not produced.") } `
+            -MaterializationResult @{ errors = @() } `
+            -ExecutionResult $null `
+            -ArtifactOnlyRepair
+        Assert-Equal ([string]$missingRequiredArtifactClassification["classification"]) "not_repairable" "Missing required artifact should stay non-repairable"
+        Assert-Equal ([string]$missingRequiredArtifactClassification["reason"]) "missing_required_artifact" "Missing required artifact should report a focused repairability reason"
+
+        $semanticInvariantClassification = & $repairerClassifier.Name `
+            -ArtifactId "phase5-2_verdict.json" `
+            -Phase "Phase5-2" `
+            -ValidationResult @{ errors = @($semanticInvariantValidation["errors"]) } `
+            -MaterializationResult @{ errors = @() } `
+            -ExecutionResult $null `
+            -ArtifactOnlyRepair
+        Assert-Equal ([string]$semanticInvariantClassification["classification"]) "not_repairable" "Semantic invariant violations should stay non-repairable"
+        Assert-Equal ([string]$semanticInvariantClassification["reason"]) "semantic_invariant" "Semantic invariant violations should report a focused non-repairable reason"
+    }
+    else {
+        Assert-Skipped "repairability classification scaffolding is waiting for Get-ArtifactRepairDecision"
+    }
+
+    $immutableGuard = Resolve-OptionalFunction -Names @("Test-RepairDiffAllowed", "Test-ReviewerArtifactImmutableFields")
+    if ($immutableGuard) {
+        $priorReviewerArtifact = @{
+            verdict = "reject"
+            rollback_phase = "Phase5"
+            security_checks = New-Phase52SecurityChecks -StatusOverrides @{
+                input_validation = "pass"
+                authentication_authorization = "warning"
+                secret_handling_and_logging = "pass"
+                dangerous_side_effects = "pass"
+                dependency_surface = "pass"
+            }
+        }
+
+        $reviewerArtifactWithImmutableChanges = @{
+            verdict = "go"
+            rollback_phase = $null
+            security_checks = New-Phase52SecurityChecks -StatusOverrides @{
+                input_validation = "pass"
+                authentication_authorization = "pass"
+                secret_handling_and_logging = "pass"
+                dangerous_side_effects = "pass"
+                dependency_surface = "pass"
+            }
+        }
+
+        $immutableGuardResult = & $immutableGuard.Name -ArtifactId "phase5-2_verdict.json" -OriginalArtifact $priorReviewerArtifact -RepairedArtifact $reviewerArtifactWithImmutableChanges
+        Assert-True (-not [bool]$immutableGuardResult["valid"]) "Reviewer immutable-field guard should reject verdict and rollback/security status rewrites"
+        $immutableGuardErrors = @($immutableGuardResult["errors"]) -join "`n"
+        Assert-Contains $immutableGuardErrors "verdict" "Immutable-field guard should mention verdict"
+        Assert-Contains $immutableGuardErrors "rollback_phase" "Immutable-field guard should mention rollback_phase"
+        Assert-Contains $immutableGuardErrors "security_checks[1].status" "Immutable-field guard should pinpoint the changed reviewer security status"
+    }
+    else {
+        Assert-Skipped "immutable reviewer-field guard scaffolding is waiting for Test-RepairDiffAllowed"
+    }
 
     $phaseDefinition = Get-PhaseDefinition -ProjectRoot $tempArtifactRoot -Phase "Phase6" -Provider "codex-cli"
     Assert-Equal $phaseDefinition["validator"]["artifact_id"] "phase6_result.json" "Phase definition should expose validator artifact id"
