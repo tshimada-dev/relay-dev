@@ -1544,6 +1544,7 @@ $cliSpawnRunId = "run-cli-spawn-" + [guid]::NewGuid().ToString("N")
 $cliInvalidPhase6RunId = "run-cli-phase6-invalid-" + [guid]::NewGuid().ToString("N")
 $cliRecoverResumeRunId = "run-cli-resume-recover-" + [guid]::NewGuid().ToString("N")
 $cliRecoverStepRunId = "run-cli-step-recover-" + [guid]::NewGuid().ToString("N")
+$cliRecoverInvalidArtifactRunId = "run-cli-invalid-artifact-recover-" + [guid]::NewGuid().ToString("N")
 $cliNonRecoverableRunId = "run-cli-no-recover-" + [guid]::NewGuid().ToString("N")
 $currentRunPointerPath = Get-CurrentRunPointerPath -ProjectRoot $repoRoot
 $originalPointerRaw = if (Test-Path $currentRunPointerPath) { Get-Content -Path $currentRunPointerPath -Raw -Encoding UTF8 } else { $null }
@@ -1808,6 +1809,43 @@ Use the seeded Phase0 fixture.
     $cliStepRecoveryEvent = ConvertTo-RelayHashtable -InputObject ((Get-Events -ProjectRoot $repoRoot -RunId $cliRecoverStepRunId | Where-Object { $_["type"] -eq "run.recovered" } | Select-Object -Last 1))
     Assert-Equal $cliStepRecoveryEvent["recovery_source"] "step" "CLI step should record when it recovered a failed run"
 
+    $cliRecoverInvalidArtifactState = New-RunState -RunId $cliRecoverInvalidArtifactRunId -ProjectRoot $repoRoot -TaskId "req-cli-invalid-artifact-recover" -CurrentPhase "Phase5-2" -CurrentRole "reviewer"
+    $cliRecoverInvalidArtifactState["status"] = "failed"
+    $cliRecoverInvalidArtifactState["current_task_id"] = "T-02"
+    $cliRecoverInvalidArtifactState = Sync-RunStatePhaseHistory -RunState $cliRecoverInvalidArtifactState
+    Write-RunState -ProjectRoot $repoRoot -RunState $cliRecoverInvalidArtifactState | Out-Null
+    Append-Event -ProjectRoot $repoRoot -RunId $cliRecoverInvalidArtifactRunId -Event @{
+        type = "run.status_changed"
+        status = $cliRecoverInvalidArtifactState["status"]
+        current_phase = $cliRecoverInvalidArtifactState["current_phase"]
+        current_role = $cliRecoverInvalidArtifactState["current_role"]
+        current_task_id = $cliRecoverInvalidArtifactState["current_task_id"]
+    }
+    Append-Event -ProjectRoot $repoRoot -RunId $cliRecoverInvalidArtifactRunId -Event @{
+        type = "job.finished"
+        job_id = "job-invalid-artifact-finished"
+        phase = "Phase5-2"
+        role = "reviewer"
+        attempt = 1
+        exit_code = 0
+        failure_class = $null
+        result_status = "succeeded"
+    }
+    Append-Event -ProjectRoot $repoRoot -RunId $cliRecoverInvalidArtifactRunId -Event @{ type = "run.failed"; reason = "invalid_artifact"; failure_class = $null }
+
+    $recoverInvalidArtifactRaw = & $pwshPath -NoLogo -NoProfile -File $cliScriptPath resume -ConfigFile $configPath -RunId $cliRecoverInvalidArtifactRunId
+    $recoverInvalidArtifactRunId = @($recoverInvalidArtifactRaw | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Last 1) | Select-Object -Last 1
+    Assert-Equal $recoverInvalidArtifactRunId $cliRecoverInvalidArtifactRunId "CLI resume should return the invalid-artifact recovery run id"
+    $cliRecoveredInvalidArtifactState = Read-RunState -ProjectRoot $repoRoot -RunId $cliRecoverInvalidArtifactRunId
+    Assert-Equal $cliRecoveredInvalidArtifactState["status"] "running" "CLI resume should recover invalid_artifact failures when the underlying job succeeded"
+    Assert-True (@($cliRecoveredInvalidArtifactState["phase_history"]).Count -ge 2) "Recovered invalid_artifact runs should retain history and append a retry entry"
+    $cliRecoveredInvalidArtifactLastPhase = ConvertTo-RelayHashtable -InputObject (@($cliRecoveredInvalidArtifactState["phase_history"])[-1])
+    Assert-Equal $cliRecoveredInvalidArtifactLastPhase["phase"] "Phase5-2" "Recovered invalid_artifact runs should retry the same phase"
+    Assert-Equal $cliRecoveredInvalidArtifactLastPhase["agent"] "reviewer" "Recovered invalid_artifact runs should preserve the same role"
+    $cliInvalidArtifactRecoveryEvent = ConvertTo-RelayHashtable -InputObject ((Get-Events -ProjectRoot $repoRoot -RunId $cliRecoverInvalidArtifactRunId | Where-Object { $_["type"] -eq "run.recovered" } | Select-Object -Last 1))
+    Assert-Equal $cliInvalidArtifactRecoveryEvent["failure_reason"] "invalid_artifact" "Recovered invalid_artifact runs should preserve the original failure reason"
+    Assert-Equal $cliInvalidArtifactRecoveryEvent["recovery_source"] "resume" "Recovered invalid_artifact runs should record the recovery source"
+
     $cliNonRecoverableState = New-RunState -RunId $cliNonRecoverableRunId -ProjectRoot $repoRoot -TaskId "req-cli-no-recover" -CurrentPhase "Phase3" -CurrentRole "implementer"
     $cliNonRecoverableState["status"] = "failed"
     $cliNonRecoverableState = Sync-RunStatePhaseHistory -RunState $cliNonRecoverableState
@@ -1838,6 +1876,7 @@ finally {
     Remove-Item -Path (Get-RunRootPath -ProjectRoot $repoRoot -RunId $cliInvalidPhase6RunId) -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -Path (Get-RunRootPath -ProjectRoot $repoRoot -RunId $cliRecoverResumeRunId) -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -Path (Get-RunRootPath -ProjectRoot $repoRoot -RunId $cliRecoverStepRunId) -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path (Get-RunRootPath -ProjectRoot $repoRoot -RunId $cliRecoverInvalidArtifactRunId) -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -Path (Get-RunRootPath -ProjectRoot $repoRoot -RunId $cliNonRecoverableRunId) -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -Path $cliOutputDir -Recurse -Force -ErrorAction SilentlyContinue
 
@@ -1988,6 +2027,8 @@ Assert-NotContains $phase51Prompt "### 重要: テスト実行コマンド（Wat
 
 Assert-NotContains $phase52Prompt "## 対立レビュー原則" "Phase5-2 should no longer duplicate the adversarial review section"
 Assert-NotContains $phase52Prompt "### 重要: 根拠（行番号/差分）の取り方" "Phase5-2 should no longer duplicate line-number guidance"
+Assert-Contains $phase52Prompt 'security_checks[].status` に `fail` が 1 件でもある場合、verdict は `reject`' "Phase5-2 prompt should explicitly align failed security checks with reject"
+Assert-Contains $phase52Prompt 'conditional_go の場合は `security_checks[].status = fail` を含めない' "Phase5-2 prompt should explicitly forbid fail statuses on conditional_go"
 
 Assert-NotContains $phase7Prompt "## 対立レビュー原則" "Phase7 should no longer duplicate the adversarial review section"
 Assert-NotContains $phase7Prompt "## 行番号付き根拠の必須化（捏造防止）" "Phase7 should no longer duplicate line-number guidance"

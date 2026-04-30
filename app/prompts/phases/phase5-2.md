@@ -16,6 +16,12 @@
 
 `reject` 以外では `rollback_phase` は空文字でよい。`conditional_go` を使う場合は `must_fix` に残課題を具体的に書くこと。
 
+重要:
+
+- `security_checks[].status` に `fail` が 1 件でもある場合、verdict は `reject` にすること
+- `conditional_go` は `security_checks[].status` が `pass` / `warning` / `not_applicable` のみで、かつ `warning` が 1 件以上ある場合に限る
+- `conditional_go` の `must_fix` / `open_requirements` は「実装を継続できるが後続 phase で必ず追跡する条件」に限定すること
+
 ## Markdown 出力に含める内容
 
 - 概要
@@ -39,7 +45,7 @@
 - `open_requirements`
 - `resolved_requirement_ids`
 
-`security_checks[]` は以下の `check_id` をすべて含む固定チェック配列で、各要素は `check_id`、`status`、`notes`、`evidence` を持つこと。
+`security_checks[]` は以下の `check_id` をすべて含む固定チェック配列で、各要素は `check_id`、`status`、`notes`、`evidence` を持つこと。`security_checks[].evidence` は 1 件だけでも文字列ではなく JSON 配列にすること。
 
 - `input_validation`
 - `authentication_authorization`
@@ -58,7 +64,7 @@
 - `verify_in_phase`
 - `required_artifacts`
 
-`source_phase` は `Phase5-2`、`source_task_id` は現在の task id を入れること。`verify_in_phase` には、この条件を再確認すべき phase を書くこと。`required_artifacts` には確認に使う artifact id を列挙すること。
+`source_phase` は `Phase5-2`、`source_task_id` は現在の task id を入れること。`verify_in_phase` には、この条件を再確認すべき phase を書くこと。`required_artifacts` には確認に使う artifact id を列挙すること。`required_artifacts` も JSON 配列にすること。
 
 `resolved_requirement_ids[]` には、過去の `open_requirements` のうち今回の review で解消済みと判断した `item_id` を列挙すること。新規 review で該当がなければ空配列にすること。
 
@@ -67,6 +73,8 @@
 - `security_checks` の 5 項目を省略していない
 - reject は本当に Phase5 の実装修正が必要な場合に限る
 - conditional_go の場合は、`must_fix` と対応する `open_requirements` を 1 件以上入れ、後続 review で追跡できる
+- conditional_go の場合は `security_checks[].status = fail` を含めない
+- security_checks に `fail` がある場合は `reject` を選び、Phase5 へ差し戻す
 - go / reject の場合は `open_requirements` を空配列にする
 - evidence に確認したコード箇所や実行根拠が入っている
 

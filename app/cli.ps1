@@ -164,14 +164,25 @@ function Repair-RecoverableFailedRunState {
         $failureClass = [string]$lastJobFinishedEvent["failure_class"]
     }
 
-    if ($failureReason -ne "job_failed" -or $failureClass -notin @("provider_error", "timeout")) {
+    $canRecover = $false
+    if ($failureReason -eq "job_failed" -and $failureClass -in @("provider_error", "timeout")) {
+        $canRecover = $true
+    }
+    elseif (
+        $failureReason -eq "invalid_artifact" -and
+        $lastJobFinishedEvent -and
+        [string]$lastJobFinishedEvent["result_status"] -eq "succeeded"
+    ) {
+        $canRecover = $true
+    }
+
+    if (-not $canRecover) {
         return @{
             changed = $false
             run_state = $state
             recovery_event = $null
         }
     }
-
     $state["status"] = "running"
     $state["feedback"] = ""
     $state["updated_at"] = (Get-Date).ToString("o")
