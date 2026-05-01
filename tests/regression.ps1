@@ -536,10 +536,20 @@ try {
     if ([string]::IsNullOrWhiteSpace($archToken)) {
         $archToken = "x64"
     }
+    $platformToken = Get-CopilotPlatformToken
+    if ([string]::IsNullOrWhiteSpace($platformToken)) {
+        throw "Copilot platform token should resolve for the current test host."
+    }
 
     $wrapperPath = Join-Path $tempCopilotProviderRoot "copilot.ps1"
-    $nativePackageDir = Join-Path $tempCopilotProviderRoot ("node_modules\\@github\\copilot\\node_modules\\@github\\copilot-win32-{0}" -f $archToken)
-    $nativeBinaryPath = Join-Path $nativePackageDir "copilot.exe"
+    $packageRoot = Join-Path $tempCopilotProviderRoot "node_modules"
+    $packageRoot = Join-Path $packageRoot "@github"
+    $packageRoot = Join-Path $packageRoot "copilot"
+    $nativePackageRoot = Join-Path $packageRoot "node_modules"
+    $nativePackageRoot = Join-Path $nativePackageRoot "@github"
+    $nativePackageDir = Join-Path $nativePackageRoot ("copilot-{0}-{1}" -f $platformToken, $archToken)
+    $nativeBinaryName = if ($platformToken -eq "win32") { "copilot.exe" } else { "copilot" }
+    $nativeBinaryPath = Join-Path $nativePackageDir $nativeBinaryName
     New-Item -ItemType Directory -Path $nativePackageDir -Force | Out-Null
     Set-Content -Path $wrapperPath -Value "# synthetic copilot wrapper" -Encoding UTF8
     Set-Content -Path $nativeBinaryPath -Value "" -Encoding UTF8

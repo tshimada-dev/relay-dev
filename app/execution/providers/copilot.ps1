@@ -92,6 +92,20 @@ function Get-CopilotArchitectureTokens {
     return @($tokens.ToArray())
 }
 
+function Get-CopilotPlatformToken {
+    if ($IsWindows) {
+        return "win32"
+    }
+    if ($IsMacOS) {
+        return "darwin"
+    }
+    if ($IsLinux) {
+        return "linux"
+    }
+
+    return ""
+}
+
 function Get-CopilotNativeCommandPath {
     param([string]$Command)
 
@@ -121,18 +135,7 @@ function Get-CopilotNativeCommandPath {
         return $resolvedPath
     }
 
-    $platformToken = if ($IsWindows) {
-        "win32"
-    }
-    elseif ($IsMacOS) {
-        "darwin"
-    }
-    elseif ($IsLinux) {
-        "linux"
-    }
-    else {
-        ""
-    }
+    $platformToken = Get-CopilotPlatformToken
     if ([string]::IsNullOrWhiteSpace($platformToken)) {
         return $null
     }
@@ -142,8 +145,11 @@ function Get-CopilotNativeCommandPath {
         return $null
     }
 
-    $packageRoot = Join-Path $baseDir "node_modules\@github\copilot"
-    $nativePackageRoot = Join-Path $packageRoot "node_modules\@github"
+    $packageRoot = Join-Path $baseDir "node_modules"
+    $packageRoot = Join-Path $packageRoot "@github"
+    $packageRoot = Join-Path $packageRoot "copilot"
+    $nativePackageRoot = Join-Path $packageRoot "node_modules"
+    $nativePackageRoot = Join-Path $nativePackageRoot "@github"
     if (-not (Test-Path $nativePackageRoot)) {
         return $null
     }
@@ -180,7 +186,7 @@ function Get-CopilotNativeCommandPath {
         $orderedDirs.Add($candidateDir) | Out-Null
     }
 
-    $binaryName = if ($IsWindows) { "copilot.exe" } else { "copilot" }
+    $binaryName = if ($platformToken -eq "win32") { "copilot.exe" } else { "copilot" }
     foreach ($candidateDir in $orderedDirs) {
         $candidatePath = Join-Path $candidateDir.FullName $binaryName
         if (Test-Path $candidatePath) {
