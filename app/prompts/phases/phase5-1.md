@@ -7,6 +7,7 @@
 - `Selected Task` と `phase5_result.json` を正本として照合すること
 - `Selected Task.boundary_contract` がある場合、それにない越境を不適合として扱うこと
 - `Selected Task.visual_contract.mode` が `not_applicable` 以外の場合、それに反するUI変更を不適合として扱うこと
+- `Selected Task.open_requirement_overlay.items[]` がある場合、それを relevant open requirements の task-scoped overlay として照合すること
 - 実装ログだけでなく、必要に応じて実ファイルと差分も確認すること
 - Required Outputs に書かれた `phase5-1_completion_check.md` と `phase5-1_verdict.json` のみを作成すること
 
@@ -78,6 +79,7 @@
 Input Artifacts と `Selected Task` を読み込むこと。
 
 - planned task / repair task を問わず、検証対象の正本は `Selected Task` に含まれる `acceptance_criteria`、`changed_files`、`boundary_contract`、`visual_contract` である
+- `Selected Task.open_requirement_overlay.items[]` がある場合は、その `additional_acceptance_criteria`、`verification`、`suggested_changed_files` を使って、in-scope carry-forward requirement の取りこぼしがないか追加確認すること
 - `phase4_task_breakdown.md` は背景説明の補助として参照してよいが、repair task のために別の raw contract file を探さないこと
 - 対象 task は engine がすでに選択済みである。task artifact directory を走査して自分で選び直さないこと
 
@@ -192,6 +194,130 @@ No項目:
 
 T-02完了チェック：11項目中10項目Yes、1項目No。No項目は検索クエリqの最大長制限が未実装でDoSリスクあり。追加指摘としてper_page=0の境界値テスト不足。修正案：max_length=200バリデーション追加＋per_page<1のバリデーション追加。機能要件は概ね充足、品質・保守性は問題なし。
 ```
+
+追加例として、`Relevant Open Requirements` が渡されている task の完了チェックイメージも示す。
+
+````markdown
+### 概要
+
+`Relevant Open Requirements` として `auth-rate-limiting-T-02` と `login-ui-error-path-tests-T-02` を受領。
+今回 task の `changed_files` は `src/app/api/auth/signin/route.ts`、`src/middleware.ts`、`src/lib/rate-limit.ts` を含むため、
+`auth-rate-limiting-T-02` は in-scope の完了条件として追加照合した。
+一方 `login-ui-error-path-tests-T-02` は `login/page.tsx` と jsdom 設定変更が必要で、今回 task の changed_files / boundary_contract 外と判断したため補助的 warning に留めた。
+
+### Criterion-by-Criterion Check
+
+- [x] サインイン成功時に既存フローを壊していないか: **Yes**
+  - 根拠: `src/__tests__/api/auth/signin.test.ts:18-42` の正常系が通過
+- [ ] ブルートフォース抑止のため、短時間の連続失敗時に 429 を返すか: **No**
+  - 根拠: `src/app/api/auth/signin/route.ts:21-39` にレート制限呼び出しがなく、`src/lib/rate-limit.ts` も新規追加されていない
+  - open requirement `auth-rate-limiting-T-02` は今回 task の changed_files と一致するため、後続 task に送らず今回の不適合として扱う
+
+### Review Checklist
+
+- `Selected Task.changed_files` と実変更の整合: **No**
+  - `src/lib/rate-limit.ts` が作成されておらず、`phase5_result.json` の `changed_files` とも不一致
+- `Relevant Open Requirements` の in-scope 照合: **No**
+  - `auth-rate-limiting-T-02` が未解消
+- `Relevant Open Requirements` の out-of-scope 切り分け: **Yes**
+  - `login-ui-error-path-tests-T-02` は今回 task の reject 根拠に含めず、継続課題として扱う判断は妥当
+
+### Defects
+
+1. `auth-rate-limiting-T-02` が未実装。`signin` route にレート制限がなく、ブルートフォース抑止の要件を満たしていない
+2. `phase5_result.json` では open requirement を回収した前提の要約になっているが、実ファイルと一致しない
+
+### Verdict Rationale
+
+**Reject — Phase5に差し戻し**
+
+今回の task は `auth-rate-limiting-T-02` を実装できる changed_files / boundary_contract を持っているにもかかわらず、
+実コードで未解消のままである。in-scope open requirement の取りこぼしは Phase5 の未完了として扱う。
+
+## phase5-1_verdict.json の抜粋例
+
+```json
+{
+  "task_id": "T-02",
+  "verdict": "reject",
+  "rollback_phase": "Phase5",
+  "must_fix": [
+    "`auth-rate-limiting-T-02` を in-scope requirement として実装し、src/app/api/auth/signin/route.ts または src/middleware.ts で実際にレート制限を有効化すること",
+    "phase5_result.json の implementation_summary / changed_files を実コードと一致させること"
+  ],
+  "warnings": [
+    "`login-ui-error-path-tests-T-02` は今回 task の changed_files / boundary_contract 外であり、reject 根拠ではなく継続課題として扱った"
+  ],
+  "evidence": [
+    "src/app/api/auth/signin/route.ts:21-39",
+    "phase5_result.json",
+    "Selected Task.changed_files"
+  ],
+  "acceptance_criteria_checks": [
+    {
+      "criterion": "ブルートフォース抑止のため、短時間の連続失敗時に 429 を返す",
+      "status": "fail",
+      "notes": "Relevant Open Requirement `auth-rate-limiting-T-02` が未解消",
+      "evidence": [
+        "src/app/api/auth/signin/route.ts:21-39"
+      ]
+    }
+  ],
+  "review_checks": [
+    {
+      "check_id": "selected_task_alignment",
+      "status": "fail",
+      "notes": "in-scope open requirement を changed_files 内で回収できていない",
+      "evidence": [
+        "Selected Task.changed_files",
+        "src/app/api/auth/signin/route.ts:21-39"
+      ]
+    },
+    {
+      "check_id": "acceptance_criteria_coverage",
+      "status": "fail",
+      "notes": "429 応答の要件が未達",
+      "evidence": [
+        "src/__tests__/api/auth/signin.test.ts"
+      ]
+    },
+    {
+      "check_id": "changed_files_audit",
+      "status": "fail",
+      "notes": "phase5_result.json の changed_files と実ファイルが一致しない",
+      "evidence": [
+        "phase5_result.json",
+        "Selected Task.changed_files"
+      ]
+    },
+    {
+      "check_id": "test_evidence_review",
+      "status": "pass",
+      "notes": "正常系テストの実行証跡は存在するが、レート制限の失敗系証跡が不足する",
+      "evidence": [
+        "src/__tests__/api/auth/signin.test.ts:18-42"
+      ]
+    },
+    {
+      "check_id": "design_boundary_alignment",
+      "status": "pass",
+      "notes": "今回の defect は設計境界逸脱ではなく、境界内 requirement の未実装",
+      "evidence": [
+        "Selected Task.boundary_contract"
+      ]
+    },
+    {
+      "check_id": "visual_contract_alignment",
+      "status": "pass",
+      "notes": "今回 task は UI 視覚変更を含まず、visual contract 逸脱は確認されない",
+      "evidence": [
+        "Selected Task.visual_contract"
+      ]
+    }
+  ]
+}
+```
+````
 
 ### Reject詳細（No項目がある場合は必須出力）
 

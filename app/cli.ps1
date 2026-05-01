@@ -830,6 +830,413 @@ function Format-ArchivedPhaseJsonContextLines {
     return @(Format-ArchivedJsonContextPromptLines -ArchivedContext $context)
 }
 
+function Save-StagedPromptContextArtifact {
+    param(
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][string]$JobId,
+        [Parameter(Mandatory)][string]$PhaseName,
+        [Parameter(Mandatory)][ValidateSet("run", "task")][string]$Scope,
+        [Parameter(Mandatory)][string]$ArtifactId,
+        [Parameter(Mandatory)]$Content,
+        [string]$TaskId,
+        [switch]$AsJson
+    )
+
+    $path = Resolve-StagedArtifactPath -ProjectRoot $script:ProjectRoot -RunId $RunId -StorageScope "job" -Scope $Scope -Phase $PhaseName -ArtifactId $ArtifactId -TaskId $TaskId -JobId $JobId
+    $directory = Split-Path -Parent $path
+    if (-not (Test-Path -LiteralPath $directory)) {
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    }
+
+    $serialized = if ($AsJson) {
+        (ConvertTo-RelayHashtable -InputObject $Content) | ConvertTo-Json -Depth 20
+    }
+    else {
+        [string]$Content
+    }
+
+    $tempPath = "${path}.tmp"
+    Set-Content -Path $tempPath -Value $serialized -Encoding UTF8
+    if (Test-Path -LiteralPath $path) {
+        Remove-Item -LiteralPath $path -Force
+    }
+    Move-Item -LiteralPath $tempPath -Destination $path -Force
+    return $path
+}
+
+function Get-RelevantOpenRequirementsForPrompt {
+    param(
+        [Parameter(Mandatory)]$RunState,
+        [Parameter(Mandatory)][string]$PhaseName,
+        [string]$TaskId
+    )
+
+    $state = ConvertTo-RelayHashtable -InputObject $RunState
+    $allRequirements = @($state["open_requirements"])
+    $relevant = New-Object System.Collections.Generic.List[object]
+    $omittedIds = New-Object System.Collections.Generic.List[string]
+    $isTaskScopedPhase = Test-TaskScopedPhase -Phase $PhaseName
+
+    foreach ($requirementRaw in $allRequirements) {
+        $requirement = ConvertTo-RelayHashtable -InputObject $requirementRaw
+        $sourceTaskId = [string]$requirement["source_task_id"]
+        $isGlobalRequirement = [string]::IsNullOrWhiteSpace($sourceTaskId)
+        $isCurrentTaskRequirement = -not [string]::IsNullOrWhiteSpace($TaskId) -and $sourceTaskId -eq $TaskId
+        $matchesCurrentPhase = [string]$requirement["verify_in_phase"] -eq $PhaseName
+
+        $include = if ($isTaskScopedPhase) {
+            $isGlobalRequirement -or $isCurrentTaskRequirement
+        }
+        else {
+            $isGlobalRequirement -or $matchesCurrentPhase
+        }
+
+        if ($include) {
+            $relevant.Add($requirement) | Out-Null
+            continue
+        }
+
+        $itemId = [string]$requirement["item_id"]
+        if ([string]::IsNullOrWhiteSpace($itemId)) {
+            $itemId = "<no-item-id>"
+        }
+        $omittedIds.Add($itemId) | Out-Null
+    }
+
+    return [ordered]@{
+        total_count = $allRequirements.Count
+        relevant = @($relevant.ToArray())
+        relevant_count = $relevant.Count
+        omitted_count = $omittedIds.Count
+        omitted_item_ids = @($omittedIds.ToArray())
+        is_task_scoped_phase = $isTaskScopedPhase
+    }
+}
+
+function Get-SelectedTaskChangedFileMetadata {
+    param([AllowNull()]$SelectedTask)
+
+    $task = ConvertTo-RelayHashtable -InputObject $SelectedTask
+    $metadata = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
+
+    foreach ($changedFileRaw in @($task["changed_files"])) {
+        $rawText = [string]$changedFileRaw
+        if ([string]::IsNullOrWhiteSpace($rawText)) {
+            continue
+        }
+
+        $normalizedPath = $rawText.Trim()
+        foreach ($delimiter in @("（", "(")) {
+            $delimiterIndex = $normalizedPath.IndexOf($delimiter)
+            if ($delimiterIndex -gt 0) {
+                $normalizedPath = $normalizedPath.Substring(0, $delimiterIndex).Trim()
+                break
+            }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($normalizedPath)) {
+            $normalizedPath = $rawText.Trim()
+        }
+
+        $key = $normalizedPath.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) {
+            continue
+        }
+
+        $seen[$key] = $true
+        $leafName = Split-Path -Leaf ($normalizedPath -replace '/', '\')
+        $metadata.Add([ordered]@{
+                raw = $rawText.Trim()
+                path = $normalizedPath
+                leaf = $leafName
+            }) | Out-Null
+    }
+
+    return @($metadata.ToArray())
+}
+
+function Get-SuggestedChangedFilesForOpenRequirement {
+    param(
+        [Parameter(Mandatory)]$Requirement,
+        [Parameter(Mandatory)][object[]]$ChangedFileMetadata,
+        [string]$CurrentTaskId
+    )
+
+    $requirementObject = ConvertTo-RelayHashtable -InputObject $Requirement
+    $description = [string]$requirementObject["description"]
+    $sourceTaskId = [string]$requirementObject["source_task_id"]
+    $matches = New-Object System.Collections.Generic.List[string]
+    $seen = @{}
+
+    foreach ($entryRaw in @($ChangedFileMetadata)) {
+        $entry = ConvertTo-RelayHashtable -InputObject $entryRaw
+        $pathCandidate = [string]$entry["path"]
+        $leafCandidate = [string]$entry["leaf"]
+        $isMatch = $false
+
+        foreach ($candidate in @($pathCandidate, $leafCandidate)) {
+            if ([string]::IsNullOrWhiteSpace($candidate)) {
+                continue
+            }
+
+            if ($description.IndexOf($candidate, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                $isMatch = $true
+                break
+            }
+        }
+
+        if (-not $isMatch) {
+            continue
+        }
+
+        $key = $pathCandidate.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) {
+            continue
+        }
+
+        $seen[$key] = $true
+        $matches.Add($pathCandidate) | Out-Null
+    }
+
+    if ($matches.Count -eq 0 -and -not [string]::IsNullOrWhiteSpace($CurrentTaskId) -and $sourceTaskId -eq $CurrentTaskId) {
+        foreach ($entryRaw in @($ChangedFileMetadata)) {
+            $entry = ConvertTo-RelayHashtable -InputObject $entryRaw
+            $pathCandidate = [string]$entry["path"]
+            if ([string]::IsNullOrWhiteSpace($pathCandidate)) {
+                continue
+            }
+
+            $key = $pathCandidate.ToLowerInvariant()
+            if ($seen.ContainsKey($key)) {
+                continue
+            }
+
+            $seen[$key] = $true
+            $matches.Add($pathCandidate) | Out-Null
+        }
+    }
+
+    return @($matches.ToArray())
+}
+
+function New-SelectedTaskOpenRequirementOverlay {
+    param(
+        [Parameter(Mandatory)]$RunState,
+        [Parameter(Mandatory)]$SelectedTask,
+        [Parameter(Mandatory)]$JobSpec
+    )
+
+    $state = ConvertTo-RelayHashtable -InputObject $RunState
+    $task = ConvertTo-RelayHashtable -InputObject $SelectedTask
+    $job = ConvertTo-RelayHashtable -InputObject $JobSpec
+    $taskId = [string]$task["task_id"]
+    $phaseName = [string]$job["phase"]
+
+    if ([string]::IsNullOrWhiteSpace($taskId) -or -not (Test-TaskScopedPhase -Phase $phaseName)) {
+        return $null
+    }
+
+    $selection = ConvertTo-RelayHashtable -InputObject (Get-RelevantOpenRequirementsForPrompt -RunState $state -PhaseName $phaseName -TaskId $taskId)
+    $changedFileMetadata = @(Get-SelectedTaskChangedFileMetadata -SelectedTask $task)
+    $overlayItems = New-Object System.Collections.Generic.List[object]
+    $nonOverlayItemIds = New-Object System.Collections.Generic.List[string]
+
+    foreach ($requirementRaw in @($selection["relevant"])) {
+        $requirement = ConvertTo-RelayHashtable -InputObject $requirementRaw
+        $itemId = [string]$requirement["item_id"]
+        $verifyInPhase = [string]$requirement["verify_in_phase"]
+        $description = [string]$requirement["description"]
+        $requiredArtifacts = @(
+            @($requirement["required_artifacts"]) |
+                ForEach-Object { [string]$_ } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        )
+        $suggestedChangedFiles = @(Get-SuggestedChangedFilesForOpenRequirement -Requirement $requirement -ChangedFileMetadata $changedFileMetadata -CurrentTaskId $taskId)
+        $sourceTaskId = [string]$requirement["source_task_id"]
+        $isCurrentTaskRequirement = -not [string]::IsNullOrWhiteSpace($sourceTaskId) -and $sourceTaskId -eq $taskId
+        $isOverlayCandidate = $isCurrentTaskRequirement -or $suggestedChangedFiles.Count -gt 0
+
+        if (-not $isOverlayCandidate) {
+            if (-not [string]::IsNullOrWhiteSpace($itemId)) {
+                $nonOverlayItemIds.Add($itemId) | Out-Null
+            }
+            continue
+        }
+
+        $additionalAcceptanceCriteria = New-Object System.Collections.Generic.List[string]
+        if (-not [string]::IsNullOrWhiteSpace($description)) {
+            $additionalAcceptanceCriteria.Add($description) | Out-Null
+        }
+        if ($suggestedChangedFiles.Count -gt 0) {
+            $additionalAcceptanceCriteria.Add("解消の主対象が Selected Task.changed_files の範囲に収まり、次の変更候補で確認できること: $($suggestedChangedFiles -join ', ')") | Out-Null
+        }
+        if ($requiredArtifacts.Count -gt 0) {
+            $additionalAcceptanceCriteria.Add("後続の $verifyInPhase で $($requiredArtifacts -join ', ') を根拠 artifact として解消確認できること") | Out-Null
+        }
+
+        $verification = New-Object System.Collections.Generic.List[string]
+        if ($suggestedChangedFiles.Count -gt 0) {
+            $verification.Add("実装変更を確認: $($suggestedChangedFiles -join ', ')") | Out-Null
+        }
+        if ($requiredArtifacts.Count -gt 0) {
+            $verification.Add("次回 $verifyInPhase で次の artifact を照合: $($requiredArtifacts -join ', ')") | Out-Null
+        }
+        else {
+            $verification.Add("次回 $verifyInPhase で関連コードと phase artifact を照合して解消確認する") | Out-Null
+        }
+        if (-not [string]::IsNullOrWhiteSpace($itemId)) {
+            $verification.Add("解消した場合は後続 verdict artifact の resolved_requirement_ids に '$itemId' を記録できる状態にする") | Out-Null
+        }
+
+        $overlayItems.Add([ordered]@{
+                item_id = $itemId
+                source_phase = [string]$requirement["source_phase"]
+                source_task_id = $sourceTaskId
+                verify_in_phase = $verifyInPhase
+                required_artifacts = $requiredArtifacts
+                description = $description
+                additional_acceptance_criteria = @($additionalAcceptanceCriteria.ToArray())
+                verification = @($verification.ToArray())
+                suggested_changed_files = $suggestedChangedFiles
+            }) | Out-Null
+    }
+
+    if ($overlayItems.Count -eq 0) {
+        return $null
+    }
+
+    $overlayArtifactId = "open_requirement_overlay.json"
+    $overlayArtifactContent = [ordered]@{
+        generated_at = (Get-Date).ToString("o")
+        run_id = [string]$job["run_id"]
+        job_id = [string]$job["job_id"]
+        phase = $phaseName
+        task_id = $taskId
+        overlay_policy = "Actionable task-scoped subset distilled from relevant open requirements. Actual run-state closure still requires downstream resolved_requirement_ids."
+        relevant_item_ids = @(
+            @($selection["relevant"]) |
+                ForEach-Object {
+                    $requirement = ConvertTo-RelayHashtable -InputObject $_
+                    [string]$requirement["item_id"]
+                } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        )
+        non_overlay_relevant_item_ids = @($nonOverlayItemIds.ToArray())
+        overlay_items = @($overlayItems.ToArray())
+    }
+    $overlayArtifactPath = Save-StagedPromptContextArtifact -RunId ([string]$job["run_id"]) -JobId ([string]$job["job_id"]) -PhaseName $phaseName -Scope "task" -ArtifactId $overlayArtifactId -TaskId $taskId -Content $overlayArtifactContent -AsJson
+
+    return [ordered]@{
+        artifact_path = $overlayArtifactPath
+        overlay = [ordered]@{
+            artifact_ref = $overlayArtifactPath
+            note = "This overlay is a task-scoped addendum distilled from relevant open requirements. It narrows actionable carry-forward work but does not authorize boundary expansion. Actual run-state closure still happens only when a later verdict artifact records resolved_requirement_ids."
+            non_overlay_relevant_item_ids = @($nonOverlayItemIds.ToArray())
+            items = @($overlayItems.ToArray())
+        }
+    }
+}
+
+function New-OpenRequirementsPromptSection {
+    param(
+        [Parameter(Mandatory)]$RunState,
+        [Parameter(Mandatory)]$JobSpec,
+        [AllowNull()]$TaskOpenRequirementOverlay
+    )
+
+    $state = ConvertTo-RelayHashtable -InputObject $RunState
+    $job = ConvertTo-RelayHashtable -InputObject $JobSpec
+    $phaseName = [string]$job["phase"]
+    $taskId = [string]$job["task_id"]
+    $selection = ConvertTo-RelayHashtable -InputObject (Get-RelevantOpenRequirementsForPrompt -RunState $state -PhaseName $phaseName -TaskId $taskId)
+
+    if ([int]$selection["total_count"] -eq 0) {
+        return $null
+    }
+
+    $artifactScope = if ([bool]$selection["is_task_scoped_phase"] -and -not [string]::IsNullOrWhiteSpace($taskId)) { "task" } else { "run" }
+    $allRequirementsArtifactId = "open_requirements_full.json"
+    $allRequirementsArtifactContent = [ordered]@{
+        generated_at = (Get-Date).ToString("o")
+        run_id = [string]$job["run_id"]
+        job_id = [string]$job["job_id"]
+        phase = $phaseName
+        task_id = if ([string]::IsNullOrWhiteSpace($taskId)) { $null } else { $taskId }
+        total_open_requirements = [int]$selection["total_count"]
+        unresolved_open_requirements = @($state["open_requirements"])
+    }
+    $allRequirementsArtifactPath = Save-StagedPromptContextArtifact -RunId ([string]$job["run_id"]) -JobId ([string]$job["job_id"]) -PhaseName $phaseName -Scope $artifactScope -ArtifactId $allRequirementsArtifactId -TaskId $taskId -Content $allRequirementsArtifactContent -AsJson
+
+    $relevantArtifactId = "open_requirements_context.json"
+    $relevantArtifactContent = [ordered]@{
+        generated_at = (Get-Date).ToString("o")
+        run_id = [string]$job["run_id"]
+        job_id = [string]$job["job_id"]
+        phase = $phaseName
+        task_id = if ([string]::IsNullOrWhiteSpace($taskId)) { $null } else { $taskId }
+        total_open_requirements = [int]$selection["total_count"]
+        relevant_open_requirements = @($selection["relevant"])
+        omitted_open_requirement_ids = @($selection["omitted_item_ids"])
+        selection_policy = [ordered]@{
+            phase_scope = if ([bool]$selection["is_task_scoped_phase"]) { "task" } else { "run" }
+            include_global_requirements = $true
+            include_current_task_requirements = [bool]$selection["is_task_scoped_phase"]
+            include_current_phase_requirements = -not [bool]$selection["is_task_scoped_phase"]
+        }
+    }
+    $relevantArtifactPath = Save-StagedPromptContextArtifact -RunId ([string]$job["run_id"]) -JobId ([string]$job["job_id"]) -PhaseName $phaseName -Scope $artifactScope -ArtifactId $relevantArtifactId -TaskId $taskId -Content $relevantArtifactContent -AsJson
+
+    $summaryLines = New-Object System.Collections.Generic.List[string]
+    $summaryLines.Add("Prompt size is intentionally bounded here. Read the JSON artifact for full relevant requirement details.") | Out-Null
+    $summaryLines.Add("- total open requirements in run-state: $([int]$selection["total_count"])") | Out-Null
+    $summaryLines.Add("- relevant to this prompt: $([int]$selection["relevant_count"])") | Out-Null
+    $summaryLines.Add("- selection policy: $(if ([bool]$selection["is_task_scoped_phase"]) { "global + current task requirements" } else { "global + current phase requirements" })") | Out-Null
+    $summaryLines.Add("- role-scoped relevant requirement JSON: $relevantArtifactPath") | Out-Null
+    $summaryLines.Add("- full unresolved requirement JSON: $allRequirementsArtifactPath") | Out-Null
+    if ([int]$selection["omitted_count"] -gt 0) {
+        $summaryLines.Add("- omitted from inline prompt as unrelated here: $([int]$selection["omitted_count"])") | Out-Null
+    }
+    if ([string]$job["role"] -in @("implementer", "repairer")) {
+        $summaryLines.Add("- if you can resolve carry-forward items in this task, inspect the full unresolved requirement JSON before stopping") | Out-Null
+    }
+    $overlayInfo = ConvertTo-RelayHashtable -InputObject $TaskOpenRequirementOverlay
+    if ($overlayInfo -and $overlayInfo["artifact_path"]) {
+        $overlayObject = ConvertTo-RelayHashtable -InputObject $overlayInfo["overlay"]
+        $overlayItems = @($overlayObject["items"])
+        if ($overlayItems.Count -gt 0) {
+            $summaryLines.Add("- task-scoped actionable overlay JSON: $([string]$overlayInfo['artifact_path'])") | Out-Null
+            $overlayItemIds = @(
+                $overlayItems |
+                    ForEach-Object {
+                        $overlayItem = ConvertTo-RelayHashtable -InputObject $_
+                        [string]$overlayItem["item_id"]
+                    } |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+            )
+            if ($overlayItemIds.Count -gt 0) {
+                $summaryLines.Add("- overlay item_ids in Selected Task.open_requirement_overlay: $($overlayItemIds -join ', ')") | Out-Null
+            }
+        }
+    }
+
+    $relevantItemIds = @(
+        @($selection["relevant"]) |
+            ForEach-Object {
+                $requirement = ConvertTo-RelayHashtable -InputObject $_
+                [string]$requirement["item_id"]
+            } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    if ($relevantItemIds.Count -gt 0) {
+        $visibleIds = if ($relevantItemIds.Count -gt 8) { @($relevantItemIds[0..7]) } else { $relevantItemIds }
+        $suffix = if ($relevantItemIds.Count -gt $visibleIds.Count) { " (+$($relevantItemIds.Count - $visibleIds.Count) more)" } else { "" }
+        $summaryLines.Add("- relevant item_ids: $($visibleIds -join ", ")$suffix") | Out-Null
+    }
+
+    return "## Relevant Open Requirements`n$($summaryLines -join "`n")"
+}
+
 function New-EnginePromptText {
     param(
         [Parameter(Mandatory)]$RunState,
@@ -896,13 +1303,20 @@ function New-EnginePromptText {
     }
 
     if ($engineAction["selected_task"]) {
-        $selectedTaskJson = (ConvertTo-RelayHashtable -InputObject $engineAction["selected_task"]) | ConvertTo-Json -Depth 20
+        $selectedTaskForPrompt = ConvertTo-RelayHashtable -InputObject $engineAction["selected_task"]
+        $taskOpenRequirementOverlay = New-SelectedTaskOpenRequirementOverlay -RunState $state -SelectedTask $selectedTaskForPrompt -JobSpec $job
+        if ($taskOpenRequirementOverlay -and $taskOpenRequirementOverlay["overlay"]) {
+            $selectedTaskForPrompt["open_requirement_overlay"] = $taskOpenRequirementOverlay["overlay"]
+        }
+        $selectedTaskJson = $selectedTaskForPrompt | ConvertTo-Json -Depth 20
         $sections.Add("## Selected Task`n$selectedTaskJson")
     }
 
     if (@($state["open_requirements"]).Count -gt 0) {
-        $openRequirementsJson = @($state["open_requirements"]) | ConvertTo-Json -Depth 20
-        $sections.Add("## Open Requirements`n$openRequirementsJson")
+        $openRequirementsSection = New-OpenRequirementsPromptSection -RunState $state -JobSpec $job -TaskOpenRequirementOverlay $taskOpenRequirementOverlay
+        if (-not [string]::IsNullOrWhiteSpace($openRequirementsSection)) {
+            $sections.Add($openRequirementsSection)
+        }
     }
 
     return ($sections -join "`n`n")

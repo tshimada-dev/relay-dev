@@ -8,6 +8,8 @@
 - 選ばれた task が planned task でも repair task でも、そこで定義された `changed_files` と `acceptance_criteria` に従うこと
 - `Selected Task` に `boundary_contract` がある場合、それを task-scoped の設計境界として守ること
 - `Selected Task` に `visual_contract` があり `mode` が `not_applicable` 以外の場合、それを task-scoped の視覚設計契約として守ること
+- `Selected Task.open_requirement_overlay.items[]` がある場合、それを relevant open requirements から engine が蒸留した task-scoped addendum として扱うこと
+- `Relevant Open Requirements` または `Open Requirements` が渡されている場合、現在 task の境界内で解消可能な項目は可能な限り今回の実装で回収すること
 - 他の task を自分で選ばないこと
 - Required Outputs に書かれた `phase5_implementation.md` と `phase5_result.json` のみを作成すること
 - 次フェーズの判定、completion marker の作成、制御ファイルの更新は engine が行う。自分で行わないこと
@@ -17,6 +19,9 @@
 - 実ファイルを編集し、変更に必要なテストも更新すること
 - 既存コードの流儀に合わせること
 - 仕様不明点は勝手に拡張せず、`known_issues` に明示すること
+- `Selected Task.open_requirement_overlay.items[]` がある場合は、その `additional_acceptance_criteria` と `verification` を現在 task の追加契約として扱うこと
+- 既存の open requirement を解消できる変更が現在 task の `changed_files`、`acceptance_criteria`、`boundary_contract` の範囲で成立するなら、後続 task 任せにせずこのフェーズで取り込むこと
+- open requirement を見ても現在 task の境界を越える場合だけ、無理に広げず `known_issues` に「今回見送った理由」を残すこと
 - `boundary_contract` にないモジュール越境、公開インターフェース追加、依存追加、副作用追加、状態所有変更は勝手に行わないこと
 - `visual_contract` にない新しい見た目ルール、コンポーネント状態、レスポンシブ挙動を勝手に足さないこと
 
@@ -76,7 +81,9 @@ Input Artifacts と `Selected Task` を読み込むこと。
 
 - `phase4_task_breakdown.md` や `phase3_design.md` のような人間向け artifact は、背景理解や説明の補助として参照してよい
 - planned task / repair task を問わず、実装スコープの正本は `Selected Task` に含まれる `changed_files`、`acceptance_criteria`、`boundary_contract`、`visual_contract` である
+- `Selected Task.open_requirement_overlay.items[]` がある場合は、そこに並ぶ `additional_acceptance_criteria`、`verification`、`suggested_changed_files` を優先的な carry-forward 回収候補として読むこと
 - repair task でも追加の raw contract file や completion marker を探さないこと。engine が渡した `Selected Task` だけで実装すること
+- `Relevant Open Requirements` または `Open Requirements` が渡されている場合は、それも現在 task に持ち込まれた未解決条件として読むこと。現在 task のスコープ内で解消できるものは拾い、関係が薄いものまで横に広げないこと
 
 `Selected Task` に `boundary_contract` が含まれる場合は、それを現在タスクで許可された変更境界の正本として扱うこと。
 そこにない越境が必要になった場合は、実装を広げず `known_issues` に不足契約として記録すること。
@@ -141,8 +148,9 @@ Input Artifacts と `Selected Task` を読み込むこと。
 engine は常に 1 件の `Selected Task` だけをこのフェーズへ渡します。
 
 1. 今回の `Selected Task` だけを実装する
-2. 実装結果を `phase5_implementation.md` と `phase5_result.json` に記録する
-3. 後続の Phase5-1 / Phase5-2 / Phase6 への進行判断は engine に委ねる
+2. その task の範囲で解消できる `open_requirements` は一緒に回収する
+3. 実装結果を `phase5_implementation.md` と `phase5_result.json` に記録する
+4. 後続の Phase5-1 / Phase5-2 / Phase6 への進行判断は engine に委ねる
 
 次の task の選択、completion marker の作成、legacy control file の更新は自分で行わないこと。
 
@@ -244,6 +252,85 @@ feat(search): 商品検索用GINインデックスを追加
 ## 要約（200字以内）
 
 商品テーブルにGINインデックスを追加するマイグレーションを作成。CONCURRENTLY指定でロックなし。変更ファイル3件（migration up/down、テスト）。リスクはインデックス構築時のCPU負荷増。ロールバック用downマイグレーションも同梱。
+````
+
+追加例として、`Relevant Open Requirements` が渡されている task の出力イメージも示す。
+
+````markdown
+### Task Summary
+
+`Relevant Open Requirements` として `auth-rate-limiting-T-02` と `login-ui-error-path-tests-T-02` を受領した。
+今回の task は `src/app/api/auth/signin/route.ts` と `src/middleware.ts` を変更対象に含むため、
+`auth-rate-limiting-T-02` は task の境界内と判断して今回の実装で回収した。
+一方 `login-ui-error-path-tests-T-02` は `login/page.tsx` と jsdom テスト基盤の整備を要し、
+今回 task の `changed_files` と `boundary_contract` を越えるため `known_issues` に理由付きで残した。
+
+### Changed Files
+
+| ファイル | 変更種別 |
+|---------|---------|
+| src/app/api/auth/signin/route.ts | 修正 |
+| src/middleware.ts | 修正 |
+| src/lib/rate-limit.ts | 新規作成 |
+| src/__tests__/api/auth/signin.test.ts | 新規作成 |
+
+### Implementation Details
+
+- `src/lib/rate-limit.ts` に IP + userKey 単位のレート制限ヘルパーを追加
+- `src/app/api/auth/signin/route.ts` でサインイン前にレート制限チェックを実行し、閾値超過時は 429 を返すよう変更
+- `src/middleware.ts` に認証エンドポイント向けの共通ヘッダ処理を追加し、将来の WAF / CDN 連携に備えて `x-forwarded-for` 解決を統一
+- `src/__tests__/api/auth/signin.test.ts` に 429 応答、成功時リセット、閾値直前の許可ケースを追加
+
+### Commands Run
+
+- `npm test -- src/__tests__/api/auth/signin.test.ts`
+- `npm run lint -- src/app/api/auth/signin/route.ts src/middleware.ts src/lib/rate-limit.ts`
+
+### Acceptance Criteria Status
+
+- [x] サインイン成功時に既存フローを壊さない
+  - 根拠: `src/__tests__/api/auth/signin.test.ts` の `returns session on valid credentials` が通過
+- [x] ブルートフォース抑止のため、短時間の連続失敗時に 429 を返す
+  - 根拠: `too many attempts returns 429` テストを追加
+- [x] レート制限は API route から有効化されている
+  - 根拠: `src/app/api/auth/signin/route.ts` で `assertSigninRateLimit()` を呼び出し
+
+### Known Issues / Residual Risks
+
+- `login-ui-error-path-tests-T-02` は `src/app/login/page.tsx` と `vitest.config.ts` への変更が必要で、今回 task の `changed_files` / `boundary_contract` 外のため未対応。
+- CDN / WAF レイヤーでの追加レート制限は未設定。今回実装はアプリ層の一次防御として成立する。
+
+## phase5_result.json の例
+
+```json
+{
+  "task_id": "T-02",
+  "changed_files": [
+    "src/app/api/auth/signin/route.ts",
+    "src/middleware.ts",
+    "src/lib/rate-limit.ts",
+    "src/__tests__/api/auth/signin.test.ts"
+  ],
+  "commands_run": [
+    "npm test -- src/__tests__/api/auth/signin.test.ts",
+    "npm run lint -- src/app/api/auth/signin/route.ts src/middleware.ts src/lib/rate-limit.ts"
+  ],
+  "implementation_summary": "`auth-rate-limiting-T-02` を task の境界内 requirement と判断し、サインイン API にレート制限を追加した。アプリ層のレート制限ヘルパーを新設し、429 応答と閾値直前ケースのテストを追加した。",
+  "acceptance_criteria_status": [
+    {
+      "criterion": "ブルートフォース抑止のため、短時間の連続失敗時に 429 を返す",
+      "status": "met",
+      "evidence": [
+        "src/app/api/auth/signin/route.ts",
+        "src/__tests__/api/auth/signin.test.ts"
+      ]
+    }
+  ],
+  "known_issues": [
+    "`login-ui-error-path-tests-T-02` は login/page.tsx と jsdom テスト基盤の変更が必要で、今回 task の changed_files / boundary_contract 外のため未対応。"
+  ]
+}
+```
 ````
 
 ## 要約（出力末尾に必ず付与）

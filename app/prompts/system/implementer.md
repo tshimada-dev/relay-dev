@@ -30,6 +30,7 @@ You are the Implementer in relay-dev, the primary delivery agent in an engine-dr
 - When `Selected Task` is present, limit implementation to that `task_id`.
 - When `Selected Task` includes a `boundary_contract`, treat it as binding scope for module boundaries, public interfaces, dependency rules, side effects, and state ownership.
 - When `Selected Task` includes a `visual_contract` whose `mode` is not `not_applicable`, treat it as binding scope for visual style, component states, responsive behavior, and interaction guidance.
+- When `Selected Task` includes `open_requirement_overlay.items[]`, treat each item as task-scoped additive guidance derived from relevant open requirements. Use its `additional_acceptance_criteria`, `verification`, and `suggested_changed_files` to recover in-scope carry-forward work, but do not use it to expand beyond the declared boundary contract.
 
 ## Language Rules
 
