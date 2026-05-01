@@ -27,7 +27,7 @@
 - [docs/architecture/](../architecture/): リファクタの設計仕様（より深い設計メモ）
 - [docs/plans/](../plans/): 実装計画（phase-transition refactor、repairer plan ほか）
 - [docs/evaluations/](../evaluations/): 自己評価メモ
-- [docs/ideas/](../ideas/): portfolio ロードマップなど将来構想
+- Ideas: `portfolio-roadmap.md`、`portfolio-improvement-backlog.md` などの将来構想
 - [docs/investigations/](../investigations/): 調査メモ
 - [docs/worklog/](../worklog/): 日次ログ
 

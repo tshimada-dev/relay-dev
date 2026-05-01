@@ -234,7 +234,7 @@ relay-dev/
 | Plans | [docs/plans/](./docs/plans/) | phase-transition refactor、repairer 実装計画、redesign tasks |
 | Evaluations | [docs/evaluations/](./docs/evaluations/) | 自己評価メモ（2026-04-06 / 04-15 / 04-30） |
 | Investigations | [docs/investigations/](./docs/investigations/) | provider / runtime 調査メモ |
-| Ideas | [docs/ideas/](./docs/ideas/) | `portfolio-roadmap.md` などの将来構想 |
+| Ideas | [docs/ideas/](./docs/ideas/) | `portfolio-roadmap.md`、`portfolio-improvement-backlog.md` などの将来構想 |
 | Worklog | [docs/worklog/](./docs/worklog/) | 日次作業ログ（`AGENTS.md` / `skills/worklog/SKILL.md`） |
 | Examples | [examples/README.md](./examples/README.md) | 公開 example の方針（manifest、redaction、validator gate） |
 

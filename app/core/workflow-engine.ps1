@@ -600,6 +600,10 @@ function Repair-StaleActiveJobState {
         $shouldClear = $true
         $reason = "finished_job_not_committed"
     }
+    elseif (($jobStatus -eq "dispatched" -or $jobStatus -eq "running") -and -not $hasPid) {
+        $shouldClear = $true
+        $reason = "job_missing_pid"
+    }
     elseif ($hasPid -and -not $processAlive) {
         $shouldClear = $true
         $reason = "stale_active_job"

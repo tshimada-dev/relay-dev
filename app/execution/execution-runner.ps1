@@ -568,7 +568,26 @@ function Invoke-ExecutionAttempt {
     $process.StartInfo = $processInfo
 
     $startedAt = Get-Date
-    $null = $process.Start()
+    try {
+        $null = $process.Start()
+    }
+    catch {
+        $finishedAt = Get-Date
+        $errorMessage = [string]$_.Exception.Message
+        return [ordered]@{
+            process_id = $null
+            exit_code = -1
+            stdout = ""
+            stderr = $errorMessage
+            started_at = $startedAt.ToString("o")
+            finished_at = $finishedAt.ToString("o")
+            elapsed_sec = [int](($finishedAt - $startedAt).TotalSeconds)
+            should_retry = $false
+            was_aborted = $false
+            artifact_completed = $false
+            artifact_completion = $null
+        }
+    }
     if ($OnStarted) {
         & $OnStarted @{
             pid = $process.Id

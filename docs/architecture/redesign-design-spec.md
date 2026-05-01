@@ -418,8 +418,8 @@ engine は `verify_in_phase` と `required_artifacts` を用いて、
   },
   "timeout_policy": {
     "warn_after_sec": 300,
-    "retry_after_sec": 600,
-    "abort_after_sec": 1200,
+    "retry_after_sec": 3600,
+    "abort_after_sec": 5400,
     "max_retries": 1
   }
 }
@@ -1133,8 +1133,8 @@ validator と `JobSpec` は `outputs/` を直接参照しません。
 ```json
 {
   "warn_after_sec": 300,
-  "retry_after_sec": 600,
-  "abort_after_sec": 1200,
+  "retry_after_sec": 3600,
+  "abort_after_sec": 5400,
   "max_retries": 1
 }
 ```

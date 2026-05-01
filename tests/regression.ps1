@@ -530,6 +530,37 @@ $copilotArgumentList = @(Get-ExecutionArgumentListForAttempt -InvocationSpec $co
 Assert-Equal $copilotArgumentList[$copilotArgumentList.Count - 2] "-p" "Copilot execution should append the prompt flag as a dedicated token"
 Assert-Equal $copilotArgumentList[$copilotArgumentList.Count - 1] "hello`nworld" "Copilot execution should keep a multiline prompt as a single argument token"
 
+$tempCopilotProviderRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("relay-dev-copilot-provider-" + [guid]::NewGuid().ToString("N"))
+try {
+    $archToken = (Get-CopilotArchitectureTokens | Select-Object -First 1)
+    if ([string]::IsNullOrWhiteSpace($archToken)) {
+        $archToken = "x64"
+    }
+
+    $wrapperPath = Join-Path $tempCopilotProviderRoot "copilot.ps1"
+    $nativePackageDir = Join-Path $tempCopilotProviderRoot ("node_modules\\@github\\copilot\\node_modules\\@github\\copilot-win32-{0}" -f $archToken)
+    $nativeBinaryPath = Join-Path $nativePackageDir "copilot.exe"
+    New-Item -ItemType Directory -Path $nativePackageDir -Force | Out-Null
+    Set-Content -Path $wrapperPath -Value "# synthetic copilot wrapper" -Encoding UTF8
+    Set-Content -Path $nativeBinaryPath -Value "" -Encoding UTF8
+
+    $resolvedNativePath = Get-CopilotNativeCommandPath -Command $wrapperPath
+    Assert-Equal ([System.IO.Path]::GetFullPath($resolvedNativePath)) ([System.IO.Path]::GetFullPath($nativeBinaryPath)) "Copilot provider should resolve a wrapper install to the adjacent native executable"
+
+    $syntheticCopilotSpec = Get-CopilotProviderInvocationSpec -JobSpec @{
+        provider = "copilot"
+        command = $wrapperPath
+        flags = "--autopilot --yolo --max-autopilot-continues 30 -p"
+    }
+    Assert-Equal ([System.IO.Path]::GetFullPath([string]$syntheticCopilotSpec["command"])) ([System.IO.Path]::GetFullPath($nativeBinaryPath)) "Copilot invocation spec should bypass the PowerShell wrapper when the native executable exists"
+
+    $syntheticCopilotInvocation = Resolve-ProcessInvocationSpec -InvocationSpec $syntheticCopilotSpec
+    Assert-Equal ([System.IO.Path]::GetFullPath([string]$syntheticCopilotInvocation["command"])) ([System.IO.Path]::GetFullPath($nativeBinaryPath)) "Resolved Copilot invocation should launch the native executable directly"
+}
+finally {
+    Remove-Item -Path $tempCopilotProviderRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 $timeoutRecovery = Resolve-EffectiveExecutionResult -ExecutionResult @{
     result_status = "failed"
     exit_code = -1
@@ -1355,6 +1386,25 @@ try {
     }
     Assert-Equal $failureResult["failure_class"] "provider_error" "Fake provider failure should map to provider_error"
 
+    $startFailureResult = Invoke-ExecutionRunner -JobSpec @{
+        run_id = "run-fake-provider"
+        job_id = "job-start-failure"
+        phase = "Phase1"
+        role = "implementer"
+        provider = "generic-cli"
+        command = "C:\\definitely-missing\\relay-dev-provider.exe"
+        flags = ""
+    } -PromptText "hello" -ProjectRoot $tempFakeRoot -WorkingDirectory $tempFakeRoot -TimeoutPolicy @{
+        warn_after_sec = 0
+        retry_after_sec = 0
+        abort_after_sec = 0
+        max_retries = 0
+    }
+    Assert-Equal $startFailureResult["result_status"] "failed" "Start failures should return a failed execution result instead of throwing"
+    Assert-Equal $startFailureResult["failure_class"] "provider_error" "Start failures should be classified as provider_error"
+    $startFailureStderr = Get-Content -Path $startFailureResult["stderr_path"] -Raw -Encoding UTF8
+    Assert-True ($startFailureStderr -match 'Exception calling "Start"|No such file or directory|cannot find|system cannot find|指定されたファイルが見つかりません') "Start failures should persist the process start error to stderr logs"
+
     $artifactRecoveryScriptPath = Join-Path $tempFakeRoot "artifact-recovery.ps1"
     $artifactRecoveryFlagPath = Join-Path $tempFakeRoot "artifact-recovery.flag"
     @"
@@ -1415,6 +1465,17 @@ Start-Sleep -Seconds 30
     Assert-True ([bool]$repairedMissingMetadata["changed"]) "Repair-StaleActiveJobState should recover when active job metadata is missing"
     Assert-Equal $repairedMissingMetadata["reason"] "missing_job_metadata" "Missing job metadata should surface an explicit stale recovery reason"
     Assert-Equal $repairedMissingMetadata["run_state"]["active_job_id"] $null "Missing job metadata recovery should clear active job ids"
+
+    $dispatchedNoPidState = New-RunState -RunId "run-fake-provider" -ProjectRoot $tempFakeRoot -CurrentPhase "Phase1" -CurrentRole "implementer"
+    $dispatchedNoPidState["active_job_id"] = "job-dispatched-no-pid"
+    Write-JobMetadata -ProjectRoot $tempFakeRoot -RunId "run-fake-provider" -JobId "job-dispatched-no-pid" -Metadata @{
+        run_id = "run-fake-provider"
+        job_id = "job-dispatched-no-pid"
+        status = "dispatched"
+    } | Out-Null
+    $repairedDispatchedNoPid = Repair-StaleActiveJobState -RunState $dispatchedNoPidState -ProjectRoot $tempFakeRoot
+    Assert-True ([bool]$repairedDispatchedNoPid["changed"]) "Repair-StaleActiveJobState should clear dispatched jobs that never acquired a pid"
+    Assert-Equal ([string]$repairedDispatchedNoPid["reason"]) "job_missing_pid" "Dispatched jobs without a pid should report a focused recovery reason"
 }
 finally {
     Remove-Item $tempFakeRoot -Recurse -Force -ErrorAction SilentlyContinue
