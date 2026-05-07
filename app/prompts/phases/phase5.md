@@ -46,12 +46,15 @@
 - `known_issues`
 
 `acceptance_criteria_status` は配列で、各要件に対して達成状況と根拠が分かるように記録すること。
+`commands_run` は配列で、最低 1 件以上の実行コマンドを含めること。doc-only task や repo 外インフラ設定 task でも空配列にしてはいけない。
 
 ## 品質基準
 
 - `task_id` が Selected Task と一致する
 - `changed_files` が実際の変更内容と一致する
 - `commands_run` には実際に試したコマンドのみを書く
+- doc-only / infra-only task でも `commands_run` を空にしない。build / test / lint が不要な場合は、実際に実行した確認コマンドを 1 件以上残すこと
+- doc-only / infra-only task の確認コマンドには、たとえば `rg`、`Get-Content`、`curl`、`terraform validate` など、今回の変更内容を自分で確認するために実行した実コマンドを書くこと
 - `known_issues` が空の場合は、既知の未解決事項が本当にない
 
 ## 詳細ガイダンス（旧テンプレート移植）

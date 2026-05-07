@@ -4,6 +4,9 @@ if (-not (Get-Command Read-ArtifactContentFromPath -ErrorAction SilentlyContinue
 if (-not (Get-Command Get-ArtifactValidationSnapshot -ErrorAction SilentlyContinue)) {
     . (Join-Path $PSScriptRoot "artifact-validator.ps1")
 }
+if (-not (Get-Command Finalize-PhaseMaterializedArtifacts -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "verdict-finalizer.ps1")
+}
 if (-not (Get-Command Test-TaskScopedPhase -ErrorAction SilentlyContinue)) {
     . (Join-Path $PSScriptRoot "workflow-engine.ps1")
 }
@@ -207,11 +210,31 @@ function Invoke-PhaseValidationPipeline {
             artifact = $null
             original_artifact = $null
             validator_ref = $validatorRef
+            materialized_artifacts = @($MaterializedArtifacts)
+        }
+    }
+
+    $finalization = ConvertTo-RelayHashtable -InputObject (Finalize-PhaseMaterializedArtifacts -PhaseName $PhaseName -MaterializedArtifacts @($MaterializedArtifacts) -TaskId $TaskId)
+    $effectiveMaterializedArtifacts = @($finalization["materialized"])
+    $finalizationWarnings = @($finalization["warnings"])
+    $finalizationErrors = @($finalization["errors"])
+    if ($finalizationErrors.Count -gt 0) {
+        return [ordered]@{
+            validation = [ordered]@{
+                valid = $false
+                errors = $finalizationErrors
+                warnings = $finalizationWarnings
+            }
+            artifact = $null
+            original_artifact = $null
+            validator_ref = $validatorRef
+            finalization = $finalization
+            materialized_artifacts = $effectiveMaterializedArtifacts
         }
     }
 
     $materializedValidatorArtifact = $null
-    foreach ($materializedRaw in @($MaterializedArtifacts)) {
+    foreach ($materializedRaw in $effectiveMaterializedArtifacts) {
         $materializedArtifact = ConvertTo-RelayHashtable -InputObject $materializedRaw
         if (
             [string]$materializedArtifact["artifact_id"] -eq [string]$validatorRef["artifact_id"] -and
@@ -232,10 +255,17 @@ function Invoke-PhaseValidationPipeline {
             artifact = $null
             original_artifact = $null
             validator_ref = $validatorRef
+            finalization = $finalization
+            materialized_artifacts = $effectiveMaterializedArtifacts
         }
     }
 
     $validationSnapshot = ConvertTo-RelayHashtable -InputObject (Get-ArtifactValidationSnapshot -ArtifactId ([string]$validatorRef["artifact_id"]) -Artifact $materializedValidatorArtifact["content"] -Phase $PhaseName)
+    $validationStatus = ConvertTo-RelayHashtable -InputObject $validationSnapshot["validation"]
+    if ($validationStatus -and $finalizationWarnings.Count -gt 0) {
+        $validationStatus["warnings"] = @($validationStatus["warnings"]) + $finalizationWarnings
+        $validationSnapshot["validation"] = $validationStatus
+    }
     $artifact = $validationSnapshot["artifact"]
     if ($null -eq $artifact) {
         return [ordered]@{
@@ -248,6 +278,8 @@ function Invoke-PhaseValidationPipeline {
             original_artifact = $validationSnapshot["original_artifact"]
             validator_ref = $validatorRef
             validation_snapshot = $validationSnapshot
+            finalization = $finalization
+            materialized_artifacts = $effectiveMaterializedArtifacts
         }
     }
 
@@ -257,5 +289,7 @@ function Invoke-PhaseValidationPipeline {
         original_artifact = $validationSnapshot["original_artifact"]
         validator_ref = $validatorRef
         validation_snapshot = $validationSnapshot
+        finalization = $finalization
+        materialized_artifacts = $effectiveMaterializedArtifacts
     }
 }

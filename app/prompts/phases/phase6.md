@@ -48,6 +48,8 @@
 
 `tests_passed`、`tests_failed`、`coverage_line`、`coverage_branch` は数値にすること。coverage を取得できない場合でも数値を入れ、markdown で理由を補足すること。
 
+`verdict` は compatibility のため引き続き出力するが、canonical な最終 verdict は engine が `verification_checks`、`tests_failed`、`open_requirements` を見て finalization する。したがって、top-level の `verdict` を合わせにいくことよりも、`verification_checks[].status` と supporting fields を正確に書くことを優先すること。
+
 `verification_checks[]` は以下の `check_id` をすべて含む固定チェック配列で、各要素は `check_id`、`status`、`notes`、`evidence` を持つこと。`verification_checks[].evidence` は 1 件だけでも文字列ではなく JSON 配列にすること。
 
 - `lint_static_analysis`
@@ -56,7 +58,7 @@
 - `error_path_coverage`
 - `coverage_assessment`
 
-`status` は `pass`、`warning`、`fail`、`not_applicable` のいずれかにすること。`conditional_go` の場合は `verification_checks` に少なくとも 1 件 `warning` を含めること。
+`status` は `pass`、`warning`、`fail`、`not_applicable` のいずれかにすること。`warning` や `fail` を付ける場合は、その status に対応する理由を `conditional_go_reasons` / `rollback_phase` / `open_requirements` に必ず反映すること。top-level `verdict` と無理に辻褄を合わせるのではなく、status を正直に書くこと。
 
 `open_requirements[]` は `conditional_go` で後続 phase に持ち越す未解決条件の配列とし、各要素は以下のキーを持つこと。
 
@@ -71,11 +73,13 @@
 
 `resolved_requirement_ids[]` には、過去の `open_requirements` のうち今回の test/review で解消済みと判断した `item_id` を列挙すること。該当がなければ空配列にすること。
 
-## 許可される verdict
+## verdict と supporting fields
 
-- `go`: 検証通過
-- `conditional_go`: テストは進行可能だが残課題あり。`conditional_go_reasons` を 1 件以上必須
-- `reject`: Phase3 / Phase4 / Phase5 のいずれかへ差し戻し。`rollback_phase` に実際の戻り先を必ず入れること
+- `go`: すべてのチェックが `pass` / `not_applicable` で、未解決の carry-forward がない場合に限る
+- `conditional_go`: `warning` が残るが Phase5 へ戻して修正すれば進める場合。`conditional_go_reasons` と `open_requirements` をそれぞれ 1 件以上必須
+- `reject`: `tests_failed > 0` または `verification_checks[].status = fail` がある場合。`rollback_phase` に `Phase3` / `Phase4` / `Phase5` の実際の戻り先を必ず入れること
+
+`coverage_assessment` だけを `warning` にした場合でも、それは canonical には `conditional_go` 側の signal として扱われる。`warning` を付けたのに `conditional_go_reasons=[]` や `open_requirements=[]` のままにしないこと。
 
 ## 品質基準
 
@@ -87,6 +91,7 @@
 - go / conditional_go の場合は `rollback_phase` を空文字にする
 - go / reject の場合は `open_requirements` を空配列にする
 - 既存の open requirement を解消した場合は `resolved_requirement_ids` に明示する
+- 保存前に、`warning` があるなら `conditional_go_reasons` と `open_requirements` が埋まっているか、`fail` があるなら `rollback_phase` が埋まっているかを自己確認する
 
 ## 詳細ガイダンス（旧テンプレート移植）
 

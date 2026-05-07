@@ -152,16 +152,12 @@ function Test-ArtifactFailureRepairable {
         return $false
     }
 
-    if ($categorySet -contains "semantic") {
-        return $false
-    }
-
-    $disallowedCategories = @($categorySet | Where-Object { $_ -notin @("syntax", "schema", "materialization") })
+    $disallowedCategories = @($categorySet | Where-Object { $_ -notin @("syntax", "schema", "materialization", "semantic") })
     if ($ArtifactOnlyRepair -and $disallowedCategories.Count -gt 0) {
         return $false
     }
 
-    $repairableCategories = @($categorySet | Where-Object { $_ -in @("syntax", "schema", "materialization") })
+    $repairableCategories = @($categorySet | Where-Object { $_ -in @("syntax", "schema", "materialization", "semantic") })
     return ($repairableCategories.Count -gt 0)
 }
 
@@ -200,6 +196,9 @@ function Get-ArtifactRepairDecision {
         }
         elseif ($categories -contains "schema") {
             "schema_shape_mismatch"
+        }
+        elseif ($categories -contains "semantic") {
+            "semantic_invariant"
         }
         else {
             "artifact_materialization"

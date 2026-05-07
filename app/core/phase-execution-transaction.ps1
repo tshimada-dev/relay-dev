@@ -183,6 +183,9 @@ function Invoke-PhaseExecutionTransaction {
     $outputSyncResult = ConvertTo-RelayHashtable -InputObject (Get-PhaseMaterializedArtifacts @outputSyncParams)
 
     $validationResult = ConvertTo-RelayHashtable -InputObject (Invoke-PhaseValidationPipeline -PhaseName $PhaseName -PhaseDefinition $PhaseDefinition -MaterializedArtifacts @($outputSyncResult["materialized"]) -MissingRequired @($outputSyncResult["missing_required"]) -StaleRequired @($outputSyncResult["stale_required"]) -ReadErrors @($outputSyncResult["read_errors"]) -TaskId $TaskId)
+    if ($validationResult -and $validationResult.ContainsKey("materialized_artifacts")) {
+        $outputSyncResult["materialized"] = @($validationResult["materialized_artifacts"])
+    }
     $repairResult = $null
     $validatorStatus = ConvertTo-RelayHashtable -InputObject $validationResult["validation"]
     if ($validatorStatus -and -not [bool]$validatorStatus["valid"]) {
@@ -215,6 +218,9 @@ function Invoke-PhaseExecutionTransaction {
             if ($repairedValidation) {
                 $validationResult = $repairedValidation
                 $validatorStatus = ConvertTo-RelayHashtable -InputObject $validationResult["validation"]
+            }
+            if ($repairedValidation -and $repairedValidation.ContainsKey("materialized_artifacts")) {
+                $outputSyncResult["materialized"] = @($repairedValidation["materialized_artifacts"])
             }
         }
     }

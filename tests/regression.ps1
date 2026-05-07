@@ -344,6 +344,28 @@ function New-Phase6OpenRequirements {
     )
 }
 
+function New-MaterializedArtifact {
+    param(
+        [Parameter(Mandatory)][string]$ArtifactId,
+        [Parameter(Mandatory)][string]$Phase,
+        [Parameter(Mandatory)]$Content,
+        [string]$Scope = "task",
+        [string]$TaskId = "T-01",
+        [string]$Path = "synthetic.json",
+        [bool]$AsJson = $true
+    )
+
+    return [ordered]@{
+        artifact_id = $ArtifactId
+        scope = $Scope
+        phase = $Phase
+        task_id = $TaskId
+        path = $Path
+        content = $Content
+        as_json = $AsJson
+    }
+}
+
 Write-Host "[1/11] Testing config parser..."
 . (Join-Path $repoRoot "config/common.ps1")
 
@@ -654,6 +676,8 @@ Write-Host "[5/11] Testing typed artifacts and validator..."
 . (Join-Path $repoRoot "app/core/artifact-validator.ps1")
 . (Join-Path $repoRoot "app/core/artifact-repair-policy.ps1")
 . (Join-Path $repoRoot "app/core/repair-diff-guard.ps1")
+. (Join-Path $repoRoot "app/core/verdict-finalizer.ps1")
+. (Join-Path $repoRoot "app/core/phase-validation-pipeline.ps1")
 . (Join-Path $repoRoot "app/phases/phase-registry.ps1")
 
 $claudePromptPackage = Resolve-PromptPackage -ProjectRoot $repoRoot -Phase "Phase1" -Role "implementer" -Provider "claude-code"
@@ -883,6 +907,105 @@ try {
     $phase6Artifact = Read-Artifact -ProjectRoot $tempArtifactRoot -RunId $runId -Scope task -TaskId "T-01" -Phase "Phase6" -ArtifactId "phase6_result.json"
     Assert-Equal $phase6Artifact["verdict"] "go" "Read-Artifact should deserialize canonical JSON"
 
+    $phase6DefinitionForValidation = Get-PhaseDefinition -ProjectRoot $repoRoot -Phase "Phase6" -Provider "codex-cli"
+    $phase6WarningLegacyVerdict = [ordered]@{
+        task_id = "T-01"
+        test_command = "npm test"
+        lint_command = "npm run lint"
+        tests_passed = 12
+        tests_failed = 0
+        coverage_line = 85
+        coverage_branch = 77
+        verdict = "reject"
+        rollback_phase = "Phase5"
+        conditional_go_reasons = @("Coverage warning must be reviewed before merge.")
+        verification_checks = (New-Phase6VerificationChecks -StatusOverrides @{
+            coverage_assessment = "warning"
+        })
+        open_requirements = (New-Phase6OpenRequirements -TaskId "T-01")
+        resolved_requirement_ids = @()
+    }
+    $phase6WarningFinalized = ConvertTo-RelayHashtable -InputObject (Invoke-PhaseValidationPipeline -PhaseName "Phase6" -PhaseDefinition $phase6DefinitionForValidation -MaterializedArtifacts @(
+            (New-MaterializedArtifact -ArtifactId "phase6_result.json" -Phase "Phase6" -TaskId "T-01" -Content $phase6WarningLegacyVerdict)
+        ) -TaskId "T-01")
+    $phase6WarningFinalizedMaterialized = ConvertTo-RelayHashtable -InputObject (@($phase6WarningFinalized["materialized_artifacts"])[0])
+    Assert-True ([bool]$phase6WarningFinalized["validation"]["valid"]) "Phase6 machine-owned verdict should accept warning-only artifacts when carry-forward fields are present"
+    Assert-Equal $phase6WarningFinalized["artifact"]["verdict"] "conditional_go" "Phase6 machine-owned verdict should infer conditional_go from warning-only verification checks"
+    Assert-Equal ([string]$phase6WarningFinalized["artifact"]["rollback_phase"]) "" "Phase6 machine-owned verdict should clear rollback_phase for conditional_go"
+    Assert-Equal $phase6WarningFinalizedMaterialized["content"]["verdict"] "conditional_go" "Phase6 finalization should feed the canonical verdict back into materialized artifacts for commit"
+    Assert-Contains (@($phase6WarningFinalized["validation"]["warnings"]) -join "`n") "finalized from 'reject' to 'conditional_go'" "Phase6 finalization should surface when it overrides a legacy verdict"
+
+    $phase6FailLegacyVerdict = [ordered]@{
+        task_id = "T-01"
+        test_command = "npm test"
+        lint_command = "npm run lint"
+        tests_passed = 11
+        tests_failed = 0
+        coverage_line = 85
+        coverage_branch = 77
+        verdict = "go"
+        rollback_phase = "Phase5"
+        conditional_go_reasons = @()
+        verification_checks = (New-Phase6VerificationChecks -StatusOverrides @{
+            automated_tests = "fail"
+        })
+        open_requirements = @()
+        resolved_requirement_ids = @()
+    }
+    $phase6FailFinalized = ConvertTo-RelayHashtable -InputObject (Invoke-PhaseValidationPipeline -PhaseName "Phase6" -PhaseDefinition $phase6DefinitionForValidation -MaterializedArtifacts @(
+            (New-MaterializedArtifact -ArtifactId "phase6_result.json" -Phase "Phase6" -TaskId "T-01" -Content $phase6FailLegacyVerdict)
+        ) -TaskId "T-01")
+    Assert-True ([bool]$phase6FailFinalized["validation"]["valid"]) "Phase6 machine-owned verdict should accept failed verification artifacts when rollback data is present"
+    Assert-Equal $phase6FailFinalized["artifact"]["verdict"] "reject" "Phase6 machine-owned verdict should infer reject from failed verification checks"
+    Assert-Contains (@($phase6FailFinalized["validation"]["warnings"]) -join "`n") "finalized from 'go' to 'reject'" "Phase6 finalization should surface when it upgrades a go verdict to reject"
+
+    $phase6MissingRollback = [ordered]@{
+        task_id = "T-01"
+        test_command = "npm test"
+        lint_command = "npm run lint"
+        tests_passed = 11
+        tests_failed = 0
+        coverage_line = 85
+        coverage_branch = 77
+        verdict = "go"
+        rollback_phase = ""
+        conditional_go_reasons = @()
+        verification_checks = (New-Phase6VerificationChecks -StatusOverrides @{
+            automated_tests = "fail"
+        })
+        open_requirements = @()
+        resolved_requirement_ids = @()
+    }
+    $phase6MissingRollbackValidation = ConvertTo-RelayHashtable -InputObject (Invoke-PhaseValidationPipeline -PhaseName "Phase6" -PhaseDefinition $phase6DefinitionForValidation -MaterializedArtifacts @(
+            (New-MaterializedArtifact -ArtifactId "phase6_result.json" -Phase "Phase6" -TaskId "T-01" -Content $phase6MissingRollback)
+        ) -TaskId "T-01")
+    Assert-True (-not [bool]$phase6MissingRollbackValidation["validation"]["valid"]) "Phase6 finalization should still fail when reject supporting fields are missing"
+    Assert-Contains (@($phase6MissingRollbackValidation["validation"]["errors"]) -join "`n") "reject verdict requires rollback_phase." "Phase6 finalization should keep rollback_phase as an explicit reject contract"
+
+    $phase6MissingCarryForward = [ordered]@{
+        task_id = "T-01"
+        test_command = "npm test"
+        lint_command = "npm run lint"
+        tests_passed = 12
+        tests_failed = 0
+        coverage_line = 85
+        coverage_branch = 77
+        verdict = "go"
+        rollback_phase = ""
+        conditional_go_reasons = @()
+        verification_checks = (New-Phase6VerificationChecks -StatusOverrides @{
+            coverage_assessment = "warning"
+        })
+        open_requirements = @()
+        resolved_requirement_ids = @()
+    }
+    $phase6MissingCarryForwardValidation = ConvertTo-RelayHashtable -InputObject (Invoke-PhaseValidationPipeline -PhaseName "Phase6" -PhaseDefinition $phase6DefinitionForValidation -MaterializedArtifacts @(
+            (New-MaterializedArtifact -ArtifactId "phase6_result.json" -Phase "Phase6" -TaskId "T-01" -Content $phase6MissingCarryForward)
+        ) -TaskId "T-01")
+    Assert-True (-not [bool]$phase6MissingCarryForwardValidation["validation"]["valid"]) "Phase6 finalization should still require carry-forward fields when warnings remain"
+    Assert-Contains (@($phase6MissingCarryForwardValidation["validation"]["errors"]) -join "`n") "conditional_go verdict requires at least one conditional_go_reasons item." "Phase6 finalization should keep conditional_go_reasons as an explicit contract"
+    Assert-Contains (@($phase6MissingCarryForwardValidation["validation"]["errors"]) -join "`n") "conditional_go verdict requires at least one open_requirements item." "Phase6 finalization should keep open_requirements as an explicit contract"
+
     $invalidPhase7 = Test-ArtifactContract -ArtifactId "phase7_verdict.json" -Artifact @{
         verdict = "conditional_go"
         rollback_phase = $null
@@ -1042,12 +1165,16 @@ try {
             -MaterializationResult @{ errors = @() } `
             -ExecutionResult $null `
             -ArtifactOnlyRepair
-        Assert-Equal ([string]$semanticInvariantClassification["classification"]) "not_repairable" "Semantic invariant violations should stay non-repairable"
-        Assert-Equal ([string]$semanticInvariantClassification["reason"]) "semantic_invariant" "Semantic invariant violations should report a focused non-repairable reason"
+        Assert-Equal ([string]$semanticInvariantClassification["classification"]) "repairable" "Semantic invariant violations should be repairable through the artifact repair pass"
+        Assert-Equal ([string]$semanticInvariantClassification["reason"]) "semantic_invariant" "Semantic invariant violations should report a focused repairability reason"
     }
     else {
         Assert-Skipped "repairability classification scaffolding is waiting for Get-ArtifactRepairDecision"
     }
+
+    $agentLoopText = Get-Content -Path (Join-Path $repoRoot "agent-loop.ps1") -Raw -Encoding UTF8
+    Assert-Contains $agentLoopText '$null = & $AppCli resume -ConfigFile $ConfigFile -RunId $runId' "Agent loop should attempt auto-resume for failed runs"
+    Assert-True ($agentLoopText -notmatch '\("completed",\s*"failed",\s*"blocked"\)') "Agent loop should not treat failed runs as immediately terminal"
 
     $immutableGuard = Resolve-OptionalFunction -Names @("Test-RepairDiffAllowed", "Test-ReviewerArtifactImmutableFields")
     if ($immutableGuard) {
@@ -1965,12 +2092,16 @@ Assert-True (-not $phase6PromptText.Contains("templates/examples/phase6_example.
 Assert-True (-not $phase6PromptText.Contains("conditional_go_log.md")) "Phase6 prompt should not require legacy conditional_go_log updates"
 Assert-True (-not $phase6PromptText.Contains("T-XX_completed.md")) "Phase6 prompt should not require legacy task markers"
 Assert-True (-not $phase6PromptText.Contains("pr_fixes")) "Phase6 prompt should not special-case a legacy repair-task id"
+Assert-Contains $phase6PromptText "canonical な最終 verdict は engine" "Phase6 prompt should explain that canonical verdict ownership moved to the engine"
+Assert-Contains $phase6PromptText "status を正直に書くこと" "Phase6 prompt should prioritize accurate checklist statuses over verdict matching"
+Assert-Contains $phase6PromptText '`warning` を付けたのに `conditional_go_reasons=[]` や `open_requirements=[]` のままにしないこと' "Phase6 prompt should force carry-forward fields when warnings remain"
 
 $phase5Definition = Get-PhaseDefinition -ProjectRoot $repoRoot -Phase "Phase5" -Provider "codex-cli"
 $phase5PromptRef = [string]$phase5Definition["prompt_package"]["phase_prompt_ref"]
 $phase5PromptText = Get-Content -Path $phase5PromptRef -Raw -Encoding UTF8
 Assert-True (-not $phase5PromptText.Contains("fix_contract.yaml")) "Phase5 prompt should not require legacy repair fix contracts"
 Assert-True (-not $phase5PromptText.Contains("task marker directory")) "Phase5 prompt should not self-select tasks from marker directories"
+Assert-Contains $phase5PromptText "doc-only task や repo 外インフラ設定 task でも空配列にしてはいけない" "Phase5 prompt should require commands_run for documentation-only or infra-only tasks"
 
 $phase51Definition = Get-PhaseDefinition -ProjectRoot $repoRoot -Phase "Phase5-1" -Provider "codex-cli"
 $phase51PromptRef = [string]$phase51Definition["prompt_package"]["phase_prompt_ref"]

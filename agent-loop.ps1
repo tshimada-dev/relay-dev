@@ -15,6 +15,7 @@ $script:ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $script:ProjectRoot
 $script:Role = $Role
 $script:LastWaitNoticeKey = $null
+$script:LastFailedRecoveryKey = $null
 
 . (Join-Path $script:ProjectRoot "config/common.ps1")
 . (Join-Path $script:ProjectRoot "lib/logging.ps1")
@@ -61,6 +62,16 @@ function Get-ApprovalActionSummary {
     }
 }
 
+function Get-FailedRecoveryAttemptKey {
+    param(
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)]$RunState
+    )
+
+    $state = ConvertTo-RelayHashtable -InputObject $RunState
+    return "failed:$RunId:$([string]$state['current_phase']):$([string]$state['current_role']):$([string]$state['current_task_id']):$([string]$state['updated_at'])"
+}
+
 $Config = Read-Config -Path $ConfigFile
 Initialize-Settings -Config $Config -Role $Role
 
@@ -85,11 +96,47 @@ while ($true) {
     }
 
     $status = [string]$runState["status"]
-    if ($status -in @("completed", "failed", "blocked")) {
+    if ($status -in @("completed", "blocked")) {
         $script:LastWaitNoticeKey = $null
+        $script:LastFailedRecoveryKey = $null
         Start-Sleep -Seconds $script:FallbackSec
         continue
     }
+
+    if ($status -eq "failed") {
+        $currentRole = [string]$runState["current_role"]
+        if ($Role -eq "orchestrator" -or $currentRole -eq $Role) {
+            $failedRecoveryKey = Get-FailedRecoveryAttemptKey -RunId $runId -RunState $runState
+            if ($script:LastFailedRecoveryKey -ne $failedRecoveryKey) {
+                try {
+                    $null = & $AppCli resume -ConfigFile $ConfigFile -RunId $runId
+                    Write-Log "Attempted auto-resume for failed run '$runId' at $([string]$runState['current_phase']) [$currentRole]." -Level Warning
+                }
+                catch {
+                    Write-Log "Auto-resume attempt failed for run '$runId': $_" -Level Warning
+                }
+                $script:LastFailedRecoveryKey = $failedRecoveryKey
+            }
+
+            $refreshedState = Read-RunState -ProjectRoot $script:ProjectRoot -RunId $runId
+            if ($refreshedState -and [string]$refreshedState["status"] -ne "failed") {
+                $script:LastWaitNoticeKey = $null
+                Start-Sleep -Seconds 1
+                continue
+            }
+
+            $noticeKey = "failed:$runId:$([string]$runState['updated_at'])"
+            if ($script:LastWaitNoticeKey -ne $noticeKey) {
+                Write-Log "Run '$runId' remains failed after auto-resume attempt. Waiting for manual intervention." -Level Warning
+                $script:LastWaitNoticeKey = $noticeKey
+            }
+        }
+
+        Start-Sleep -Seconds $script:FallbackSec
+        continue
+    }
+
+    $script:LastFailedRecoveryKey = $null
 
     if ($status -eq "waiting_approval") {
         $pendingApproval = ConvertTo-RelayHashtable -InputObject $runState["pending_approval"]

@@ -213,6 +213,9 @@ function Invoke-ArtifactRepairTransaction {
 
     $repairedOutputSync = ConvertTo-RelayHashtable -InputObject (Get-PhaseMaterializedArtifacts -ProjectRoot $ProjectRoot -RunId $RunId -PhaseName $PhaseName -PhaseDefinition $PhaseDefinition -JobId ([string]$job["job_id"]) -AttemptId $AttemptId -StorageScope "attempt" -TaskId $TaskId)
     $repairedValidation = ConvertTo-RelayHashtable -InputObject (Invoke-PhaseValidationPipeline -PhaseName $PhaseName -PhaseDefinition $PhaseDefinition -MaterializedArtifacts @($repairedOutputSync["materialized"]) -MissingRequired @($repairedOutputSync["missing_required"]) -StaleRequired @($repairedOutputSync["stale_required"]) -ReadErrors @($repairedOutputSync["read_errors"]) -TaskId $TaskId)
+    if ($repairedValidation -and $repairedValidation.ContainsKey("materialized_artifacts")) {
+        $repairedOutputSync["materialized"] = @($repairedValidation["materialized_artifacts"])
+    }
 
     $repairedValidatorArtifact = ConvertTo-RelayHashtable -InputObject (Get-RepairableValidatorArtifact -OutputSyncResult $repairedOutputSync -ValidatorRef $validatorRef)
     $repairedValidatorRawText = Read-RepairArtifactRawText -Path $validatorPath

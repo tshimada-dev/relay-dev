@@ -1,0 +1,55 @@
+{
+  "plan_id": "machine-owned-verdict-phase6-rollout",
+  "created_at": "2026-05-07T16:30:00+09:00",
+  "goal": "Implement the first rollout of machine-owned verdicts for Phase6 and verify it with regression tests.",
+  "tasks": [
+    {
+      "id": "P1",
+      "title": "Prepare active handoff and create the rollout task list",
+      "status": "completed",
+      "files": [
+        "docs/worklog/current.md",
+        "plans/machine-owned-verdict-phase6-rollout.json"
+      ],
+      "notes": "Use the plan file as the ordered checklist for this rollout."
+    },
+    {
+      "id": "P2",
+      "title": "Add a Phase6 verdict finalizer and wire it into validation",
+      "status": "completed",
+      "files": [
+        "app/core/verdict-finalizer.ps1",
+        "app/core/phase-validation-pipeline.ps1"
+      ],
+      "notes": "Infer canonical verdict from verification checks and tests_failed before validator/commit."
+    },
+    {
+      "id": "P3",
+      "title": "Slim the Phase6 prompt so AI focuses on primitives instead of top-level verdict logic",
+      "status": "completed",
+      "files": [
+        "app/prompts/phases/phase6.md"
+      ],
+      "notes": "Keep output compatibility, but clarify that checklist accuracy is primary and engine finalizes the canonical verdict."
+    },
+    {
+      "id": "P4",
+      "title": "Add regression coverage for Phase6 machine-owned verdict behavior",
+      "status": "completed",
+      "files": [
+        "tests/regression.ps1"
+      ],
+      "notes": "Cover pass, warning, fail, missing rollback_phase, missing conditional_go_reasons, and legacy verdict override."
+    },
+    {
+      "id": "P5",
+      "title": "Run regression tests and record the results",
+      "status": "completed",
+      "files": [
+        "tests/regression.ps1",
+        "docs/worklog/2026-05-07.md"
+      ],
+      "notes": "Only the parent agent performs final verification."
+    }
+  ]
+}
