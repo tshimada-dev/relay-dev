@@ -2743,6 +2743,9 @@ Assert-Contains $phase52Prompt 'conditional_go の場合は `security_checks[].s
 
 Assert-NotContains $phase7Prompt "## 対立レビュー原則" "Phase7 should no longer duplicate the adversarial review section"
 Assert-NotContains $phase7Prompt "## 行番号付き根拠の必須化（捏造防止）" "Phase7 should no longer duplicate line-number guidance"
+Assert-Contains $phase7Prompt 'conditional_go`: 修正タスクを作れば進行可能。`must_fix` と `follow_up_tasks` をそれぞれ 1 件以上必須' "Phase7 prompt should require must_fix and follow_up_tasks for conditional_go"
+Assert-Contains $phase7Prompt '`warnings[]` は non-blocker 専用' "Phase7 prompt should reserve warnings for non-blocking issues"
+Assert-Contains $phase7Prompt '`conditional_go` を選ぶ場合、`must_fix.length >= 1`' "Phase7 prompt should include a conditional_go self-check for must_fix"
 Assert-Contains $cliPromptSource '$promptLineBreak = "`n"' "CLI prompt builder should define a real newline separator"
 Assert-Contains $cliPromptSource '-join $promptLineBreak' "CLI prompt builder should join contract lines with real newlines"
 Assert-NotContains $cliPromptSource '-join ''`n''' "CLI prompt builder should not join contract lines with a literal backtick-n token"

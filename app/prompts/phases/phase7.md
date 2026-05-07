@@ -13,7 +13,7 @@
 ## 許可される verdict
 
 - `go`: run 全体としてマージ可能
-- `conditional_go`: 修正タスクを作れば進行可能。`follow_up_tasks` を 1 件以上必須
+- `conditional_go`: 修正タスクを作れば進行可能。`must_fix` と `follow_up_tasks` をそれぞれ 1 件以上必須
 - `reject`: より早い phase に戻す必要がある。`rollback_phase` は `Phase1`、`Phase3`、`Phase4`、`Phase5`、`Phase6` のいずれか
 
 `reject` 以外では `rollback_phase` は空文字でよい。
@@ -65,6 +65,10 @@
 
 `resolved_requirement_ids[]` には、`Open Requirements` に出てきた未解決条件のうち、今回の PR review で解消済みと判断した `item_id` を列挙すること。`go` を選ぶ場合は、未解決条件を残さないこと。
 
+`conditional_go` の場合、`must_fix` は 1 件以上必須とする。`must_fix[]` には「この issue が残る限り merge できない」という blocking item を短く列挙し、`follow_up_tasks[]` の修正目的と対応づけること。repair task が必要な論点を `warnings[]` だけに置いてはいけない。
+
+`warnings[]` は non-blocker 専用である。`conditional_go` の根拠になる未解決事項は、必ず `must_fix[]` にも書くこと。
+
 `conditional_go` の場合、`follow_up_tasks` は 1 件以上必須で、各要素は次のキーを持つこと。
 
 - `task_id`
@@ -77,12 +81,19 @@
 
 `follow_up_tasks[]` は repair task の正本になる。人が読んで実装できる粒度で書くこと。`changed_files`、`acceptance_criteria`、`depends_on`、`verification`、`source_evidence` はすべて JSON 配列にすること。
 
+JSON 保存前に次を自己確認すること。
+
+- `conditional_go` を選ぶ場合、`must_fix.length >= 1`
+- `conditional_go` を選ぶ場合、`follow_up_tasks.length >= 1`
+- `conditional_go` を選ぶ場合、blocking issue が `warnings` にしか存在しない状態になっていない
+- `go` を選ぶ場合、未解決の open requirement を残していない
+
 ## 品質基準
 
 - `review_checks` の 6 項目を省略していない
 - outstanding open requirements を確認し、解消済みなら `resolved_requirement_ids`、未解決なら `conditional_go` または `reject` で扱っている
 - critical issue と `must_fix` が対応している
-- conditional_go の場合は follow_up task が修正単位として成立している
+- conditional_go の場合は `must_fix` と follow_up task が両方あり、同じ blocking issue を表している
 - reject の場合は rollback_phase の選択理由が明確である
 
 ## 詳細ガイダンス（旧テンプレート移植）
