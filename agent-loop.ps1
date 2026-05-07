@@ -69,7 +69,7 @@ function Get-FailedRecoveryAttemptKey {
     )
 
     $state = ConvertTo-RelayHashtable -InputObject $RunState
-    return "failed:$RunId:$([string]$state['current_phase']):$([string]$state['current_role']):$([string]$state['current_task_id']):$([string]$state['updated_at'])"
+    return "failed:${RunId}:$([string]$state['current_phase']):$([string]$state['current_role']):$([string]$state['current_task_id']):$([string]$state['updated_at'])"
 }
 
 $Config = Read-Config -Path $ConfigFile
@@ -125,7 +125,7 @@ while ($true) {
                 continue
             }
 
-            $noticeKey = "failed:$runId:$([string]$runState['updated_at'])"
+            $noticeKey = "failed:${runId}:$([string]$runState['updated_at'])"
             if ($script:LastWaitNoticeKey -ne $noticeKey) {
                 Write-Log "Run '$runId' remains failed after auto-resume attempt. Waiting for manual intervention." -Level Warning
                 $script:LastWaitNoticeKey = $noticeKey
@@ -143,7 +143,7 @@ while ($true) {
         $approvalId = if ($pendingApproval) { [string]$pendingApproval["approval_id"] } else { "" }
         $requestedPhase = if ($pendingApproval) { [string]$pendingApproval["requested_phase"] } else { [string]$runState["current_phase"] }
         $approveActionSummary = Get-ApprovalActionSummary -Action $pendingApproval["proposed_action"]
-        $noticeKey = "waiting_approval:$approvalId"
+        $noticeKey = "waiting_approval:${approvalId}"
 
         if ($InteractiveApproval -and $Role -eq "orchestrator") {
             if ($script:LastWaitNoticeKey -ne $noticeKey) {
