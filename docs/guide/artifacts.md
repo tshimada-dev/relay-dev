@@ -61,7 +61,9 @@ outputs/<compatibility-name>/tasks/<task-id>/<artifact-id>
    └─ provider stdout は attempt 内 staging に書かれる
 
 4. phase-validation-pipeline
-   └─ artifact-validator を含む validator chain を順に実行
+   └─ materialized artifact を phase-aware に正規化してから validator chain を順に実行
+       ├─ verdict-finalizer（現在は Phase6 の canonical verdict を engine 側で確定）
+       ├─ artifact-validator
        ├─ pass  → 5a へ
        ├─ repairable invalid_artifact → 5b へ
        └─ non-repairable / job failure → run を blocked へ
@@ -80,16 +82,17 @@ outputs/<compatibility-name>/tasks/<task-id>/<artifact-id>
 
 ## Validator
 
-`app/core/artifact-validator.ps1` は phase ごとに JSON schema を強制します。
+`app/core/artifact-validator.ps1` は phase ごとに JSON schema を強制します。実行時にはその前段で `phase-validation-pipeline.ps1` が materialized artifact を取りまとめ、必要に応じて engine-owned finalization を挟みます。
 
 - 主な検査:
   - 必須フィールドの存在
-  - enum / 列挙値の整合（例: `verdict ∈ {go, conditional_go, no_go}`）
+  - enum / 列挙値の整合（例: `verdict ∈ {go, conditional_go, reject}`）
   - 関連 field の整合（例: `verdict = conditional_go` のとき `security_checks[].status` に矛盾がないか）
   - reviewer 専用項目（`verdict`, `verdict_reason`, `evidence`）の構造
 - 設計上の方針:
   - validator は **read-only**。落ちても canonical を上書きしない。
   - validation 結果は staging 上の artifact に対して下し、その判断結果に応じて commit / repair / fail へ振り分ける。
+  - ただし phase-aware finalization は validator の前段で行われる。現在は `verdict-finalizer.ps1` が `phase6_result.json` の top-level verdict を `tests_failed` / `verification_checks` / `open_requirements` から canonical に寄せる。
 
 ## Repairable と non-repairable の境界
 
@@ -97,8 +100,8 @@ outputs/<compatibility-name>/tasks/<task-id>/<artifact-id>
 
 | 種別 | 例 | 扱い |
 | --- | --- | --- |
-| Repairable | フィールド名の typo、enum 値の不整合、required key 欠落、軽微な type 違い | repairer lane に乗せる |
-| Non-repairable | provider job 自体の crash、staging への書き込みすら無い、product code の同時破壊が必要なケース | run を blocked にして人間に escalate |
+| Repairable | bad JSON escape、enum 値の不整合、required key 欠落、recoverable materialization error、semantic invariant 違反（例: `go` なのに warning/fail を含む） | repairer lane に乗せる |
+| Non-repairable | required artifact 未生成、provider job 自体の crash / timeout、staging への書き込みすら無い、product code の同時破壊が必要なケース | run を blocked にして人間に escalate |
 
 詳細は [repairer.md](./repairer.md)。
 
@@ -111,6 +114,14 @@ provider job が成功扱いで返ってきたが artifact が invalid_artifact 
 3. provider に再投入され、validator を通り直す。
 
 これにより、commit 寸前で落ちた run も canonical を破壊せず再開できます。
+
+加えて、`app/cli.ps1 resume` と `step` は recoverable な `failed` state を自動で `running` に戻します。対象は現在の実装では次の系統です。
+
+- `job_failed` かつ `failure_class ∈ {provider_error, timeout}`
+- `invalid_artifact` だが直前 job 自体は成功しているケース
+- `invalid_transition` だが直前 job 自体は成功しているケース
+
+この recovery は `run.recovered` event を追記し、`active_attempt` を `retry_same_phase` 向けに再初期化します。`agent-loop.ps1` も同じ経路を 1 failed-state fingerprint につき 1 回だけ自動試行します。
 
 ## 言語ポリシー
 
@@ -129,5 +140,6 @@ provider job が成功扱いで返ってきたが artifact が invalid_artifact 
 | `app/core/job-context-builder.ps1` | latest archived snapshot を context 化 |
 | `app/core/phase-execution-transaction.ps1` | transaction 全体 |
 | `app/core/phase-validation-pipeline.ps1` | validator chain orchestration |
+| `app/core/verdict-finalizer.ps1` | phase-aware canonicalization（現在は Phase6 verdict finalization） |
 | `app/core/phase-completion-committer.ps1` | staging → canonical commit |
 | `app/core/visual-contract-schema.ps1` | visual contract の JSON schema |

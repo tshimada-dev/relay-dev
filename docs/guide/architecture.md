@@ -79,7 +79,7 @@ execution layer:
 | コマンド | 主な責務 |
 | --- | --- |
 | `new` | 新しい `run-id` を採番、`run-state.json` を初期化、`runs/current-run.json` を更新 |
-| `resume` | `runs/current-run.json` の run-id を再選択し、stale な `active_job_id` を整合化 |
+| `resume` | `runs/current-run.json` の run-id を再選択し、stale な `active_job_id` を整合化し、recoverable な `failed` state は `retry_same_phase` に戻す |
 | `step` | `WorkflowEngine` に次 action を問い合わせ、`phase-execution-transaction` で 1 phase 進める |
 | `show` | canonical state を読み出して人間向けに整形（read-only） |
 
@@ -112,6 +112,7 @@ execution layer:
 | `app/core/job-context-builder.ps1` | latest archived JSON snapshot を prompt context に組み立てる |
 | `app/core/phase-execution-transaction.ps1` | `archive → dispatch → validate → commit` を 1 transaction にまとめる |
 | `app/core/phase-validation-pipeline.ps1` | `artifact-validator` を含む validator chain の orchestration |
+| `app/core/verdict-finalizer.ps1` | validator 前の phase-aware canonicalization（現在は Phase6 verdict finalization） |
 | `app/core/phase-completion-committer.ps1` | staging から canonical への commit、phase_history への記録 |
 
 ### Artifact / 修復
@@ -149,7 +150,7 @@ cli.ps1 step
             │         ├─ attempt-preparation: archive + staging
             │         ├─ job-context-builder: prompt context 組立
             │         ├─ execution-runner: provider CLI を呼ぶ
-            │         ├─ phase-validation-pipeline: artifact-validator
+            │         ├─ phase-validation-pipeline: verdict-finalizer + artifact-validator
             │         │    ├─ pass → phase-completion-committer
             │         │    └─ repairable invalid →
             │         │         artifact-repair-transaction
@@ -166,13 +167,14 @@ cli.ps1 step
                  └─ run-state.json.status = completed
 ```
 
-`agent-loop.ps1` は polling で `cli.ps1 step` を繰り返し呼ぶだけです。`run-state.json` が `completed` / `failed` / `blocked` になったら待機します。
+`agent-loop.ps1` は polling で `cli.ps1 step` を繰り返し呼ぶ thin wrapper です。`completed` / `blocked` では待機し、`failed` では `resume` による recoverable failed-state recovery を 1 状態 fingerprint につき 1 回だけ試してから待機します。
 
 ## 障害耐性のポイント
 
 - **half-write 防止**: `run-state-store.ps1` は temp file → atomic rename。途中失敗時は次回 `resume` が `active_job_id` を整合化。
 - **stale baton 無視**: `queue/status.yaml` と `outputs/` は read-only な投影。canonical state とずれていれば自動再生成で上書き。
 - **invalid artifact からの復旧**: provider job 自体は成功しているが artifact が schema 違反のケースを `repairer` レーンに乗せ、product code を触らずに修復する。詳しくは [repairer.md](./repairer.md)。
+- **recoverable failed run の自動再開**: `cli.ps1 resume` / `step` と `agent-loop.ps1` が `provider_error` / `timeout` / recoverable `invalid_artifact` / `invalid_transition` を `run.recovered` event 付きで `retry_same_phase` に戻す。
 - **二重 step 防止**: `run.lock` で同一 run の並列 `step` を直列化。
 
 ## 設計上の非交渉制約

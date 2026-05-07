@@ -48,6 +48,8 @@ pwsh -NoLogo -NoProfile -File .\start-agents.ps1 -ConfigFile config/settings-gem
 - `provider-adapter.ps1`: command / flags / 標準入出力 / 環境変数の差異を埋める
 - `execution-runner.ps1`: prompt の組立、stdin への投入、stdout / stderr の tee、staging path の prompt 注入、UTF-8 ハンドリング
 
+現在の実装では、generic CLI 系 provider は **prompt を argv に埋め込まず stdin で渡す** のが既定です。これにより Windows のコマンドライン長制限に引っかかりにくくしています。
+
 ## Prompt overlay の構造
 
 provider に渡される prompt は次の合成です。
@@ -61,6 +63,12 @@ provider に渡される prompt は次の合成です。
 ```
 
 provider overlay は短く、CLI 固有の流儀（出力形式、ツール呼び出しの可否、`<thinking>` 表記の扱いなど）を吸収するための差分だけを書きます。phase prompt 自体は provider に依存しません。
+
+## Provider 別の実装メモ
+
+- Codex / Gemini: `generic-cli.ps1` ベースで `prompt_mode = stdin`。Gemini は `GEMINI_CLI_TRUST_WORKSPACE=true` を追加で注入する。
+- Claude Code: `claude` を PATH 解決しつつ、Windows では `%LOCALAPPDATA%\AnthropicClaudeCode\bin`、Linux/macOS では `~/.local/bin` も探索する。prompt は stdin。
+- GitHub Copilot CLI: wrapper script ではなく現在 OS / arch に対応した native `copilot(.exe)` を `node_modules/@github/...` 配下から解決できる場合はそちらを優先する。あわせて GitHub CLI install dir を PATH に前置し、launch failure を減らす。
 
 ## UTF-8 と encoding
 
