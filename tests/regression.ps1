@@ -504,10 +504,19 @@ $claudeSpec = Get-ProviderInvocationSpec -JobSpec @{
     flags = "--dangerously-skip-permissions -p"
 }
 Assert-Equal $claudeSpec["provider"] "claude-code" "Claude provider should normalize to claude-code"
-Assert-Equal $claudeSpec["prompt_mode"] "argv" "Claude provider should pass prompts via CLI arguments"
+Assert-Equal $claudeSpec["prompt_mode"] "stdin" "Claude provider should pass prompts via stdin"
 Assert-Equal $claudeSpec["prompt_flag"] "-p" "Claude provider should preserve the prompt flag"
 Assert-Equal $claudeSpec["arguments"] "--dangerously-skip-permissions" "Claude provider should strip prompt flags from base arguments"
 Assert-True (-not [string]::IsNullOrWhiteSpace([string]$claudeSpec["environment"]["PATH"])) "Claude provider should propagate PATH for CLI discovery"
+
+$claudeInvocation = Resolve-ProcessInvocationSpec -InvocationSpec $claudeSpec
+$claudeArguments = Get-ExecutionArgumentsForAttempt -InvocationSpec $claudeInvocation -PromptText "hello world"
+Assert-Equal $claudeArguments "--dangerously-skip-permissions" "Claude execution should preserve base arguments when prompts are sent via stdin"
+$claudeDisplayArguments = Get-ExecutionArgumentsForAttempt -InvocationSpec $claudeInvocation -PromptText "hello world" -ForDisplay
+Assert-Equal $claudeDisplayArguments "--dangerously-skip-permissions" "Claude execution logs should not append a redacted prompt argument when prompts are sent via stdin"
+$claudeArgumentList = @(Get-ExecutionArgumentListForAttempt -InvocationSpec $claudeInvocation -PromptText "hello`nworld")
+Assert-Equal $claudeArgumentList.Count 1 "Claude execution should not append prompt argv tokens when prompts are sent via stdin"
+Assert-Equal $claudeArgumentList[0] "--dangerously-skip-permissions" "Claude execution should preserve the base argument token list when prompts are sent via stdin"
 
 $copilotSpec = Get-ProviderInvocationSpec -JobSpec @{
     provider = "copilot"
@@ -515,20 +524,23 @@ $copilotSpec = Get-ProviderInvocationSpec -JobSpec @{
     flags = "--autopilot --yolo --max-autopilot-continues 30 -p"
 }
 Assert-Equal $copilotSpec["provider"] "copilot-cli" "Copilot provider should normalize to copilot-cli"
-Assert-Equal $copilotSpec["prompt_mode"] "argv" "Copilot provider should pass prompts via CLI arguments"
+Assert-Equal $copilotSpec["prompt_mode"] "stdin" "Copilot provider should pass prompts via stdin"
 Assert-Equal $copilotSpec["prompt_flag"] "-p" "Copilot provider should preserve the prompt flag"
 Assert-Equal $copilotSpec["arguments"] "--autopilot --yolo --max-autopilot-continues 30" "Copilot provider should strip prompt flags from base arguments"
 Assert-True (-not [string]::IsNullOrWhiteSpace([string]$copilotSpec["environment"]["PATH"])) "Copilot provider should propagate PATH for GitHub CLI discovery"
 
 $copilotInvocation = Resolve-ProcessInvocationSpec -InvocationSpec $copilotSpec
 $copilotArguments = Get-ExecutionArgumentsForAttempt -InvocationSpec $copilotInvocation -PromptText "hello world"
-Assert-Contains $copilotArguments '-p "hello world"' "Copilot execution should append the prompt as a quoted CLI argument"
+Assert-Equal $copilotArguments "--autopilot --yolo --max-autopilot-continues 30" "Copilot execution should preserve base arguments when prompts are sent via stdin"
 
 $copilotDisplayArguments = Get-ExecutionArgumentsForAttempt -InvocationSpec $copilotInvocation -PromptText "hello world" -ForDisplay
-Assert-Contains $copilotDisplayArguments "-p <prompt>" "Copilot execution logs should redact the raw prompt text"
+Assert-Equal $copilotDisplayArguments "--autopilot --yolo --max-autopilot-continues 30" "Copilot execution logs should not append a redacted prompt argument when prompts are sent via stdin"
 $copilotArgumentList = @(Get-ExecutionArgumentListForAttempt -InvocationSpec $copilotInvocation -PromptText "hello`nworld")
-Assert-Equal $copilotArgumentList[$copilotArgumentList.Count - 2] "-p" "Copilot execution should append the prompt flag as a dedicated token"
-Assert-Equal $copilotArgumentList[$copilotArgumentList.Count - 1] "hello`nworld" "Copilot execution should keep a multiline prompt as a single argument token"
+Assert-Equal $copilotArgumentList.Count 4 "Copilot execution should not append prompt argv tokens when prompts are sent via stdin"
+Assert-Equal $copilotArgumentList[0] "--autopilot" "Copilot execution should preserve the first base argument token when prompts are sent via stdin"
+Assert-Equal $copilotArgumentList[1] "--yolo" "Copilot execution should preserve the second base argument token when prompts are sent via stdin"
+Assert-Equal $copilotArgumentList[2] "--max-autopilot-continues" "Copilot execution should preserve flag/value argument ordering when prompts are sent via stdin"
+Assert-Equal $copilotArgumentList[3] "30" "Copilot execution should preserve the max-autopilot-continues value token when prompts are sent via stdin"
 
 $tempCopilotProviderRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("relay-dev-copilot-provider-" + [guid]::NewGuid().ToString("N"))
 try {
@@ -681,6 +693,7 @@ try {
         coverage_line = 85
         coverage_branch = 77
         verdict = "go"
+        rollback_phase = $null
         conditional_go_reasons = @()
         verification_checks = New-Phase6VerificationChecks
         open_requirements = @()
@@ -1075,6 +1088,7 @@ try {
 
     $phaseDefinition = Get-PhaseDefinition -ProjectRoot $tempArtifactRoot -Phase "Phase6" -Provider "codex-cli"
     Assert-Equal $phaseDefinition["validator"]["artifact_id"] "phase6_result.json" "Phase definition should expose validator artifact id"
+    Assert-True (@($phaseDefinition["transition_rules"]["reject"]) -contains "Phase5") "Phase6 definition should expose reject rollback targets"
     $phase0Definition = Get-PhaseDefinition -ProjectRoot $tempArtifactRoot -Phase "Phase0" -Provider "codex-cli"
     $phase0TaskInput = @($phase0Definition["input_contract"] | Where-Object { $_["scope"] -eq "external" -and $_["artifact_id"] -eq "task.md" })
     $phase0DesignInput = @($phase0Definition["input_contract"] | Where-Object { $_["scope"] -eq "external" -and $_["artifact_id"] -eq "DESIGN.md" })
@@ -1268,6 +1282,7 @@ try {
         coverage_line = 85
         coverage_branch = 77
         verdict = "conditional_go"
+        rollback_phase = $null
         conditional_go_reasons = @("Coverage follow-up")
         verification_checks = New-Phase6VerificationChecks
         open_requirements = @()
@@ -1275,6 +1290,26 @@ try {
     } -Phase "Phase6"
     Assert-True (-not [bool]$invalidPhase6["valid"]) "conditional_go without warning verification check should be invalid"
     Assert-Contains ($invalidPhase6["errors"] -join "`n") "warning verification check" "Phase6 validator should enforce fixed verification checklist semantics"
+
+    $invalidPhase6Reject = Test-ArtifactContract -ArtifactId "phase6_result.json" -Artifact @{
+        task_id = "T-01"
+        test_command = "npm test"
+        lint_command = "npm run lint"
+        tests_passed = 11
+        tests_failed = 1
+        coverage_line = 85
+        coverage_branch = 77
+        verdict = "reject"
+        rollback_phase = $null
+        conditional_go_reasons = @()
+        verification_checks = New-Phase6VerificationChecks -StatusOverrides @{
+            automated_tests = "fail"
+        }
+        open_requirements = @()
+        resolved_requirement_ids = @()
+    } -Phase "Phase6"
+    Assert-True (-not [bool]$invalidPhase6Reject["valid"]) "reject without rollback_phase should be invalid"
+    Assert-Contains ($invalidPhase6Reject["errors"] -join "`n") "rollback_phase" "Phase6 validator should require rollback_phase on reject"
 
     $invalidPhase52 = Test-ArtifactContract -ArtifactId "phase5-2_verdict.json" -Artifact @{
         task_id = "T-01"
@@ -1705,6 +1740,21 @@ try {
     Assert-Equal $phase6Conditional["run_state"]["current_task_id"] "T-02" "Phase6 conditional_go should move to the next ready task"
     Assert-Equal @($phase6Conditional["run_state"]["open_requirements"]).Count 1 "Phase6 conditional_go should register open requirements"
 
+    $phase6Reject = Apply-JobResult -RunState $phase6State -JobResult @{
+        phase = "Phase6"
+        task_id = "T-01"
+        result_status = "succeeded"
+        exit_code = 0
+    } -ValidationResult @{ valid = $true } -Artifact @{
+        task_id = "T-01"
+        verdict = "reject"
+        rollback_phase = "Phase5"
+        open_requirements = @()
+        resolved_requirement_ids = @()
+    } -ProjectRoot $tempEngineRoot
+    Assert-Equal $phase6Reject["run_state"]["current_phase"] "Phase5" "Phase6 reject should rollback to the requested phase"
+    Assert-Equal $phase6Reject["run_state"]["current_task_id"] "T-01" "Phase6 reject should keep the current task selected"
+
     $phase7GoBlockedState = New-RunState -RunId $runId -ProjectRoot $tempEngineRoot -CurrentPhase "Phase7" -CurrentRole "reviewer"
     $phase7GoBlockedState["open_requirements"] = @(New-Phase6OpenRequirements -TaskId "T-01")
     $phase7GoBlocked = Apply-JobResult -RunState $phase7GoBlockedState -JobResult @{
@@ -1963,6 +2013,7 @@ $cliInvalidPhase6RunId = "run-cli-phase6-invalid-" + [guid]::NewGuid().ToString(
 $cliRecoverResumeRunId = "run-cli-resume-recover-" + [guid]::NewGuid().ToString("N")
 $cliRecoverStepRunId = "run-cli-step-recover-" + [guid]::NewGuid().ToString("N")
 $cliRecoverInvalidArtifactRunId = "run-cli-invalid-artifact-recover-" + [guid]::NewGuid().ToString("N")
+$cliRecoverInvalidTransitionRunId = "run-cli-invalid-transition-recover-" + [guid]::NewGuid().ToString("N")
 $cliNonRecoverableRunId = "run-cli-no-recover-" + [guid]::NewGuid().ToString("N")
 $cliSyncRunId = "run-cli-sync-" + [guid]::NewGuid().ToString("N")
 $currentRunPointerPath = Get-CurrentRunPointerPath -ProjectRoot $repoRoot
@@ -2413,6 +2464,47 @@ Write-Output 'rerun regenerated phase4-1 artifacts'
     Assert-Equal $cliInvalidArtifactRecoveryEvent["failure_reason"] "invalid_artifact" "Recovered invalid_artifact runs should preserve the original failure reason"
     Assert-Equal $cliInvalidArtifactRecoveryEvent["recovery_source"] "resume" "Recovered invalid_artifact runs should record the recovery source"
 
+    $cliRecoverInvalidTransitionState = New-RunState -RunId $cliRecoverInvalidTransitionRunId -ProjectRoot $repoRoot -TaskId "req-cli-invalid-transition-recover" -CurrentPhase "Phase6" -CurrentRole "reviewer"
+    $cliRecoverInvalidTransitionState["status"] = "failed"
+    $cliRecoverInvalidTransitionState = Sync-RunStatePhaseHistory -RunState $cliRecoverInvalidTransitionState
+    Write-RunState -ProjectRoot $repoRoot -RunState $cliRecoverInvalidTransitionState | Out-Null
+    Append-Event -ProjectRoot $repoRoot -RunId $cliRecoverInvalidTransitionRunId -Event @{
+        type = "run.status_changed"
+        status = $cliRecoverInvalidTransitionState["status"]
+        current_phase = $cliRecoverInvalidTransitionState["current_phase"]
+        current_role = $cliRecoverInvalidTransitionState["current_role"]
+        current_task_id = $cliRecoverInvalidTransitionState["current_task_id"]
+    }
+    Append-Event -ProjectRoot $repoRoot -RunId $cliRecoverInvalidTransitionRunId -Event @{
+        type = "job.finished"
+        job_id = "job-invalid-transition-finished"
+        phase = "Phase6"
+        role = "reviewer"
+        attempt = 1
+        exit_code = 0
+        failure_class = $null
+        result_status = "succeeded"
+    }
+    Append-Event -ProjectRoot $repoRoot -RunId $cliRecoverInvalidTransitionRunId -Event @{
+        type = "run.failed"
+        reason = "invalid_transition"
+        failure_class = $null
+    }
+
+    $recoverInvalidTransitionRaw = & $pwshPath -NoLogo -NoProfile -File $cliScriptPath resume -ConfigFile $configPath -RunId $cliRecoverInvalidTransitionRunId
+    $recoverInvalidTransitionRunId = @($recoverInvalidTransitionRaw | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Last 1) | Select-Object -Last 1
+    Assert-Equal $recoverInvalidTransitionRunId $cliRecoverInvalidTransitionRunId "CLI resume should return the invalid-transition recovery run id"
+
+    $cliRecoveredInvalidTransitionState = Read-RunState -ProjectRoot $repoRoot -RunId $cliRecoverInvalidTransitionRunId
+    Assert-Equal $cliRecoveredInvalidTransitionState["status"] "running" "CLI resume should recover invalid_transition failures when the underlying job succeeded"
+    Assert-True (@($cliRecoveredInvalidTransitionState["phase_history"]).Count -ge 2) "Recovered invalid_transition runs should retain history and append a retry entry"
+    $cliRecoveredInvalidTransitionLastPhase = ConvertTo-RelayHashtable -InputObject (@($cliRecoveredInvalidTransitionState["phase_history"])[-1])
+    Assert-Equal $cliRecoveredInvalidTransitionLastPhase["phase"] "Phase6" "Recovered invalid_transition runs should retry the same phase"
+    Assert-Equal $cliRecoveredInvalidTransitionLastPhase["agent"] "reviewer" "Recovered invalid_transition runs should preserve the same role"
+    $cliInvalidTransitionRecoveryEvent = ConvertTo-RelayHashtable -InputObject ((Get-Events -ProjectRoot $repoRoot -RunId $cliRecoverInvalidTransitionRunId | Where-Object { $_["type"] -eq "run.recovered" } | Select-Object -Last 1))
+    Assert-Equal $cliInvalidTransitionRecoveryEvent["failure_reason"] "invalid_transition" "Recovered invalid_transition runs should preserve the original failure reason"
+    Assert-Equal $cliInvalidTransitionRecoveryEvent["recovery_source"] "resume" "Recovered invalid_transition runs should record the recovery source"
+
     $cliNonRecoverableState = New-RunState -RunId $cliNonRecoverableRunId -ProjectRoot $repoRoot -TaskId "req-cli-no-recover" -CurrentPhase "Phase3" -CurrentRole "implementer"
     $cliNonRecoverableState["status"] = "failed"
     $cliNonRecoverableState = Sync-RunStatePhaseHistory -RunState $cliNonRecoverableState
@@ -2494,6 +2586,7 @@ finally {
     Remove-Item -Path (Get-RunRootPath -ProjectRoot $repoRoot -RunId $cliRecoverResumeRunId) -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -Path (Get-RunRootPath -ProjectRoot $repoRoot -RunId $cliRecoverStepRunId) -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -Path (Get-RunRootPath -ProjectRoot $repoRoot -RunId $cliRecoverInvalidArtifactRunId) -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path (Get-RunRootPath -ProjectRoot $repoRoot -RunId $cliRecoverInvalidTransitionRunId) -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -Path (Get-RunRootPath -ProjectRoot $repoRoot -RunId $cliNonRecoverableRunId) -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -Path (Get-RunRootPath -ProjectRoot $repoRoot -RunId $cliSyncRunId) -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -Path $cliOutputDir -Recurse -Force -ErrorAction SilentlyContinue

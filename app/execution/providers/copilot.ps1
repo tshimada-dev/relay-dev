@@ -207,7 +207,7 @@ function Get-CopilotProviderInvocationSpec {
         $spec["command"] = "copilot"
     }
 
-    $spec["prompt_mode"] = "argv"
+    $spec["prompt_mode"] = "stdin"
     $spec["prompt_flag"] = Get-RelayPromptFlag -Arguments ([string]$job["flags"]) -DefaultFlag "-p"
     $nativeCommandPath = Get-CopilotNativeCommandPath -Command ([string]$spec["command"])
     if (-not [string]::IsNullOrWhiteSpace($nativeCommandPath)) {

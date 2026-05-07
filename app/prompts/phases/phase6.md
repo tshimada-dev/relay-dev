@@ -40,6 +40,7 @@
 - `coverage_line`
 - `coverage_branch`
 - `verdict`
+- `rollback_phase`
 - `conditional_go_reasons`
 - `verification_checks`
 - `open_requirements`
@@ -74,7 +75,7 @@
 
 - `go`: 検証通過
 - `conditional_go`: テストは進行可能だが残課題あり。`conditional_go_reasons` を 1 件以上必須
-- `reject`: Phase3 / Phase4 / Phase5 のいずれかへ差し戻し。実際に必要な戻り先を選ぶこと
+- `reject`: Phase3 / Phase4 / Phase5 のいずれかへ差し戻し。`rollback_phase` に実際の戻り先を必ず入れること
 
 ## 品質基準
 
@@ -82,6 +83,8 @@
 - `test_command` と `lint_command` は実際に使ったコマンドである
 - `test_output.log` と markdown の要約が矛盾しない
 - conditional_go の場合は、`conditional_go_reasons` と対応する `open_requirements` を 1 件以上入れる
+- reject の場合は `rollback_phase` を `Phase3` / `Phase4` / `Phase5` のいずれかで埋める
+- go / conditional_go の場合は `rollback_phase` を空文字にする
 - go / reject の場合は `open_requirements` を空配列にする
 - 既存の open requirement を解消した場合は `resolved_requirement_ids` に明示する
 

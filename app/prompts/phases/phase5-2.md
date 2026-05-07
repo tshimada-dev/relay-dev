@@ -20,6 +20,7 @@
 
 - `security_checks[].status` に `fail` が 1 件でもある場合、verdict は `reject` にすること
 - `conditional_go` は `security_checks[].status` が `pass` / `warning` / `not_applicable` のみで、かつ `warning` が 1 件以上ある場合に限る
+- `security_checks[].status` に `warning` が 1 件でもある場合、verdict は必ず `conditional_go` にすること。`go` を選んではいけない
 - `conditional_go` の `must_fix` / `open_requirements` は「実装を継続できるが後続 phase で必ず追跡する条件」に限定すること
 
 ## Markdown 出力に含める内容
@@ -74,9 +75,16 @@
 - reject は本当に Phase5 の実装修正が必要な場合に限る
 - conditional_go の場合は、`must_fix` と対応する `open_requirements` を 1 件以上入れ、後続 review で追跡できる
 - conditional_go の場合は `security_checks[].status = fail` を含めない
+- `security_checks[].status = warning` を 1 件でも含む場合は `verdict = conditional_go` にし、`must_fix` と `open_requirements` を空にしない
 - security_checks に `fail` がある場合は `reject` を選び、Phase5 へ差し戻す
 - go / reject の場合は `open_requirements` を空配列にする
 - evidence に確認したコード箇所や実行根拠が入っている
+
+## JSON保存前の自己チェック
+
+- `verdict = go` のときは、`security_checks[].status` に `warning` / `fail` を 1 件も含めない
+- `security_checks[].status = warning` を 1 件でも使ったら、`verdict = conditional_go`、`must_fix` 1 件以上、`open_requirements` 1 件以上にする
+- `verdict = go` と `security_checks[].status = warning` の組み合わせは schema 違反で run が `invalid_artifact` で停止する
 
 ## 詳細ガイダンス（旧テンプレート移植）
 
@@ -221,6 +229,7 @@ T-02セキュリティチェック：Conditional Go。NG 1件は検索クエリq
 ❌ 攻撃シナリオの検討なしにOK判定 → まず「どう攻撃できるか」を考えてから判定すること
 ❌ 変更対象にフロントエンドコードがあるのにセクション6を省略 → フロント変更がある場合は必ず6を実施すること
 ❌ fetchラッパーの再帰呼び出しを確認せずにOK → 401リトライループの終端条件を必ず確認すること
+❌ `security_checks[].status = warning` があるのに `verdict = go` → `conditional_go` にし、`must_fix` と `open_requirements` を入れること
 ```
 
 ## 総合判定

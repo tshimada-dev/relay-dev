@@ -836,7 +836,7 @@ function Test-Phase6ResultArtifact {
     param([Parameter(Mandatory)]$Artifact)
 
     $result = New-ArtifactValidationResult
-    $requiredKeys = @("task_id", "test_command", "lint_command", "tests_passed", "tests_failed", "coverage_line", "coverage_branch", "verdict", "conditional_go_reasons", "verification_checks", "open_requirements", "resolved_requirement_ids")
+    $requiredKeys = @("task_id", "test_command", "lint_command", "tests_passed", "tests_failed", "coverage_line", "coverage_branch", "verdict", "rollback_phase", "conditional_go_reasons", "verification_checks", "open_requirements", "resolved_requirement_ids")
     Test-ArtifactRequiredKeys -Artifact $Artifact -Result $result -Keys $requiredKeys -ArtifactId "phase6_result.json"
 
     Test-ArtifactStringField -Artifact $Artifact -Result $result -FieldName "task_id"
@@ -899,6 +899,12 @@ function Test-Phase6ResultArtifact {
     elseif ($verdict -eq "reject") {
         if ($testsFailed -eq 0 -and [int]$counts["fail"] -eq 0) {
             Add-ArtifactValidationError -Result $result -Message "reject verdict requires a failed test or failed verification check."
+        }
+        if ([string]::IsNullOrWhiteSpace([string]$Artifact["rollback_phase"])) {
+            Add-ArtifactValidationError -Result $result -Message "reject verdict requires rollback_phase."
+        }
+        elseif ([string]$Artifact["rollback_phase"] -notin @("Phase3", "Phase4", "Phase5")) {
+            Add-ArtifactValidationError -Result $result -Message "rollback_phase must be one of: Phase3, Phase4, Phase5."
         }
         if (@($Artifact["open_requirements"]).Count -gt 0) {
             Add-ArtifactValidationError -Result $result -Message "reject verdict must not include open_requirements."

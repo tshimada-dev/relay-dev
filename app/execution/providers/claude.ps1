@@ -80,9 +80,9 @@ function Get-ClaudeProviderInvocationSpec {
     $spec = Get-GenericCliProviderInvocationSpec -JobSpec $job
     $spec["provider"] = "claude-code"
     $spec["command"] = Get-ClaudeProviderCommand
-
-    $spec["prompt_mode"] = "argv"
+    $spec["prompt_mode"] = "stdin"
     $spec["prompt_flag"] = Get-RelayPromptFlag -Arguments ([string]$job["flags"]) -DefaultFlag "-p"
+
     $spec["environment"] = @{
         PATH = Get-ClaudeProviderPath
     }

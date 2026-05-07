@@ -18,6 +18,7 @@ function Get-Phase6Definition {
         transition_rules = @{
             go = "Phase7"
             conditional_go = "Phase5"
+            reject = @("Phase3", "Phase4", "Phase5")
         }
     }
 }

@@ -180,6 +180,13 @@ function Repair-RecoverableFailedRunState {
     ) {
         $canRecover = $true
     }
+    elseif (
+        $failureReason -eq "invalid_transition" -and
+        $lastJobFinishedEvent -and
+        [string]$lastJobFinishedEvent["result_status"] -eq "succeeded"
+    ) {
+        $canRecover = $true
+    }
 
     if (-not $canRecover) {
         return @{

@@ -307,6 +307,13 @@ function Get-PhaseDefinition {
 
     $definition["phase"] = $Phase
     $definition["role"] = $role
+    $transitionRules = Get-DefaultTransitionRules -Phase $Phase
+    if ($definition["transition_rules"]) {
+        foreach ($entry in (ConvertTo-RelayHashtable -InputObject $definition["transition_rules"]).GetEnumerator()) {
+            $transitionRules[[string]$entry.Key] = $entry.Value
+        }
+    }
+    $definition["transition_rules"] = $transitionRules
     $definition["input_contract"] = Merge-PhaseInputContract -Phase $Phase -InputContract $definition["input_contract"]
     $definition["prompt_package"] = Resolve-PromptPackage -ProjectRoot $ProjectRoot -Phase $Phase -Role $role -Provider $Provider
 
