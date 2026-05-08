@@ -435,6 +435,13 @@ try {
     Assert-Equal $defaultRunState["current_phase"] "Phase0" "New-RunState should default to Phase0"
     Assert-True ($defaultRunState.Keys -contains "active_attempt") "New-RunState should initialize active_attempt"
     Assert-True ($null -eq $defaultRunState["active_attempt"]) "New-RunState should default active_attempt to null"
+    Assert-True ($defaultRunState.Keys -contains "active_jobs") "New-RunState should initialize active_jobs"
+    Assert-Equal @($defaultRunState["active_jobs"].Keys).Count 0 "New-RunState should default active_jobs to empty"
+    Assert-True ($defaultRunState.Keys -contains "task_lane") "New-RunState should initialize task_lane"
+    Assert-Equal $defaultRunState["task_lane"]["mode"] "single" "New-RunState should default task_lane mode to single"
+    Assert-Equal ([int]$defaultRunState["task_lane"]["max_parallel_jobs"]) 1 "New-RunState should default max_parallel_jobs to 1"
+    Assert-Equal ([bool]$defaultRunState["task_lane"]["stop_leasing"]) $false "New-RunState should default stop_leasing to false"
+    Assert-Equal ([int]$defaultRunState["state_revision"]) 0 "New-RunState should start state_revision at 0 before first write"
     $runState = New-RunState -RunId $runId -ProjectRoot $tempRoot -CurrentPhase "Phase3" -CurrentRole "implementer"
     Write-RunState -ProjectRoot $tempRoot -RunState $runState | Out-Null
     Set-CurrentRunPointer -ProjectRoot $tempRoot -RunId $runId | Out-Null
@@ -445,6 +452,13 @@ try {
     Assert-Equal $readState["current_phase"] "Phase3" "Read-RunState should preserve current_phase"
     Assert-Equal @($readState["open_requirements"]).Count 0 "Read-RunState should preserve empty arrays"
     Assert-True ($readState.Keys -contains "active_attempt") "Read-RunState should preserve active_attempt compatibility field"
+    Assert-True ($readState.Keys -contains "active_jobs") "Read-RunState should preserve active_jobs compatibility field"
+    Assert-Equal @($readState["active_jobs"].Keys).Count 0 "Read-RunState should preserve empty active_jobs"
+    Assert-Equal $readState["task_lane"]["mode"] "single" "Read-RunState should preserve task_lane mode"
+    Assert-Equal ([int]$readState["state_revision"]) 1 "Write-RunState should increment state_revision on first write"
+    Write-RunState -ProjectRoot $tempRoot -RunState $readState | Out-Null
+    $readStateAfterSecondWrite = Read-RunState -ProjectRoot $tempRoot -RunId $runId
+    Assert-Equal ([int]$readStateAfterSecondWrite["state_revision"]) 2 "Write-RunState should increment state_revision monotonically"
     Assert-Equal (Resolve-ActiveRunId -ProjectRoot $tempRoot) $runId "Resolve-ActiveRunId should use current-run pointer"
     Assert-Equal @((Get-Events -ProjectRoot $tempRoot -RunId $runId)).Count 2 "Get-Events should return appended events"
     Assert-Equal (Get-LastEvent -ProjectRoot $tempRoot -RunId $runId -Type "job.finished")["job_id"] "job-1" "Get-LastEvent should return the latest matching event"
@@ -1717,6 +1731,12 @@ try {
     $registered = Register-PlannedTasks -RunState $runState -TasksArtifact $phase4Tasks
     Assert-Equal $registered["task_states"]["T-01"]["status"] "ready" "Register-PlannedTasks should mark dependency-free tasks ready"
     Assert-Equal $registered["task_states"]["T-02"]["status"] "not_started" "Register-PlannedTasks should keep blocked tasks not_started"
+    Assert-True ($registered["task_states"]["T-01"].ContainsKey("phase_cursor")) "New task states should include phase_cursor"
+    Assert-True ($null -eq $registered["task_states"]["T-01"]["phase_cursor"]) "New task states should default phase_cursor to null"
+    Assert-True ($registered["task_states"]["T-01"].ContainsKey("active_job_id")) "New task states should include active_job_id"
+    Assert-True ($null -eq $registered["task_states"]["T-01"]["active_job_id"]) "New task states should default active_job_id to null"
+    Assert-True ($registered["task_states"]["T-01"].ContainsKey("wait_reason")) "New task states should include wait_reason"
+    Assert-True ($null -eq $registered["task_states"]["T-01"]["wait_reason"]) "New task states should default wait_reason to null"
 
     $selectedState = Set-RunStateCursor -RunState $registered -Phase "Phase5" -TaskId $null
     $nextAction = Get-NextAction -RunState $selectedState -ProjectRoot $tempEngineRoot

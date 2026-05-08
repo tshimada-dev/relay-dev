@@ -335,6 +335,84 @@ function Initialize-RunStateActiveAttempt {
     return $state
 }
 
+function Initialize-RunStateParallelFields {
+    param([Parameter(Mandatory)]$RunState)
+
+    $state = ConvertTo-RelayHashtable -InputObject $RunState
+
+    if (-not $state.ContainsKey("state_revision")) {
+        $state["state_revision"] = 0
+    }
+    else {
+        $parsedRevision = 0
+        if ([int]::TryParse([string]$state["state_revision"], [ref]$parsedRevision)) {
+            $state["state_revision"] = $parsedRevision
+        }
+        else {
+            $state["state_revision"] = 0
+        }
+    }
+
+    if (-not $state.ContainsKey("active_jobs") -or $null -eq $state["active_jobs"]) {
+        $state["active_jobs"] = @{}
+    }
+    else {
+        $state["active_jobs"] = ConvertTo-RelayHashtable -InputObject $state["active_jobs"]
+    }
+
+    if (-not $state.ContainsKey("task_lane") -or $null -eq $state["task_lane"]) {
+        $state["task_lane"] = [ordered]@{
+            mode = "single"
+            max_parallel_jobs = 1
+            stop_leasing = $false
+        }
+    }
+    else {
+        $taskLane = ConvertTo-RelayHashtable -InputObject $state["task_lane"]
+        if (-not $taskLane.ContainsKey("mode") -or [string]::IsNullOrWhiteSpace([string]$taskLane["mode"])) {
+            $taskLane["mode"] = "single"
+        }
+        if (-not $taskLane.ContainsKey("max_parallel_jobs") -or $null -eq $taskLane["max_parallel_jobs"]) {
+            $taskLane["max_parallel_jobs"] = 1
+        }
+        if (-not $taskLane.ContainsKey("stop_leasing") -or $null -eq $taskLane["stop_leasing"]) {
+            $taskLane["stop_leasing"] = $false
+        }
+        $state["task_lane"] = $taskLane
+    }
+
+    if (-not $state.ContainsKey("task_states") -or $null -eq $state["task_states"]) {
+        $state["task_states"] = @{}
+    }
+    else {
+        $taskStates = ConvertTo-RelayHashtable -InputObject $state["task_states"]
+        foreach ($taskId in @($taskStates.Keys)) {
+            $taskState = ConvertTo-RelayHashtable -InputObject $taskStates[$taskId]
+            if (-not $taskState.ContainsKey("phase_cursor")) {
+                $taskState["phase_cursor"] = $null
+            }
+            if (-not $taskState.ContainsKey("active_job_id")) {
+                $taskState["active_job_id"] = $null
+            }
+            if (-not $taskState.ContainsKey("wait_reason")) {
+                $taskState["wait_reason"] = $null
+            }
+            $taskStates[$taskId] = $taskState
+        }
+        $state["task_states"] = $taskStates
+    }
+
+    return $state
+}
+
+function Initialize-RunStateCompatibilityFields {
+    param([Parameter(Mandatory)]$RunState)
+
+    $state = Initialize-RunStateActiveAttempt -RunState $RunState
+    $state = Initialize-RunStateParallelFields -RunState $state
+    return $state
+}
+
 function New-RunState {
     param(
         [Parameter(Mandatory)][string]$RunId,
@@ -355,11 +433,18 @@ function New-RunState {
         current_role = $CurrentRole
         current_task_id = $null
         active_job_id = $null
+        active_jobs = @{}
         active_attempt = $null
         pending_approval = $null
         open_requirements = @()
         task_order = @()
         task_states = @{}
+        task_lane = [ordered]@{
+            mode = "single"
+            max_parallel_jobs = 1
+            stop_leasing = $false
+        }
+        state_revision = 0
         feedback = ""
         phase_history = @(
             [ordered]@{
@@ -499,7 +584,7 @@ function Write-RunState {
         [Parameter(Mandatory)]$RunState
     )
 
-    $state = Initialize-RunStateActiveAttempt -RunState $RunState
+    $state = Initialize-RunStateCompatibilityFields -RunState $RunState
     $runId = $state["run_id"]
     if (-not $runId) {
         throw "run_id is required to write run-state.json"
@@ -508,6 +593,7 @@ function Write-RunState {
     Ensure-RunDirectories -ProjectRoot $ProjectRoot -RunId $runId
 
     $state["updated_at"] = (Get-Date).ToString("o")
+    $state["state_revision"] = [int]$state["state_revision"] + 1
     $state = Sync-RunStatePhaseHistory -RunState $state
     $path = Get-RunStatePath -ProjectRoot $ProjectRoot -RunId $runId
     $tempPath = "${path}.tmp"
@@ -537,7 +623,7 @@ function Read-RunState {
         return $null
     }
 
-    return (Initialize-RunStateActiveAttempt -RunState ($raw | ConvertFrom-Json))
+    return (Initialize-RunStateCompatibilityFields -RunState ($raw | ConvertFrom-Json))
 }
 
 function Set-CurrentRunPointer {

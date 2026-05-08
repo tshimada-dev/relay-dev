@@ -30,6 +30,9 @@ function New-TaskState {
         status = $Status
         kind = $Kind
         last_completed_phase = $LastCompletedPhase
+        phase_cursor = $null
+        active_job_id = $null
+        wait_reason = $null
         depends_on = @($DependsOn)
         origin_phase = $OriginPhase
         task_contract_ref = (ConvertTo-RelayHashtable -InputObject $TaskContractRef)
