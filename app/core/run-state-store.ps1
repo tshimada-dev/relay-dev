@@ -413,6 +413,158 @@ function Initialize-RunStateCompatibilityFields {
     return $state
 }
 
+function New-RunStateLeaseToken {
+    return "lease-{0}" -f ([guid]::NewGuid().ToString("N"))
+}
+
+function Get-RunStateActiveJobIds {
+    param([Parameter(Mandatory)]$RunState)
+
+    $state = Initialize-RunStateCompatibilityFields -RunState $RunState
+    $activeJobIds = New-Object System.Collections.Generic.List[string]
+    foreach ($jobId in @($state["active_jobs"].Keys)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$jobId)) {
+            $activeJobIds.Add([string]$jobId)
+        }
+    }
+
+    $compatJobId = [string]$state["active_job_id"]
+    if (-not [string]::IsNullOrWhiteSpace($compatJobId) -and $compatJobId -notin @($activeJobIds.ToArray())) {
+        $activeJobIds.Add($compatJobId)
+    }
+
+    return @($activeJobIds.ToArray())
+}
+
+function Add-RunStateActiveJobLease {
+    param(
+        [Parameter(Mandatory)]$RunState,
+        [Parameter(Mandatory)]$JobSpec,
+        [string]$LeaseOwner = "single-step",
+        [string]$SlotId = "slot-01",
+        [string]$WorkspaceId = "main",
+        [int]$LeaseDurationMinutes = 120
+    )
+
+    $state = Initialize-RunStateCompatibilityFields -RunState $RunState
+    $job = ConvertTo-RelayHashtable -InputObject $JobSpec
+    $jobId = [string]$job["job_id"]
+    if ([string]::IsNullOrWhiteSpace($jobId)) {
+        throw "job_id is required to create an active job lease."
+    }
+
+    $existingActiveJobIds = @(Get-RunStateActiveJobIds -RunState $state)
+    if ($existingActiveJobIds.Count -gt 0 -and $jobId -notin $existingActiveJobIds) {
+        throw "Cannot lease job '$jobId' because active job(s) already exist: $($existingActiveJobIds -join ', ')."
+    }
+
+    $now = Get-Date
+    $leaseToken = if (-not [string]::IsNullOrWhiteSpace([string]$job["lease_token"])) { [string]$job["lease_token"] } else { New-RunStateLeaseToken }
+    $lease = [ordered]@{
+        job_id = $jobId
+        task_id = if ([string]::IsNullOrWhiteSpace([string]$job["task_id"])) { $null } else { [string]$job["task_id"] }
+        phase = [string]$job["phase"]
+        role = [string]$job["role"]
+        lease_token = $leaseToken
+        leased_at = $now.ToString("o")
+        lease_expires_at = $now.AddMinutes($LeaseDurationMinutes).ToString("o")
+        last_heartbeat_at = $now.ToString("o")
+        lease_owner = $LeaseOwner
+        slot_id = $SlotId
+        workspace_id = $WorkspaceId
+        state_revision = [int]$state["state_revision"]
+    }
+
+    $state["active_jobs"][$jobId] = $lease
+    $state["active_job_id"] = $jobId
+
+    $taskId = [string]$lease["task_id"]
+    if (-not [string]::IsNullOrWhiteSpace($taskId) -and $state["task_states"].ContainsKey($taskId)) {
+        $taskState = ConvertTo-RelayHashtable -InputObject $state["task_states"][$taskId]
+        $taskState["active_job_id"] = $jobId
+        $taskState["phase_cursor"] = [string]$lease["phase"]
+        $taskState["status"] = "in_progress"
+        $taskState["wait_reason"] = $null
+        $state["task_states"][$taskId] = $taskState
+    }
+
+    return [ordered]@{
+        run_state = $state
+        lease = $lease
+    }
+}
+
+function Test-RunStateActiveJobLease {
+    param(
+        [Parameter(Mandatory)]$RunState,
+        [Parameter(Mandatory)][string]$JobId,
+        [Parameter(Mandatory)][string]$LeaseToken,
+        [string]$Phase,
+        [string]$TaskId,
+        [datetime]$Now = (Get-Date)
+    )
+
+    $state = Initialize-RunStateCompatibilityFields -RunState $RunState
+    $errors = New-Object System.Collections.Generic.List[string]
+    $lease = $null
+    if (-not $state["active_jobs"].ContainsKey($JobId)) {
+        $errors.Add("active job '$JobId' is not leased")
+    }
+    else {
+        $lease = ConvertTo-RelayHashtable -InputObject $state["active_jobs"][$JobId]
+        if ([string]$lease["lease_token"] -ne $LeaseToken) {
+            $errors.Add("lease token mismatch for job '$JobId'")
+        }
+        if (-not [string]::IsNullOrWhiteSpace($Phase) -and [string]$lease["phase"] -ne $Phase) {
+            $errors.Add("phase mismatch for job '$JobId'")
+        }
+        if (-not [string]::IsNullOrWhiteSpace($TaskId) -and [string]$lease["task_id"] -ne $TaskId) {
+            $errors.Add("task mismatch for job '$JobId'")
+        }
+
+        $leaseExpiresAt = [datetime]::MinValue
+        if ([datetime]::TryParse([string]$lease["lease_expires_at"], [ref]$leaseExpiresAt)) {
+            if ($leaseExpiresAt -lt $Now) {
+                $errors.Add("lease expired for job '$JobId'")
+            }
+        }
+    }
+
+    return [ordered]@{
+        valid = ($errors.Count -eq 0)
+        errors = @($errors.ToArray())
+        lease = $lease
+    }
+}
+
+function Clear-RunStateActiveJobLease {
+    param(
+        [Parameter(Mandatory)]$RunState,
+        [string]$JobId
+    )
+
+    $state = Initialize-RunStateCompatibilityFields -RunState $RunState
+    $resolvedJobId = if (-not [string]::IsNullOrWhiteSpace($JobId)) { $JobId } else { [string]$state["active_job_id"] }
+
+    if (-not [string]::IsNullOrWhiteSpace($resolvedJobId) -and $state["active_jobs"].ContainsKey($resolvedJobId)) {
+        $state["active_jobs"].Remove($resolvedJobId)
+    }
+
+    if ([string]$state["active_job_id"] -eq $resolvedJobId) {
+        $state["active_job_id"] = $null
+    }
+
+    foreach ($taskId in @($state["task_states"].Keys)) {
+        $taskState = ConvertTo-RelayHashtable -InputObject $state["task_states"][$taskId]
+        if ([string]$taskState["active_job_id"] -eq $resolvedJobId) {
+            $taskState["active_job_id"] = $null
+            $state["task_states"][$taskId] = $taskState
+        }
+    }
+
+    return $state
+}
+
 function New-RunState {
     param(
         [Parameter(Mandatory)][string]$RunId,

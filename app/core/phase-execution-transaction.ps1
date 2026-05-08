@@ -104,7 +104,8 @@ function Invoke-PhaseExecutionTransaction {
         [scriptblock]$OnWarn,
         [scriptblock]$OnRetry,
         [scriptblock]$OnAbort,
-        [scriptblock]$OnRepairStart
+        [scriptblock]$OnRepairStart,
+        [scriptblock]$PreCommitGuard
     )
 
     $job = ConvertTo-RelayHashtable -InputObject $JobSpec
@@ -226,14 +227,23 @@ function Invoke-PhaseExecutionTransaction {
     }
 
     $commitResult = $null
+    $commitGuardResult = $null
     if ($validatorStatus -and [bool]$validatorStatus["valid"]) {
-        try {
-            $commitResult = ConvertTo-RelayHashtable -InputObject (Complete-PhaseOutputCommit -ProjectRoot $ProjectRoot -RunId $RunId -MaterializedArtifacts @($outputSyncResult["materialized"]))
-            $validationResult["commit"] = $commitResult
+        if ($PreCommitGuard) {
+            $commitGuardResult = ConvertTo-RelayHashtable -InputObject (& $PreCommitGuard @{
+                    job_spec = $job
+                    job_id = $jobId
+                    phase = $PhaseName
+                    task_id = $TaskId
+                    attempt_id = $attemptId
+                    output_sync_result = $outputSyncResult
+                    validation_result = $validationResult
+                })
         }
-        catch {
+
+        if ($commitGuardResult -and -not [bool]$commitGuardResult["valid"]) {
             $validatorStatus["valid"] = $false
-            $validatorStatus["errors"] = @($validatorStatus["errors"]) + "Failed to commit validated artifacts: $($_.Exception.Message)"
+            $validatorStatus["errors"] = @($validatorStatus["errors"]) + @($commitGuardResult["errors"])
             $validationResult["validation"] = $validatorStatus
             $commitResult = [ordered]@{
                 committed = @()
@@ -241,7 +251,26 @@ function Invoke-PhaseExecutionTransaction {
                     committed_count = 0
                     artifact_ids = @()
                 }
-                error = $_.Exception.Message
+                error = "pre_commit_guard_rejected"
+            }
+        }
+        else {
+            try {
+                $commitResult = ConvertTo-RelayHashtable -InputObject (Complete-PhaseOutputCommit -ProjectRoot $ProjectRoot -RunId $RunId -MaterializedArtifacts @($outputSyncResult["materialized"]))
+                $validationResult["commit"] = $commitResult
+            }
+            catch {
+                $validatorStatus["valid"] = $false
+                $validatorStatus["errors"] = @($validatorStatus["errors"]) + "Failed to commit validated artifacts: $($_.Exception.Message)"
+                $validationResult["validation"] = $validatorStatus
+                $commitResult = [ordered]@{
+                    committed = @()
+                    summary = [ordered]@{
+                        committed_count = 0
+                        artifact_ids = @()
+                    }
+                    error = $_.Exception.Message
+                }
             }
         }
     }
@@ -265,6 +294,7 @@ function Invoke-PhaseExecutionTransaction {
         artifact_completion_cutoff_utc = if ($artifactCompletionCutoffUtc) { $artifactCompletionCutoffUtc.ToString("o") } else { $null }
         output_sync_result = $outputSyncResult
         validation_result = $validationResult
+        commit_guard_result = $commitGuardResult
         commit_result = $commitResult
         repair_result = $repairResult
         effective_execution_result = $effectiveExecutionResult

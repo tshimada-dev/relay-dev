@@ -50,6 +50,7 @@ Set-Location $script:ProjectRoot
 . (Join-Path $script:ProjectRoot "app/execution/provider-adapter.ps1")
 . (Join-Path $script:ProjectRoot "app/execution/execution-runner.ps1")
 . (Join-Path $script:ProjectRoot "app/phases/phase-registry.ps1")
+. (Join-Path $script:ProjectRoot "app/ui/task-lane-summary.ps1")
 
 $config = Read-Config -Path $ConfigFile
 Initialize-Settings -Config $config -Role "system"
@@ -1669,8 +1670,16 @@ function Invoke-EngineStep {
 
             $dispatchState = ConvertTo-RelayHashtable -InputObject $runState
             $dispatchState["status"] = "running"
-            $dispatchState["active_job_id"] = $jobSpec["job_id"]
             $dispatchState = Set-RunStateCursor -RunState $dispatchState -Phase $phaseName -TaskId $taskId
+            $leaseResult = ConvertTo-RelayHashtable -InputObject (Add-RunStateActiveJobLease -RunState $dispatchState -JobSpec $jobSpec -LeaseOwner "single-step" -SlotId "slot-01" -WorkspaceId "main")
+            $dispatchState = ConvertTo-RelayHashtable -InputObject $leaseResult["run_state"]
+            $lease = ConvertTo-RelayHashtable -InputObject $leaseResult["lease"]
+            $jobSpec["lease_token"] = [string]$lease["lease_token"]
+            $jobSpec["lease_expires_at"] = [string]$lease["lease_expires_at"]
+            $jobSpec["lease_owner"] = [string]$lease["lease_owner"]
+            $jobSpec["slot_id"] = [string]$lease["slot_id"]
+            $jobSpec["workspace_id"] = [string]$lease["workspace_id"]
+            $jobSpec["state_revision"] = $lease["state_revision"]
             $archiveResult = ConvertTo-RelayHashtable -InputObject $dispatchPreparation["archive_result"]
             $archivePath = if ($archiveResult) { [string]$archiveResult["snapshot_path"] } else { $null }
             $dispatchState = Start-RunStateActiveAttempt -RunState $dispatchState -AttemptId ([string]$jobSpec["attempt_id"]) -Phase $phaseName -Stage "dispatching" -Status "running" -TaskId $taskId -JobId ([string]$jobSpec["job_id"]) -ArchivePath $archivePath
@@ -1680,6 +1689,18 @@ function Invoke-EngineStep {
                 Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event $dispatchPreparation["archive_event"]
             }
             Append-RunStatusChangedEvent -RunId $ResolvedRunId -RunState $dispatchState
+            Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event @{
+                type = "job.leased"
+                job_id = $jobSpec["job_id"]
+                phase = $phaseName
+                role = $resolvedRole
+                task_id = $taskId
+                lease_token = $jobSpec["lease_token"]
+                lease_owner = $jobSpec["lease_owner"]
+                slot_id = $jobSpec["slot_id"]
+                workspace_id = $jobSpec["workspace_id"]
+                lease_expires_at = $jobSpec["lease_expires_at"]
+            }
 
             if (-not [string]::IsNullOrWhiteSpace($taskId)) {
                 Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event @{
@@ -1724,7 +1745,13 @@ function Invoke-EngineStep {
                 phase_started_at_utc = $phaseStartedAtUtc
             }
             try {
-                $transactionResult = ConvertTo-RelayHashtable -InputObject (Invoke-PhaseExecutionTransaction -JobSpec $jobSpec -PromptText $promptText -ProjectRoot $script:ProjectRoot -WorkingDirectory $script:ProjectDir -TimeoutPolicy (Get-StepTimeoutPolicy) -RunId $ResolvedRunId -PhaseName $phaseName -PhaseDefinition $phaseDefinition -ArtifactCompletionProbe ${function:Invoke-PhaseArtifactCompletionProbe} -TaskId $taskId -PhaseStartedAtUtc $phaseStartedAtUtc -OnRepairStart {
+                $transactionResult = ConvertTo-RelayHashtable -InputObject (Invoke-PhaseExecutionTransaction -JobSpec $jobSpec -PromptText $promptText -ProjectRoot $script:ProjectRoot -WorkingDirectory $script:ProjectDir -TimeoutPolicy (Get-StepTimeoutPolicy) -RunId $ResolvedRunId -PhaseName $phaseName -PhaseDefinition $phaseDefinition -ArtifactCompletionProbe ${function:Invoke-PhaseArtifactCompletionProbe} -TaskId $taskId -PhaseStartedAtUtc $phaseStartedAtUtc -PreCommitGuard {
+                        param($CommitContext)
+
+                        $commitJob = ConvertTo-RelayHashtable -InputObject $CommitContext["job_spec"]
+                        $latestState = Read-RunState -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId
+                        return (Test-RunStateActiveJobLease -RunState $latestState -JobId ([string]$commitJob["job_id"]) -LeaseToken ([string]$commitJob["lease_token"]) -Phase ([string]$commitJob["phase"]) -TaskId ([string]$commitJob["task_id"]))
+                    } -OnRepairStart {
                         param($RepairContext)
 
                         $repairState = ConvertTo-RelayHashtable -InputObject $RepairContext
@@ -1748,9 +1775,14 @@ function Invoke-EngineStep {
             $outputSync = ConvertTo-RelayHashtable -InputObject $transactionResult["output_sync_result"]
             $validationResult = ConvertTo-RelayHashtable -InputObject $transactionResult["validation_result"]
             $commitResult = ConvertTo-RelayHashtable -InputObject $transactionResult["commit_result"]
+            $commitGuardResult = ConvertTo-RelayHashtable -InputObject $transactionResult["commit_guard_result"]
             $repairResult = ConvertTo-RelayHashtable -InputObject $transactionResult["repair_result"]
             $executionResult = ConvertTo-RelayHashtable -InputObject $transactionResult["raw_execution_result"]
             $effectiveExecutionResult = ConvertTo-RelayHashtable -InputObject $transactionResult["effective_execution_result"]
+            $effectiveExecutionResult["phase"] = $phaseName
+            $effectiveExecutionResult["role"] = $resolvedRole
+            $effectiveExecutionResult["task_id"] = $taskId
+            $effectiveExecutionResult["lease_token"] = $jobSpec["lease_token"]
             $attemptId = [string]$transactionResult["resolved_attempt_id"]
             $dispatchState = Update-RunStateActiveAttempt -RunState $dispatchState -AttemptId $attemptId -Stage "committing" -Status "running" -TaskId $taskId -JobId ([string]$jobSpec["job_id"]) -Result ([string]$effectiveExecutionResult["result_status"])
             Write-RunState -ProjectRoot $script:ProjectRoot -RunState $dispatchState | Out-Null
@@ -1799,6 +1831,16 @@ function Invoke-EngineStep {
                                 }
                         )
                     }
+                }
+            }
+
+            if ($commitGuardResult -and -not [bool]$commitGuardResult["valid"]) {
+                Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event @{
+                    type = "job.commit_rejected"
+                    job_id = $jobSpec["job_id"]
+                    phase = $phaseName
+                    task_id = $taskId
+                    errors = @($commitGuardResult["errors"])
                 }
             }
 
@@ -2043,6 +2085,8 @@ switch ($Command) {
             exit 0
         }
         $state = Read-RunState -ProjectRoot $script:ProjectRoot -RunId $resolvedRunId
+        $events = @(Get-Events -ProjectRoot $script:ProjectRoot -RunId $resolvedRunId)
+        $state["lane_summary"] = New-TaskLaneSummary -RunState $state -Events $events
         Write-Output ($state | ConvertTo-Json -Depth 20 -Compress)
     }
 }

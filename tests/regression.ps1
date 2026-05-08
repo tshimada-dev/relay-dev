@@ -459,6 +459,35 @@ try {
     Write-RunState -ProjectRoot $tempRoot -RunState $readState | Out-Null
     $readStateAfterSecondWrite = Read-RunState -ProjectRoot $tempRoot -RunId $runId
     Assert-Equal ([int]$readStateAfterSecondWrite["state_revision"]) 2 "Write-RunState should increment state_revision monotonically"
+    $leaseProbe = Add-RunStateActiveJobLease -RunState $readStateAfterSecondWrite -JobSpec @{
+        job_id = "job-lease"
+        phase = "Phase3"
+        role = "implementer"
+    } -LeaseOwner "test-owner" -SlotId "slot-test" -WorkspaceId "main"
+    $leasedState = ConvertTo-RelayHashtable -InputObject $leaseProbe["run_state"]
+    $lease = ConvertTo-RelayHashtable -InputObject $leaseProbe["lease"]
+    Assert-Equal $leasedState["active_job_id"] "job-lease" "Add-RunStateActiveJobLease should set compatibility active_job_id"
+    Assert-True ($leasedState["active_jobs"].ContainsKey("job-lease")) "Add-RunStateActiveJobLease should add active_jobs entry"
+    Assert-Equal $lease["lease_owner"] "test-owner" "Add-RunStateActiveJobLease should preserve lease_owner"
+    $validLeaseCheck = Test-RunStateActiveJobLease -RunState $leasedState -JobId "job-lease" -LeaseToken ([string]$lease["lease_token"]) -Phase "Phase3"
+    Assert-True ([bool]$validLeaseCheck["valid"]) "Test-RunStateActiveJobLease should accept matching lease metadata"
+    $mismatchedLeaseCheck = Test-RunStateActiveJobLease -RunState $leasedState -JobId "job-lease" -LeaseToken "wrong-token" -Phase "Phase3"
+    Assert-True (-not [bool]$mismatchedLeaseCheck["valid"]) "Test-RunStateActiveJobLease should reject mismatched lease tokens"
+    $expiredLeaseState = ConvertTo-RelayHashtable -InputObject $leasedState
+    $expiredLeaseState["active_jobs"]["job-lease"]["lease_expires_at"] = (Get-Date).AddMinutes(-5).ToString("o")
+    $expiredLeaseCheck = Test-RunStateActiveJobLease -RunState $expiredLeaseState -JobId "job-lease" -LeaseToken ([string]$lease["lease_token"]) -Phase "Phase3"
+    Assert-True (-not [bool]$expiredLeaseCheck["valid"]) "Test-RunStateActiveJobLease should reject expired leases"
+    $duplicateLeaseRejected = $false
+    try {
+        $null = Add-RunStateActiveJobLease -RunState $leasedState -JobSpec @{ job_id = "job-other"; phase = "Phase3"; role = "implementer" }
+    }
+    catch {
+        $duplicateLeaseRejected = $true
+    }
+    Assert-True $duplicateLeaseRejected "Add-RunStateActiveJobLease should reject a second active job in single mode"
+    $clearedLeaseState = Clear-RunStateActiveJobLease -RunState $leasedState -JobId "job-lease"
+    Assert-Equal $clearedLeaseState["active_job_id"] $null "Clear-RunStateActiveJobLease should clear compatibility active_job_id"
+    Assert-Equal @($clearedLeaseState["active_jobs"].Keys).Count 0 "Clear-RunStateActiveJobLease should clear active_jobs entry"
     Assert-Equal (Resolve-ActiveRunId -ProjectRoot $tempRoot) $runId "Resolve-ActiveRunId should use current-run pointer"
     Assert-Equal @((Get-Events -ProjectRoot $tempRoot -RunId $runId)).Count 2 "Get-Events should return appended events"
     Assert-Equal (Get-LastEvent -ProjectRoot $tempRoot -RunId $runId -Type "job.finished")["job_id"] "job-1" "Get-LastEvent should return the latest matching event"
@@ -1755,6 +1784,7 @@ try {
     } -ValidationResult @{ valid = $true } -Artifact @{ verdict = "go"; rollback_phase = $null } -ProjectRoot $tempEngineRoot
     Assert-Equal $phase41Mutation["run_state"]["current_phase"] "Phase5" "Phase4-1 go should advance to Phase5"
     Assert-Equal $phase41Mutation["run_state"]["current_task_id"] "T-01" "Phase4-1 go should select the first ready task"
+    Assert-Equal $phase41Mutation["run_state"]["task_states"]["T-01"]["phase_cursor"] "Phase5" "Phase4-1 go should set the selected task phase_cursor"
 
     $phase41ApprovalMutation = Apply-JobResult -RunState $phase41State -JobResult @{
         phase = "Phase4-1"
@@ -1762,6 +1792,7 @@ try {
         exit_code = 0
     } -ValidationResult @{ valid = $true } -Artifact @{ verdict = "go"; rollback_phase = $null } -ProjectRoot $tempEngineRoot -ApprovalPhases @("Phase4-1")
     Assert-Equal $phase41ApprovalMutation["action"]["type"] "RequestApproval" "Configured approval phases should request approval"
+    Assert-Equal ([bool]$phase41ApprovalMutation["run_state"]["task_lane"]["stop_leasing"]) $true "Approval requests should stop new task-lane leases"
     Assert-Equal (@($phase41ApprovalMutation["run_state"]["pending_approval"]["allowed_reject_phases"]) -join ",") "Phase3,Phase4" "Approval request should preserve all valid reject targets"
 
     $phase41ConditionalApprovalMutation = Apply-JobResult -RunState $phase41State -JobResult @{
@@ -1787,6 +1818,7 @@ try {
         decision = "approve"
     }
     Assert-Equal $phase41ConditionalApproved["run_state"]["current_phase"] "Phase4" "Approving conditional_go should resume the proposed Phase4 action"
+    Assert-Equal ([bool]$phase41ConditionalApproved["run_state"]["task_lane"]["stop_leasing"]) $false "Approval resolution should unblock task-lane leasing"
     Assert-Equal @($phase41ConditionalApproved["run_state"]["open_requirements"]).Count 2 "Approving conditional_go should preserve reviewer must-fix items as open requirements"
     Assert-Equal $phase41ConditionalApproved["run_state"]["open_requirements"][0]["source_phase"] "Phase4-1" "Auto-carried requirements should keep the reviewer phase as source"
     Assert-Equal $phase41ConditionalApproved["run_state"]["open_requirements"][0]["verify_in_phase"] "Phase4" "Auto-carried requirements should target the resumed phase for verification"
@@ -1885,6 +1917,8 @@ try {
     } -ProjectRoot $tempEngineRoot
     Assert-Equal $phase6Conditional["run_state"]["current_phase"] "Phase5" "Phase6 conditional_go should return to Phase5 when next task exists"
     Assert-Equal $phase6Conditional["run_state"]["current_task_id"] "T-02" "Phase6 conditional_go should move to the next ready task"
+    Assert-Equal $phase6Conditional["run_state"]["task_states"]["T-01"]["active_job_id"] $null "Apply-JobResult should clear task active_job_id after commit"
+    Assert-Equal $phase6Conditional["run_state"]["task_states"]["T-01"]["status"] "completed" "Phase6 completion should mark the task completed"
     Assert-Equal @($phase6Conditional["run_state"]["open_requirements"]).Count 1 "Phase6 conditional_go should register open requirements"
 
     $phase6Reject = Apply-JobResult -RunState $phase6State -JobResult @{
