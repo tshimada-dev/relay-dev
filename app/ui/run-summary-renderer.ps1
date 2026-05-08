@@ -15,6 +15,8 @@ function New-RunSummaryText {
         $approvalSuffix = " Approval pending."
     }
 
-    return "Run $($state['run_id']) is $($state['status']) at $($state['current_phase']) with $($lane['event_count']) events. Tasks: $($lane['completed_count'])/$($lane['total_tasks']) complete, $($lane['running_count']) running, $($lane['ready_count']) ready, $($lane['blocked_count']) blocked. Lane: $($lane['mode']) $($lane['used_slots'])/$($lane['max_parallel_jobs']) slots.$approvalSuffix"
+    $stallSuffix = if ($lane["stall_reason"]) { " Stall: $($lane['stall_reason'])." } else { "" }
+
+    return "Run $($state['run_id']) is $($state['status']) at $($state['current_phase']) with $($lane['event_count']) events. Tasks: $($lane['completed_count'])/$($lane['total_tasks']) complete, $($lane['running_count']) running, $($lane['ready_count']) ready, $($lane['blocked_count']) blocked. Lane: $($lane['mode']) $($lane['used_slots'])/$($lane['max_parallel_jobs']) slots, capacity remaining $($lane['capacity_remaining']), ready queue $(@($lane['ready_queue']).Count), lease candidates $(@($lane['lease_candidates']).Count).$stallSuffix$approvalSuffix"
 }
 

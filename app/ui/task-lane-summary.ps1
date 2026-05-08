@@ -72,6 +72,124 @@ function ConvertTo-TaskLaneBoolean {
     return $Default
 }
 
+function ConvertTo-TaskLaneStringArray {
+    param([AllowNull()]$Value)
+
+    if ($null -eq $Value) {
+        return @()
+    }
+
+    return @(
+        @($Value) |
+            ForEach-Object { [string]$_ } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
+    )
+}
+
+function Resolve-TaskLaneStallReason {
+    param(
+        [Parameter(Mandatory)]$Lane,
+        [Parameter(Mandatory)]$ActiveJobs,
+        [Parameter(Mandatory)]$ReadyQueue,
+        [Parameter(Mandatory)]$WaitingTasks,
+        [int]$CapacityRemaining = 0
+    )
+
+    if ($Lane.ContainsKey("stop_leasing") -and (ConvertTo-TaskLaneBoolean -Value $Lane["stop_leasing"])) {
+        return "stop_leasing"
+    }
+
+    if (@($ActiveJobs).Count -gt 0) {
+        if ($CapacityRemaining -le 0) {
+            return "capacity_full"
+        }
+        return "job_in_progress"
+    }
+
+    if (@($ReadyQueue).Count -gt 0) {
+        return ""
+    }
+
+    $resourceLockWaits = @(
+        @($WaitingTasks) |
+            ForEach-Object { ConvertTo-RelayHashtable -InputObject $_ } |
+            Where-Object { $_ -and [string]$_["wait_reason"] -eq "resource_lock" }
+    )
+    if ($resourceLockWaits.Count -gt 0) {
+        return "resource_locked"
+    }
+
+    return "no_ready_tasks"
+}
+
+function Resolve-TaskLaneLeaseCandidates {
+    param(
+        [Parameter(Mandatory)]$RunState,
+        [AllowNull()][string]$ProjectRoot,
+        [Parameter(Mandatory)]$ReadyQueue,
+        [int]$CapacityRemaining = 0
+    )
+
+    if ($CapacityRemaining -le 0) {
+        return @()
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ProjectRoot)) {
+        foreach ($commandName in @("Get-BatchLeaseCandidates", "Get-TaskLeaseCandidates", "Get-TaskLeaseCandidateBatch", "Get-TaskDispatchCandidates")) {
+            $command = Get-Command -Name $commandName -ErrorAction SilentlyContinue
+            if (-not $command) {
+                continue
+            }
+
+            $parameters = @{}
+            foreach ($name in @($command.Parameters.Keys)) {
+                switch ($name) {
+                    "RunState" { $parameters[$name] = $RunState }
+                    "ProjectRoot" { $parameters[$name] = $ProjectRoot }
+                    "Limit" { $parameters[$name] = $CapacityRemaining }
+                    "MaxCandidates" { $parameters[$name] = $CapacityRemaining }
+                    "CapacityRemaining" { $parameters[$name] = $CapacityRemaining }
+                }
+            }
+
+            try {
+                return @(& $command @parameters)
+            }
+            catch {
+                return @()
+            }
+        }
+    }
+
+    $state = ConvertTo-RelayHashtable -InputObject $RunState
+    $items = New-Object System.Collections.Generic.List[object]
+    $activeJobs = ConvertTo-RelayHashtable -InputObject $state["active_jobs"]
+    if (-not $activeJobs) {
+        $activeJobs = @{}
+    }
+    $slotNumber = @($activeJobs.Keys).Count + 1
+    foreach ($taskRaw in (@($ReadyQueue) | Select-Object -First $CapacityRemaining)) {
+        $task = ConvertTo-RelayHashtable -InputObject $taskRaw
+        if (-not $task) {
+            continue
+        }
+
+        $row = [ordered]@{
+            task_id = [string]$task["task_id"]
+            phase = if ($task["phase_cursor"]) { [string]$task["phase_cursor"] } else { [string]$state["current_phase"] }
+            role = [string]$state["current_role"]
+            selected_task = [string]$task["task_id"]
+            resource_locks = @(ConvertTo-TaskLaneStringArray -Value $task["resource_locks"])
+            parallel_safety = [string]$task["parallel_safety"]
+            slot_id = "slot-$slotNumber"
+        }
+        $items.Add($row) | Out-Null
+        $slotNumber++
+    }
+
+    return @($items.ToArray())
+}
+
 function New-TaskLaneSummary {
     param(
         [Parameter(Mandatory)]$RunState,
@@ -92,6 +210,22 @@ function New-TaskLaneSummary {
     $taskLane = ConvertTo-RelayHashtable -InputObject $state["task_lane"]
     if (-not $taskLane) {
         $taskLane = @{}
+    }
+
+    $eligibilityByTaskId = @{}
+    $projectRoot = [string]$state["project_root"]
+    if ((Get-Command Get-TaskDispatchEligibility -ErrorAction SilentlyContinue) -and -not [string]::IsNullOrWhiteSpace($projectRoot)) {
+        try {
+            foreach ($eligibilityRaw in @(Get-TaskDispatchEligibility -RunState $state -ProjectRoot $projectRoot)) {
+                $eligibility = ConvertTo-RelayHashtable -InputObject $eligibilityRaw
+                if ($eligibility -and -not [string]::IsNullOrWhiteSpace([string]$eligibility["task_id"])) {
+                    $eligibilityByTaskId[[string]$eligibility["task_id"]] = $eligibility
+                }
+            }
+        }
+        catch {
+            $eligibilityByTaskId = @{}
+        }
     }
 
     $activeJobRows = New-Object System.Collections.Generic.List[object]
@@ -130,6 +264,7 @@ function New-TaskLaneSummary {
     }
 
     $waitingTaskRows = New-Object System.Collections.Generic.List[object]
+    $readyQueueRows = New-Object System.Collections.Generic.List[object]
     $readyCount = 0
     $runningCount = $activeJobRows.Count
     $blockedCount = 0
@@ -146,6 +281,9 @@ function New-TaskLaneSummary {
         $kind = [string]$task["kind"]
         $activeJobId = [string]$task["active_job_id"]
         $waitReason = [string]$task["wait_reason"]
+        $eligibility = if ($eligibilityByTaskId.ContainsKey([string]$taskId)) { ConvertTo-RelayHashtable -InputObject $eligibilityByTaskId[[string]$taskId] } else { $null }
+        $eligibleForDispatch = if ($eligibility) { [bool]$eligibility["eligible"] } else { $true }
+        $effectiveWaitReason = if ($eligibility -and -not [string]::IsNullOrWhiteSpace([string]$eligibility["wait_reason"])) { [string]$eligibility["wait_reason"] } else { $waitReason }
 
         if ($kind -eq "repair") {
             $repairCount++
@@ -157,16 +295,45 @@ function New-TaskLaneSummary {
             "completed" { $completedCount++ }
         }
 
+        if ($status -eq "ready" -and [string]::IsNullOrWhiteSpace($activeJobId) -and $eligibleForDispatch) {
+            $readyRow = [ordered]@{
+                task_id = [string]$taskId
+                status = $status
+            }
+            foreach ($field in @("phase_cursor", "parallel_safety")) {
+                Copy-TaskLaneFieldIfPresent -Source $task -Target $readyRow -FieldName $field
+            }
+            if ($eligibility) {
+                Copy-TaskLaneFieldIfPresent -Source $eligibility -Target $readyRow -FieldName "parallel_safety"
+            }
+            if ($task.ContainsKey("resource_locks") -and $null -ne $task["resource_locks"]) {
+                $readyRow["resource_locks"] = @(ConvertTo-TaskLaneStringArray -Value $task["resource_locks"])
+            }
+            if ($eligibility -and $eligibility.ContainsKey("resource_locks")) {
+                $readyRow["resource_locks"] = @(ConvertTo-TaskLaneStringArray -Value $eligibility["resource_locks"])
+            }
+            $readyQueueRows.Add($readyRow) | Out-Null
+        }
+
         $isWaiting = ($status -ne "completed" -and [string]::IsNullOrWhiteSpace($activeJobId))
-        if ($isWaiting -and ($status -in @("ready", "blocked", "waiting") -or -not [string]::IsNullOrWhiteSpace($waitReason))) {
+        if ($isWaiting -and ($status -in @("ready", "blocked", "waiting") -or -not [string]::IsNullOrWhiteSpace($effectiveWaitReason) -or ($eligibility -and -not $eligibleForDispatch))) {
             $row = [ordered]@{
                 task_id = [string]$taskId
                 status = $status
-                wait_reason = $waitReason
+                wait_reason = $effectiveWaitReason
             }
-            foreach ($field in @("blocked_by", "depends_on")) {
+            foreach ($field in @("blocked_by", "depends_on", "blocked_by_jobs", "blocked_by_tasks")) {
                 if ($task.ContainsKey($field) -and $null -ne $task[$field]) {
-                    $row[$field] = @($task[$field])
+                    $row[$field] = @(ConvertTo-TaskLaneStringArray -Value $task[$field])
+                }
+                if ($eligibility -and $eligibility.ContainsKey($field) -and $null -ne $eligibility[$field]) {
+                    $row[$field] = @(ConvertTo-TaskLaneStringArray -Value $eligibility[$field])
+                }
+            }
+            foreach ($field in @("parallel_safety", "stall_reason")) {
+                Copy-TaskLaneFieldIfPresent -Source $task -Target $row -FieldName $field
+                if ($eligibility) {
+                    Copy-TaskLaneFieldIfPresent -Source $eligibility -Target $row -FieldName $field
                 }
             }
             $waitingTaskRows.Add($row) | Out-Null
@@ -195,6 +362,15 @@ function New-TaskLaneSummary {
     if ($taskLane.ContainsKey("max_parallel_jobs") -and $null -ne $taskLane["max_parallel_jobs"]) {
         [void][int]::TryParse([string]$taskLane["max_parallel_jobs"], [ref]$maxParallelJobs)
     }
+    if ($maxParallelJobs -lt 1) {
+        $maxParallelJobs = 1
+    }
+
+    $usedSlots = $activeJobRows.Count
+    $capacityRemaining = [Math]::Max(0, $maxParallelJobs - $usedSlots)
+    $capacityFull = ($capacityRemaining -le 0)
+    $leaseCandidates = @(Resolve-TaskLaneLeaseCandidates -RunState $state -ProjectRoot $projectRoot -ReadyQueue @($readyQueueRows.ToArray()) -CapacityRemaining $capacityRemaining)
+    $stallReason = Resolve-TaskLaneStallReason -Lane $taskLane -ActiveJobs @($activeJobRows.ToArray()) -ReadyQueue @($readyQueueRows.ToArray()) -WaitingTasks @($waitingTaskRows.ToArray()) -CapacityRemaining $capacityRemaining
 
     return [ordered]@{
         total_tasks = @($taskStates.Keys).Count
@@ -204,11 +380,16 @@ function New-TaskLaneSummary {
         completed_count = $completedCount
         repair_count = $repairCount
         active_jobs = @($activeJobRows.ToArray())
+        ready_queue = @($readyQueueRows.ToArray())
         waiting_tasks = @($waitingTaskRows.ToArray())
+        stall_reason = $stallReason
         mode = if ($taskLane.ContainsKey("mode")) { [string]$taskLane["mode"] } else { "single" }
         max_parallel_jobs = $maxParallelJobs
+        capacity_remaining = $capacityRemaining
+        capacity_full = $capacityFull
         stop_leasing = if ($taskLane.ContainsKey("stop_leasing")) { ConvertTo-TaskLaneBoolean -Value $taskLane["stop_leasing"] } else { $false }
-        used_slots = $activeJobRows.Count
+        used_slots = $usedSlots
+        lease_candidates = @($leaseCandidates)
         pending_approval = $approvalSummary
         event_count = @($Events).Count
     }

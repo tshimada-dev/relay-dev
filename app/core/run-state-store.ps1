@@ -375,6 +375,15 @@ function Initialize-RunStateParallelFields {
         if (-not $taskLane.ContainsKey("max_parallel_jobs") -or $null -eq $taskLane["max_parallel_jobs"]) {
             $taskLane["max_parallel_jobs"] = 1
         }
+        else {
+            $parsedMaxParallelJobs = 1
+            if ([int]::TryParse([string]$taskLane["max_parallel_jobs"], [ref]$parsedMaxParallelJobs) -and $parsedMaxParallelJobs -ge 1) {
+                $taskLane["max_parallel_jobs"] = $parsedMaxParallelJobs
+            }
+            else {
+                $taskLane["max_parallel_jobs"] = 1
+            }
+        }
         if (-not $taskLane.ContainsKey("stop_leasing") -or $null -eq $taskLane["stop_leasing"]) {
             $taskLane["stop_leasing"] = $false
         }
@@ -454,15 +463,48 @@ function Add-RunStateActiveJobLease {
     }
 
     $existingActiveJobIds = @(Get-RunStateActiveJobIds -RunState $state)
-    if ($existingActiveJobIds.Count -gt 0 -and $jobId -notin $existingActiveJobIds) {
+    $taskLane = ConvertTo-RelayHashtable -InputObject $state["task_lane"]
+    $taskLaneMode = ([string]$taskLane["mode"]).Trim().ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($taskLaneMode)) {
+        $taskLaneMode = "single"
+    }
+    $maxParallelJobs = 1
+    if (-not [int]::TryParse([string]$taskLane["max_parallel_jobs"], [ref]$maxParallelJobs) -or $maxParallelJobs -lt 1) {
+        $maxParallelJobs = 1
+    }
+    $capacityLimit = if ($taskLaneMode -eq "parallel") { $maxParallelJobs } else { 1 }
+
+    $taskId = if ([string]::IsNullOrWhiteSpace([string]$job["task_id"])) { $null } else { [string]$job["task_id"] }
+    foreach ($existingJobId in $existingActiveJobIds) {
+        if (-not $state["active_jobs"].ContainsKey($existingJobId)) {
+            continue
+        }
+
+        $existingLease = ConvertTo-RelayHashtable -InputObject $state["active_jobs"][$existingJobId]
+        if (
+            -not [string]::IsNullOrWhiteSpace($taskId) -and
+            [string]$existingLease["task_id"] -eq $taskId -and
+            [string]$existingJobId -ne $jobId
+        ) {
+            throw "Cannot lease job '$jobId' for task '$taskId' because task is already leased by job '$existingJobId'."
+        }
+    }
+
+    if ($jobId -notin $existingActiveJobIds -and $existingActiveJobIds.Count -ge $capacityLimit) {
+        if ($taskLaneMode -eq "parallel") {
+            throw "Cannot lease job '$jobId' because task lane capacity is full ($($existingActiveJobIds.Count)/$capacityLimit)."
+        }
+
         throw "Cannot lease job '$jobId' because active job(s) already exist: $($existingActiveJobIds -join ', ')."
     }
 
     $now = Get-Date
     $leaseToken = if (-not [string]::IsNullOrWhiteSpace([string]$job["lease_token"])) { [string]$job["lease_token"] } else { New-RunStateLeaseToken }
+    $resolvedSlotId = if (-not [string]::IsNullOrWhiteSpace([string]$job["slot_id"])) { [string]$job["slot_id"] } else { $SlotId }
+    $resolvedWorkspaceId = if (-not [string]::IsNullOrWhiteSpace([string]$job["workspace_id"])) { [string]$job["workspace_id"] } else { $WorkspaceId }
     $lease = [ordered]@{
         job_id = $jobId
-        task_id = if ([string]::IsNullOrWhiteSpace([string]$job["task_id"])) { $null } else { [string]$job["task_id"] }
+        task_id = $taskId
         phase = [string]$job["phase"]
         role = [string]$job["role"]
         lease_token = $leaseToken
@@ -470,13 +512,21 @@ function Add-RunStateActiveJobLease {
         lease_expires_at = $now.AddMinutes($LeaseDurationMinutes).ToString("o")
         last_heartbeat_at = $now.ToString("o")
         lease_owner = $LeaseOwner
-        slot_id = $SlotId
-        workspace_id = $WorkspaceId
+        slot_id = $resolvedSlotId
+        workspace_id = $resolvedWorkspaceId
         state_revision = [int]$state["state_revision"]
+    }
+    if ($job.ContainsKey("resource_locks")) {
+        $lease["resource_locks"] = @($job["resource_locks"])
+    }
+    if ($job.ContainsKey("parallel_safety")) {
+        $lease["parallel_safety"] = [string]$job["parallel_safety"]
     }
 
     $state["active_jobs"][$jobId] = $lease
-    $state["active_job_id"] = $jobId
+    if ([string]::IsNullOrWhiteSpace([string]$state["active_job_id"]) -or -not $state["active_jobs"].ContainsKey([string]$state["active_job_id"])) {
+        $state["active_job_id"] = $jobId
+    }
 
     $taskId = [string]$lease["task_id"]
     if (-not [string]::IsNullOrWhiteSpace($taskId) -and $state["task_states"].ContainsKey($taskId)) {
@@ -537,6 +587,54 @@ function Test-RunStateActiveJobLease {
     }
 }
 
+function Update-RunStateActiveJobHeartbeat {
+    param(
+        [Parameter(Mandatory)]$RunState,
+        [Parameter(Mandatory)][string]$JobId,
+        [Parameter(Mandatory)][string]$LeaseToken,
+        [datetime]$Now = (Get-Date),
+        [int]$LeaseDurationMinutes = 120
+    )
+
+    $state = Initialize-RunStateCompatibilityFields -RunState $RunState
+    $errors = New-Object System.Collections.Generic.List[string]
+    $lease = $null
+
+    if ([string]::IsNullOrWhiteSpace($JobId)) {
+        $errors.Add("job_id is required")
+    }
+    elseif (-not $state["active_jobs"].ContainsKey($JobId)) {
+        $errors.Add("active job '$JobId' is not leased")
+    }
+    else {
+        $lease = ConvertTo-RelayHashtable -InputObject $state["active_jobs"][$JobId]
+        if ([string]::IsNullOrWhiteSpace($LeaseToken)) {
+            $errors.Add("lease_token is required for job '$JobId'")
+        }
+        elseif ([string]$lease["lease_token"] -ne $LeaseToken) {
+            $errors.Add("lease token mismatch for job '$JobId'")
+        }
+    }
+
+    if ($LeaseDurationMinutes -lt 1) {
+        $errors.Add("LeaseDurationMinutes must be at least 1")
+    }
+
+    if ($errors.Count -eq 0) {
+        $lease["last_heartbeat_at"] = $Now.ToString("o")
+        $lease["lease_expires_at"] = $Now.AddMinutes($LeaseDurationMinutes).ToString("o")
+        $state["active_jobs"][$JobId] = $lease
+        $state["updated_at"] = $Now.ToString("o")
+    }
+
+    return [ordered]@{
+        valid = ($errors.Count -eq 0)
+        errors = @($errors.ToArray())
+        run_state = $state
+        lease = $lease
+    }
+}
+
 function Clear-RunStateActiveJobLease {
     param(
         [Parameter(Mandatory)]$RunState,
@@ -551,7 +649,13 @@ function Clear-RunStateActiveJobLease {
     }
 
     if ([string]$state["active_job_id"] -eq $resolvedJobId) {
-        $state["active_job_id"] = $null
+        $remainingJobIds = @(
+            @($state["active_jobs"].Keys) |
+                ForEach-Object { [string]$_ } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+                Sort-Object
+        )
+        $state["active_job_id"] = if ($remainingJobIds.Count -gt 0) { $remainingJobIds[0] } else { $null }
     }
 
     foreach ($taskId in @($state["task_states"].Keys)) {

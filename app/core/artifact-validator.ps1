@@ -595,6 +595,8 @@ function Test-Phase4TaskDefinition {
     Test-ArtifactArrayField -Artifact $TaskDefinition -Result $Result -FieldName "acceptance_criteria"
     Test-ArtifactArrayField -Artifact $TaskDefinition -Result $Result -FieldName "dependencies" -AllowEmpty
     Test-ArtifactArrayField -Artifact $TaskDefinition -Result $Result -FieldName "tests" -AllowEmpty
+    Test-ArtifactStringArrayField -Artifact $TaskDefinition -Result $Result -FieldName "resource_locks"
+    Test-ArtifactEnumField -Artifact $TaskDefinition -Result $Result -FieldName "parallel_safety" -AllowedValues @("serial", "cautious", "parallel")
     Test-ArtifactObjectField -Artifact $TaskDefinition -Result $Result -FieldName "boundary_contract"
     Test-VisualContractField -Artifact $TaskDefinition -Result $Result -FieldName "visual_contract" -ArtifactId "phase4_tasks.json tasks[]"
     if ($TaskDefinition.ContainsKey("boundary_contract")) {

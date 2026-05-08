@@ -1,0 +1,266 @@
+{
+  "id": "task-parallelization-parallel-ready",
+  "title": "Task Parallelization Parallel-Ready Plan",
+  "version": 1,
+  "status": "draft",
+  "source_documents": [
+    "docs/ideas/task-parallel-execution-proposal.md",
+    "docs/plans/task-parallelization-prep-plan.json",
+    "docs/plans/task-parallelization-conservative-scheduler-plan.json"
+  ],
+  "goal": "Make relay-dev's control plane able to represent and plan multiple safe task-lane leases while keeping actual provider parallel execution gated.",
+  "summary": "Lift the hard single-active-job state assumption behind an explicit parallel mode, add deterministic batch lease candidate planning, propagate scheduler metadata into lease specs, and expose remaining capacity in read-only summaries.",
+  "non_goals": [
+    "Do not make max_parallel_jobs > 1 the default.",
+    "Do not start a provider worker pool.",
+    "Do not run provider execution concurrently.",
+    "Do not implement isolated workspace or merge-back.",
+    "Do not infer same-workspace safety from changed_files alone.",
+    "Do not bypass lease fencing or single-writer commit.",
+    "Do not remove compatibility fields current_phase, current_task_id, or active_job_id.",
+    "Do not rewrite cli.ps1 step; it remains a one-job synchronous path."
+  ],
+  "implementation_steps": [
+    {
+      "id": "PRP-01",
+      "title": "Multi-lease capacity model",
+      "priority": "P0",
+      "depends_on": [],
+      "goal": "Allow run-state to represent more than one active job when task-lane configuration explicitly permits it.",
+      "tasks": [
+        "Normalize task_lane.max_parallel_jobs to an integer >= 1.",
+        "Keep task_lane.mode single by default.",
+        "Reject additional active jobs in single mode.",
+        "Allow additional active jobs in parallel mode up to max_parallel_jobs.",
+        "Reject duplicate leasing of the same task.",
+        "Keep compatibility active_job_id stable for older readers.",
+        "Keep multi-lease allowance limited to explicit test/helper/control-plane paths; no production execution path creates more than one active lease in this slice."
+      ],
+      "candidate_files": [
+        "app/core/run-state-store.ps1",
+        "tests/task-parallelization-ready-runstate.ps1"
+      ],
+      "acceptance": [
+        "task_lane.max_parallel_jobs is normalized to an integer >= 1.",
+        "task_lane.mode remains single by default.",
+        "Add-RunStateActiveJobLease rejects additional jobs in single mode.",
+        "Add-RunStateActiveJobLease allows additional jobs in parallel mode up to max_parallel_jobs.",
+        "Duplicate leasing of the same task is rejected.",
+        "Compatibility active_job_id remains set to a stable active job id for older readers.",
+        "No production execution path creates more than one active lease in this slice."
+      ],
+      "verification": [
+        "Run tests/task-parallelization-ready-runstate.ps1."
+      ]
+    },
+    {
+      "id": "PRP-02",
+      "title": "Batch lease candidate planner",
+      "priority": "P0",
+      "depends_on": [
+        "PRP-01"
+      ],
+      "goal": "Add a scheduler helper that derives a deterministic batch of safe dispatch candidates without executing them.",
+      "tasks": [
+        "Return up to remaining lane capacity candidates.",
+        "Use task contracts and run-state as canonical inputs.",
+        "Respect dependency, stop_leasing, resource-lock, active-job, and serial-safety constraints.",
+        "Include task_id, phase, role, selected_task, resource_locks, parallel_safety, and slot_id in candidate rows.",
+        "Keep existing Get-NextAction behavior unchanged."
+      ],
+      "candidate_files": [
+        "app/core/workflow-engine.ps1",
+        "tests/task-parallelization-ready-scheduler.ps1"
+      ],
+      "acceptance": [
+        "Helper returns up to remaining lane capacity candidates.",
+        "Candidates come from task contract state, not Phase4 prose batch summaries.",
+        "Dependency, stop_leasing, resource-lock, active-job, and serial-safety constraints are respected.",
+        "Candidate rows include task_id, phase, role, selected_task, resource_locks, parallel_safety, and slot_id.",
+        "Existing Get-NextAction behavior remains unchanged."
+      ],
+      "verification": [
+        "Run tests/task-parallelization-ready-scheduler.ps1."
+      ]
+    },
+    {
+      "id": "PRP-03",
+      "title": "Lease metadata propagation",
+      "priority": "P1",
+      "depends_on": [
+        "PRP-01",
+        "PRP-02"
+      ],
+      "goal": "Make lease specs carry the scheduler constraint metadata needed by later worker slots.",
+      "tasks": [
+        "Allow planned job specs to carry resource_locks, parallel_safety, slot_id, and workspace_id.",
+        "Preserve those fields in active_jobs[job_id] when provided.",
+        "Include resource locks and parallel safety in lease events where available.",
+        "Keep existing single-step callers backwards compatible.",
+        "Treat workspace_id as metadata only; do not switch provider working directories, imply workspace isolation, or provide merge-back safety."
+      ],
+      "candidate_files": [
+        "app/core/run-state-store.ps1",
+        "app/cli.ps1",
+        "tests/task-parallelization-ready-runstate.ps1"
+      ],
+      "acceptance": [
+        "Planned job specs can carry resource_locks, parallel_safety, slot_id, and workspace_id.",
+        "active_jobs[job_id] preserves those fields when provided.",
+        "Lease events can include resource locks and parallel safety where available.",
+        "No existing single-step caller needs to provide the new fields.",
+        "workspace_id is metadata only in this slice and does not invoke isolated workspace or merge-back behavior."
+      ],
+      "verification": [
+        "Run tests/task-parallelization-ready-runstate.ps1."
+      ]
+    },
+    {
+      "id": "PRP-04",
+      "title": "Parallel-ready observability",
+      "priority": "P1",
+      "depends_on": [
+        "PRP-01",
+        "PRP-02"
+      ],
+      "goal": "Expose remaining capacity and batch-candidate information in read-only summaries.",
+      "tasks": [
+        "Expose capacity_remaining from New-TaskLaneSummary.",
+        "Distinguish capacity_full from job_in_progress when slots are full.",
+        "Include derived lease_candidates without persisting them.",
+        "Display capacity remaining in watch-run and dashboard surfaces."
+      ],
+      "candidate_files": [
+        "app/ui/task-lane-summary.ps1",
+        "app/ui/dashboard-renderer.ps1",
+        "app/ui/run-summary-renderer.ps1",
+        "watch-run.ps1",
+        "tests/task-parallelization-ready-ui.ps1"
+      ],
+      "acceptance": [
+        "New-TaskLaneSummary exposes capacity_remaining.",
+        "Summary distinguishes capacity_full from job_in_progress when slots are full.",
+        "Summary can include derived lease_candidates without persisting them.",
+        "watch-run and dashboard surfaces can display capacity remaining."
+      ],
+      "verification": [
+        "Run tests/task-parallelization-ready-ui.ps1."
+      ]
+    },
+    {
+      "id": "PRP-05",
+      "title": "Parallel-ready regression coverage",
+      "priority": "P0",
+      "depends_on": [
+        "PRP-01",
+        "PRP-02",
+        "PRP-03",
+        "PRP-04"
+      ],
+      "goal": "Prove the system is parallel-ready but not yet running providers concurrently.",
+      "tasks": [
+        "Test two independent ready tasks selected as lease candidates when mode=parallel and capacity is 2.",
+        "Test two leases can coexist in run-state under parallel mode.",
+        "Test same task cannot be leased twice.",
+        "Test resource-lock conflicts are excluded from the candidate batch.",
+        "Test serial tasks block co-dispatch.",
+        "Test Get-NextAction still returns one dispatch action.",
+        "Test existing cli.ps1 step cannot dispatch or execute more than one provider job even when fixture state uses task_lane.mode=parallel.",
+        "Test workspace_id metadata does not invoke isolated workspace or merge-back behavior."
+      ],
+      "candidate_files": [
+        "tests/task-parallelization-ready-runstate.ps1",
+        "tests/task-parallelization-ready-scheduler.ps1",
+        "tests/task-parallelization-ready-ui.ps1",
+        "tests/regression.ps1"
+      ],
+      "acceptance": [
+        "Targeted tests cover multi-lease state, batch planning, resource locks, serial safety, and compatibility single dispatch.",
+        "Negative tests cover production single-dispatch gating and workspace_id metadata-only behavior.",
+        "Regression suite still passes."
+      ],
+      "verification": [
+        "Run tests/task-parallelization-ready-runstate.ps1.",
+        "Run tests/task-parallelization-ready-scheduler.ps1.",
+        "Run tests/task-parallelization-ready-ui.ps1.",
+        "Run tests/task-parallelization-prep.ps1.",
+        "Run tests/task-parallelization-scheduler.ps1.",
+        "Run tests/regression.ps1."
+      ]
+    }
+  ],
+  "recommended_order": [
+    "PRP-01",
+    "PRP-02",
+    "PRP-03",
+    "PRP-04",
+    "PRP-05"
+  ],
+  "worker_split": [
+    {
+      "worker": "A",
+      "owns": [
+        "PRP-01",
+        "PRP-03 run-state part"
+      ],
+      "write_scope": [
+        "app/core/run-state-store.ps1",
+        "tests/task-parallelization-ready-runstate.ps1"
+      ],
+      "notes": "Do not edit workflow-engine, UI renderers, or cli.ps1."
+    },
+    {
+      "worker": "B",
+      "owns": [
+        "PRP-02"
+      ],
+      "write_scope": [
+        "app/core/workflow-engine.ps1",
+        "tests/task-parallelization-ready-scheduler.ps1"
+      ],
+      "notes": "Do not change Get-NextAction behavior except through shared helpers that preserve current single-dispatch output."
+    },
+    {
+      "worker": "C",
+      "owns": [
+        "PRP-04"
+      ],
+      "write_scope": [
+        "app/ui/task-lane-summary.ps1",
+        "app/ui/dashboard-renderer.ps1",
+        "app/ui/run-summary-renderer.ps1",
+        "watch-run.ps1",
+        "tests/task-parallelization-ready-ui.ps1"
+      ],
+      "notes": "Use workflow helper functions if present; do not duplicate scheduler policy."
+    }
+  ],
+  "parent_owned": [
+    "Middle review coordination.",
+    "Any small cli.ps1 lease event projection if needed.",
+    "Any cli.ps1 edits so worker scopes stay disjoint.",
+    "Final targeted and full regression checks.",
+    "Worklog updates."
+  ],
+  "global_acceptance": [
+    "Plans exist as Markdown and JSON under docs/plans.",
+    "The middle reviewer passes the task list before implementation.",
+    "Targeted parallel-ready tests pass.",
+    "Existing prep and conservative scheduler tests pass.",
+    "Existing regression suite passes.",
+    "The repo can represent and plan multiple concurrent task-lane leases under explicit task_lane.mode=parallel, but production provider execution remains gated.",
+    "Existing cli.ps1 step cannot dispatch or execute more than one provider job even when fixture state uses task_lane.mode=parallel.",
+    "Batch lease candidates are derived read-only and are not persisted as ready_queue or auto-leased by production paths."
+  ],
+  "llm_execution_guidance": {
+    "do_not_do": [
+      "Do not make parallel mode default.",
+      "Do not run providers concurrently.",
+      "Do not implement worker pools.",
+      "Do not implement isolated workspace or merge-back.",
+      "Do not remove compatibility fields.",
+      "Do not touch unrelated dirty files."
+    ],
+    "verification_policy": "Workers may run targeted tests for their slice, but parent runs final targeted and full regression checks."
+  }
+}

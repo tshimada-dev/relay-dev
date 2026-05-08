@@ -1,0 +1,309 @@
+{
+  "id": "task-parallelization-headless-execution",
+  "title": "Task Parallelization Headless Execution Plan",
+  "source": [
+    "docs/ideas/task-parallel-execution-proposal.md",
+    "docs/plans/task-parallelization-prep-plan.json",
+    "docs/plans/task-parallelization-conservative-scheduler-plan.json",
+    "docs/plans/task-parallelization-parallel-ready-plan.json"
+  ],
+  "goal": "Enable an explicit experimental headless parallel-step path that leases multiple safe task-lane jobs, executes providers concurrently, and commits through the single-writer run lock.",
+  "non_goals": [
+    "Do not make parallel mode the default.",
+    "Do not remove or weaken sequential step.",
+    "Do not implement git worktree-based isolation in this slice.",
+    "Do not implement automatic merge conflict resolution in this slice.",
+    "Do not open visible worker terminals.",
+    "Do not parallelize run-scoped phases.",
+    "Do not infer safety from changed_files alone."
+  ],
+  "gates": {
+    "enabled_command": "parallel-step",
+    "internal_worker_command": "run-leased-job",
+    "requires_task_lane_mode": "parallel",
+    "requires_max_parallel_jobs_gt": 1,
+    "workspace_mode": "isolated-copy-experimental",
+    "default_launchable_parallel_safety": [
+      "parallel"
+    ],
+    "requires_declared_changed_files": true,
+    "requires_actual_diff_guard": true,
+    "requires_worker_heartbeat": true,
+    "sequential_step_unchanged": true
+  },
+  "tasks": [
+    {
+      "id": "HPE-01",
+      "title": "CLI command surface and gating",
+      "goal": "Add explicit parent and internal worker commands while keeping ordinary step sequential.",
+      "files": [
+        "app/cli.ps1",
+        "tests/task-parallelization-headless-execution.ps1"
+      ],
+      "acceptance": [
+        "step remains sequential.",
+        "parallel-step only dispatches task-scoped phases.",
+        "parallel-step requires task_lane.mode=parallel and max_parallel_jobs > 1.",
+        "parallel-step returns a clear wait result when no candidates are available.",
+        "run-leased-job requires -JobPackageFile.",
+        "Test-ParallelStepLaunchableCandidate owns shared launchability rules and contains no launcher or commit behavior."
+      ],
+      "verification": [
+        "Run tests/task-parallelization-headless-execution.ps1.",
+        "Run existing parallel-ready tests."
+      ]
+    },
+    {
+      "id": "HPE-02",
+      "title": "Batch lease and job package creation",
+      "goal": "Derive batch lease candidates under one run lock and persist one executable package per leased job.",
+      "files": [
+        "app/cli.ps1",
+        "app/core/run-state-store.ps1",
+        "tests/task-parallelization-headless-execution.ps1"
+      ],
+      "acceptance": [
+        "Candidate selection uses Get-BatchLeaseCandidates.",
+        "Lease metadata preserves resource_locks, parallel_safety, slot_id, and workspace_id.",
+        "Each lease emits job.leased and task selection events.",
+        "Each package includes job spec, prompt text, phase definition, task id, phase, run id, and phase started timestamp.",
+        "Packages are written under the run job directory.",
+        "Each package records a workspace baseline before provider execution.",
+        "Each package records declared task changed_files and normalized allowed product paths.",
+        "New-ParallelStepJobPackages owns candidate filtering, lease creation, prompt rendering, baseline capture, and package persistence without launching providers."
+      ],
+      "verification": [
+        "Focused package creation assertions in tests/task-parallelization-headless-execution.ps1."
+      ]
+    },
+    {
+      "id": "HPE-03",
+      "title": "Worker execution command",
+      "goal": "Execute one pre-leased job package outside the run lock and commit under a short lock.",
+      "files": [
+        "app/cli.ps1",
+        "tests/task-parallelization-headless-execution.ps1"
+      ],
+      "acceptance": [
+        "Provider execution happens before acquiring the commit lock.",
+        "Worker acquires run lock in the pre-commit guard and holds it through artifact commit, state mutation, event append, and lease clear.",
+        "Commit fencing rereads latest state under the run lock and validates job_id, lease_token, phase, task_id, lease expiry, lease presence, and state_revision compatibility.",
+        "Commit rejection emits job.commit_rejected and exits nonzero.",
+        "Successful worker completion emits essential sequential-equivalent events.",
+        "Before commit, the worker compares actual workspace changes against the package baseline and declared changed_files.",
+        "Boundary drift rejects commit.",
+        "When a worker result requests approval, it sets task_lane.stop_leasing=true.",
+        "If another approval is already pending, a second approval commit is rejected or blocked with a clear approval.commit_rejected or job.commit_rejected event.",
+        "Invoke-LeasedJobPackage owns worker execution and commit; it does not rewrite sequential Invoke-EngineStep."
+      ],
+      "verification": [
+        "Focused worker execution assertions in tests/task-parallelization-headless-execution.ps1."
+      ]
+    },
+    {
+      "id": "HPE-04",
+      "title": "Parent worker launcher",
+      "goal": "Launch one headless worker process per package and summarize results.",
+      "files": [
+        "app/cli.ps1",
+        "tests/task-parallelization-headless-execution.ps1"
+      ],
+      "acceptance": [
+        "Parent launches hidden worker windows on Windows.",
+        "Each worker has separate stdout/stderr log files.",
+        "Parent waits for all workers and returns JSON with job ids, task ids, package paths, exit codes, and log paths.",
+        "Parent does not hold run lock while workers execute.",
+        "Worker failures do not cause additional leases in the same invocation.",
+        "Parent emits or returns enough timing data to prove worker overlap in focused tests.",
+        "Invoke-ParallelStepWorkers consumes packages and never mutates run state directly."
+      ],
+      "verification": [
+        "Focused launcher assertions in tests/task-parallelization-headless-execution.ps1."
+      ]
+    },
+    {
+      "id": "HPE-05",
+      "title": "Isolated workspace and serial merge-back guard",
+      "goal": "Execute providers in per-job isolated copy workspaces and merge accepted files back serially under the run lock.",
+      "files": [
+        "app/cli.ps1",
+        "tests/task-parallelization-headless-execution.ps1"
+      ],
+      "acceptance": [
+        "parallel-step launches only candidates whose parallel_safety is parallel by default.",
+        "Candidates with empty declared changed_files are not launched by default.",
+        "cautious and serial candidates are not co-dispatched by default.",
+        "If fewer than two launchable candidates remain, parallel-step waits unless -AllowSingleParallelJob is passed.",
+        "Command output labels workspace mode as isolated-copy-experimental.",
+        "Workspace preparation copies the configured project workspace to a per-job directory under runs/<run-id>/workspaces/<job-id> while excluding heavy/runtime paths such as .git, node_modules, .next, coverage, and relay-dev runtime outputs.",
+        "Provider WorkingDirectory is the isolated workspace.",
+        "Relay-dev control-plane artifact paths remain the canonical main run paths from the prompt package.",
+        "Baseline capture and actual diff detection run inside the isolated workspace so sibling worker edits cannot appear in a job diff.",
+        "Actual isolated workspace changes outside declared task changed_files reject merge-back and commit.",
+        "Main workspace target files are compared against the package baseline immediately before merge-back; changed targets reject merge-back with a clear conflict event.",
+        "Merge-back copies only declared and accepted changed files from isolated workspace to main workspace under the run lock.",
+        "Actual product changes to known shared files reject merge-back unless protected by a matching resource_locks policy.",
+        "New-IsolatedJobWorkspace, New-WorkspaceBaselineSnapshot, Test-WorkspaceBoundaryDelta, and Invoke-IsolatedWorkspaceMergeBack are callable by Invoke-LeasedJobPackage without depending on launcher behavior."
+      ],
+      "verification": [
+        "Focused guard assertions in tests/task-parallelization-headless-execution.ps1."
+      ]
+    },
+    {
+      "id": "HPE-06",
+      "title": "Lease heartbeat and expiry policy",
+      "goal": "Keep leases fresh while workers execute outside the run lock.",
+      "files": [
+        "app/core/run-state-store.ps1",
+        "app/core/workflow-engine.ps1",
+        "app/cli.ps1",
+        "tests/task-parallelization-headless-execution.ps1"
+      ],
+      "acceptance": [
+        "Worker package execution starts a lightweight heartbeat loop or periodic heartbeat update process.",
+        "Heartbeat updates active_jobs[job_id].last_heartbeat_at and extends lease_expires_at under short run locks.",
+        "Heartbeat validates the current lease token before writing.",
+        "Stale recovery does not clear jobs with fresh heartbeat.",
+        "If heartbeat cannot update, worker execution may continue but commit fencing can reject it with a clear event.",
+        "Focused tests cover fresh heartbeat preservation and expired lease commit rejection."
+      ],
+      "verification": [
+        "Focused heartbeat assertions in tests/task-parallelization-headless-execution.ps1.",
+        "Run task-parallelization-ready-recovery.ps1."
+      ]
+    },
+    {
+      "id": "HPE-07",
+      "title": "Focused regression coverage",
+      "goal": "Prove the new path actually runs workers concurrently while preserving existing sequential behavior.",
+      "files": [
+        "tests/task-parallelization-headless-execution.ps1",
+        "tests/task-parallelization-ready-*.ps1",
+        "tests/regression.ps1"
+      ],
+      "acceptance": [
+        "Two independent parallel tasks are leased and worker processes are launched.",
+        "Parent does not keep run.lock held while workers execute.",
+        "Worker commit clears its own lease and preserves other live leases until they commit.",
+        "Sequential step still dispatches only one job.",
+        "parallel-step refuses non-parallel lane mode.",
+        "parallel-step refuses cautious/serial co-dispatch by default.",
+        "Stale lease recovery still works after partial worker failure.",
+        "Isolated workspace boundary drift rejects merge-back and commit.",
+        "Main workspace drift on a declared target rejects merge-back.",
+        "Heartbeat keeps live long-running workers from being recovered as stale.",
+        "A second approval request is rejected or blocked when one approval is already pending."
+      ],
+      "verification": [
+        "Run tests/task-parallelization-headless-execution.ps1.",
+        "Run task-parallelization-ready-recovery.ps1.",
+        "Run task-parallelization-ready-runstate.ps1.",
+        "Run task-parallelization-ready-scheduler.ps1.",
+        "Run task-parallelization-ready-ui.ps1.",
+        "Run task-parallelization-scheduler.ps1.",
+        "Run task-parallelization-prep.ps1.",
+        "Run tests/regression.ps1."
+      ]
+    }
+  ],
+  "worker_split": [
+    {
+      "worker": "A",
+      "owns": [
+        "HPE-01",
+        "HPE-02"
+      ],
+      "primary_files": [
+        "app/cli.ps1"
+      ],
+      "notes": "Own Test-ParallelStepLaunchableCandidate and New-ParallelStepJobPackages."
+    },
+    {
+      "worker": "B",
+      "owns": [
+        "HPE-03"
+      ],
+      "primary_files": [
+        "app/cli.ps1"
+      ],
+      "notes": "Own Invoke-LeasedJobPackage and short-lock commit path."
+    },
+    {
+      "worker": "C",
+      "owns": [
+        "HPE-04",
+        "HPE-05"
+      ],
+      "primary_files": [
+        "app/cli.ps1"
+      ],
+      "notes": "Own Invoke-ParallelStepWorkers, isolated workspace helpers, merge-back helpers, and result summary. Call Worker A's launchability helper rather than redefining gating."
+    },
+    {
+      "worker": "D",
+      "owns": [
+        "HPE-06"
+      ],
+      "primary_files": [
+        "app/core/run-state-store.ps1",
+        "app/core/workflow-engine.ps1",
+        "app/cli.ps1"
+      ],
+      "notes": "Own heartbeat state helpers and stale recovery integration."
+    },
+    {
+      "worker": "Parent",
+      "owns": [
+        "HPE-07",
+        "integration",
+        "final verification"
+      ],
+      "primary_files": [
+        "tests/task-parallelization-headless-execution.ps1",
+        "docs/worklog/2026-05-08.md",
+        "docs/worklog/current.md"
+      ],
+      "notes": "Parent writes final tests or integrates worker-provided test hooks and runs all verification."
+    }
+  ],
+  "global_acceptance": [
+    "parallel-step can actually run at least two fake-provider task-lane jobs concurrently.",
+    "The run lock is not held during provider execution.",
+    "Commits are single-writer and lease-fenced.",
+    "Isolated copy workspace execution is used for provider concurrency.",
+    "Serial merge-back rejects undeclared isolated changes and main workspace target drift.",
+    "Heartbeat prevents live long-running workers from being stale-recovered.",
+    "Single pending_approval safety is preserved by lane stop and second-approval rejection/blocking.",
+    "step remains sequential.",
+    "Focused headless execution tests pass.",
+    "Full regression suite passes.",
+    "Worklog records the explicit experimental status."
+  ],
+  "risks": [
+    {
+      "id": "R-01",
+      "title": "Workspace merge-back conflicts",
+      "mitigation": "Use isolated copy workspaces for provider execution and reject merge-back when main target files drift."
+    },
+    {
+      "id": "R-02",
+      "title": "Duplicate or stale commit",
+      "mitigation": "Acquire run lock in pre-commit guard and hold it through commit/state/event updates; verify latest lease fencing."
+    },
+    {
+      "id": "R-03",
+      "title": "Event/state divergence",
+      "mitigation": "Mirror sequential post-transaction mutation/event behavior rather than creating a second transition model."
+    },
+    {
+      "id": "R-04",
+      "title": "Repair flow writes while unlocked",
+      "mitigation": "Keep repair semantics narrow in MVP; avoid broad parallel repair behavior unless covered by focused tests."
+    },
+    {
+      "id": "R-05",
+      "title": "Approval collision",
+      "mitigation": "Use lane stop and reject/block second approval commits until pending_approvals exists."
+    }
+  ]
+}

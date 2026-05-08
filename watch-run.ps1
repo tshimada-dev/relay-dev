@@ -18,6 +18,8 @@ Set-Location $script:ProjectRoot
 . (Join-Path $script:ProjectRoot "config/common.ps1")
 . (Join-Path $script:ProjectRoot "app/core/run-state-store.ps1")
 . (Join-Path $script:ProjectRoot "app/core/event-store.ps1")
+. (Join-Path $script:ProjectRoot "app/core/artifact-repository.ps1")
+. (Join-Path $script:ProjectRoot "app/core/workflow-engine.ps1")
 . (Join-Path $script:ProjectRoot "app/approval/approval-manager.ps1")
 . (Join-Path $script:ProjectRoot "app/ui/task-lane-summary.ps1")
 
@@ -98,7 +100,8 @@ function Write-MonitorSummary {
     Write-Host "Active Job:        $(if ($state['active_job_id']) { $state['active_job_id'] } else { '-' })" -ForegroundColor White
     Write-Host "Current Task:      $(if ($state['current_task_id']) { $state['current_task_id'] } else { '-' })" -ForegroundColor White
     Write-Host "Open Requirements: $openRequirementsCount" -ForegroundColor White
-    Write-Host "Task Lane:         $($lane['mode']) slots $($lane['used_slots'])/$($lane['max_parallel_jobs']) stop_leasing=$($lane['stop_leasing'])" -ForegroundColor White
+    Write-Host "Task Lane:         $($lane['mode']) slots $($lane['used_slots'])/$($lane['max_parallel_jobs']) remaining=$($lane['capacity_remaining']) stop_leasing=$($lane['stop_leasing'])" -ForegroundColor White
+    Write-Host "Lane Stall:        $(if ($lane['stall_reason']) { $lane['stall_reason'] } else { '-' })" -ForegroundColor White
     Write-Host "Tasks:             total=$($lane['total_tasks']) ready=$($lane['ready_count']) running=$($lane['running_count']) blocked=$($lane['blocked_count']) completed=$($lane['completed_count']) repair=$($lane['repair_count'])" -ForegroundColor White
     Write-Host "Updated At:        $($state['updated_at'])" -ForegroundColor White
 }
@@ -108,6 +111,8 @@ function Write-MonitorLaneDetails {
 
     $lane = ConvertTo-RelayHashtable -InputObject $LaneSummary
     $activeJobs = @($lane["active_jobs"])
+    $readyQueue = @($lane["ready_queue"])
+    $leaseCandidates = @($lane["lease_candidates"])
     $waitingTasks = @($lane["waiting_tasks"])
 
     Write-Host ""
@@ -124,6 +129,32 @@ function Write-MonitorLaneDetails {
         Write-Host "- $($job['job_id']) task=$($job['task_id']) phase=$($job['phase']) role=$($job['role'])$owner$slot$workspace$stale"
     }
 
+    Write-Host "Ready queue:" -ForegroundColor Cyan
+    if ($readyQueue.Count -eq 0) {
+        Write-Host "- none" -ForegroundColor DarkGray
+    }
+    foreach ($taskRaw in ($readyQueue | Select-Object -First 5)) {
+        $task = ConvertTo-RelayHashtable -InputObject $taskRaw
+        $phaseCursor = if ($task["phase_cursor"]) { " phase=$($task['phase_cursor'])" } else { "" }
+        $safety = if ($task["parallel_safety"]) { " safety=$($task['parallel_safety'])" } else { "" }
+        $locks = if ($task["resource_locks"]) { " locks=$(@($task['resource_locks']) -join ',')" } else { "" }
+        Write-Host "- $($task['task_id'])$phaseCursor$safety$locks"
+    }
+
+    Write-Host "Lease candidates:" -ForegroundColor Cyan
+    if ($leaseCandidates.Count -eq 0) {
+        Write-Host "- none" -ForegroundColor DarkGray
+    }
+    foreach ($candidateRaw in ($leaseCandidates | Select-Object -First 5)) {
+        $candidate = ConvertTo-RelayHashtable -InputObject $candidateRaw
+        $phase = if ($candidate["phase"]) { " phase=$($candidate['phase'])" } else { "" }
+        $role = if ($candidate["role"]) { " role=$($candidate['role'])" } else { "" }
+        $slot = if ($candidate["slot_id"]) { " slot=$($candidate['slot_id'])" } else { "" }
+        $safety = if ($candidate["parallel_safety"]) { " safety=$($candidate['parallel_safety'])" } else { "" }
+        $locks = if ($candidate["resource_locks"]) { " locks=$(@($candidate['resource_locks']) -join ',')" } else { "" }
+        Write-Host "- $($candidate['task_id'])$phase$role$slot$safety$locks"
+    }
+
     if ($waitingTasks.Count -gt 0) {
         Write-Host "Waiting tasks:" -ForegroundColor Cyan
         foreach ($taskRaw in ($waitingTasks | Select-Object -First 5)) {
@@ -131,7 +162,11 @@ function Write-MonitorLaneDetails {
             $reason = if ($task["wait_reason"]) { " reason=$($task['wait_reason'])" } else { "" }
             $dependsOn = if ($task["depends_on"]) { " depends_on=$(@($task['depends_on']) -join ',')" } else { "" }
             $blockedBy = if ($task["blocked_by"]) { " blocked_by=$(@($task['blocked_by']) -join ',')" } else { "" }
-            Write-Host "- $($task['task_id']) status=$($task['status'])$reason$dependsOn$blockedBy"
+            $blockedByJobs = if ($task["blocked_by_jobs"]) { " blocked_by_jobs=$(@($task['blocked_by_jobs']) -join ',')" } else { "" }
+            $blockedByTasks = if ($task["blocked_by_tasks"]) { " blocked_by_tasks=$(@($task['blocked_by_tasks']) -join ',')" } else { "" }
+            $safety = if ($task["parallel_safety"]) { " safety=$($task['parallel_safety'])" } else { "" }
+            $stall = if ($task["stall_reason"]) { " stall=$($task['stall_reason'])" } else { "" }
+            Write-Host "- $($task['task_id']) status=$($task['status'])$reason$dependsOn$blockedBy$blockedByJobs$blockedByTasks$safety$stall"
         }
     }
 }

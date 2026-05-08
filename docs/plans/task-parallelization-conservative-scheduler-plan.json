@@ -1,0 +1,230 @@
+{
+  "id": "task-parallelization-conservative-scheduler",
+  "title": "Task Parallelization Conservative Scheduler Plan",
+  "version": 1,
+  "status": "draft",
+  "source_documents": [
+    "docs/ideas/task-parallel-execution-proposal.md",
+    "docs/plans/task-parallelization-prep-plan.json"
+  ],
+  "goal": "Add conservative task-lane scheduling constraints and observability without enabling multiple provider jobs.",
+  "summary": "Extend Phase4 task contracts with resource locks and parallel safety, add scheduler explanation helpers for ready and waiting tasks, and expose those explanations through task-lane summaries while keeping max_parallel_jobs=1 behavior intact.",
+  "non_goals": [
+    "Do not enable official max_parallel_jobs > 1 execution.",
+    "Do not introduce a headless worker pool.",
+    "Do not run provider execution outside the existing single-step path.",
+    "Do not implement same-workspace actual-diff commit guards.",
+    "Do not implement isolated workspaces or merge-back.",
+    "Do not implement visible worker slot launchers.",
+    "Do not treat Phase4 prose parallel groups as canonical scheduler input.",
+    "Do not infer same-workspace co-dispatch safety from changed_files alone.",
+    "Do not persist ready_queue as a new source of truth; derive it from run-state and task contracts."
+  ],
+  "implementation_steps": [
+    {
+      "id": "CPS-01",
+      "title": "Phase4 contract safety fields",
+      "priority": "P0",
+      "depends_on": [],
+      "goal": "Add optional resource_locks[] and parallel_safety to Phase4 task contracts.",
+      "tasks": [
+        "Validate optional resource_locks as an array of non-empty strings.",
+        "Validate optional parallel_safety as serial, cautious, or parallel.",
+        "Keep missing parallel_safety backwards compatible.",
+        "Update Phase4 prompt to request the fields.",
+        "Update Phase4-1 prompt to review the fields."
+      ],
+      "candidate_files": [
+        "app/core/artifact-validator.ps1",
+        "app/prompts/phases/phase4.md",
+        "app/prompts/phases/phase4-1.md",
+        "tests/regression.ps1"
+      ],
+      "acceptance": [
+        "phase4_tasks.json tasks[] accepts optional resource_locks as an array of non-empty strings.",
+        "phase4_tasks.json tasks[] accepts optional parallel_safety as serial, cautious, or parallel.",
+        "Missing parallel_safety remains backwards compatible.",
+        "Phase4 prompt asks authors to emit these fields.",
+        "Phase4-1 prompt asks reviewers to check them."
+      ],
+      "verification": [
+        "Run artifact validation tests for valid and invalid Phase4 task safety fields.",
+        "Run regression tests that cover legacy Phase4 tasks without the optional fields."
+      ]
+    },
+    {
+      "id": "CPS-02",
+      "title": "Conservative scheduler constraint helpers",
+      "priority": "P0",
+      "depends_on": [
+        "CPS-01"
+      ],
+      "goal": "Add helpers that explain dispatch eligibility without enabling actual parallel execution.",
+      "semantics": {
+        "parallel_safety": {
+          "serial": "Cannot be co-dispatched with any other active job; if a serial task is active, no other task is dispatchable.",
+          "cautious": "Eligible only when dependencies and resource locks allow it; no extra priority boost in this slice.",
+          "parallel": "Eligible when dependencies and resource locks allow it; changed_files alone is not used to infer same-workspace safety in this slice."
+        },
+        "resource_lock_blocking": {
+          "blocked_by": "For wait_reason=resource_lock, blocked_by is the list of blocking resource lock ids.",
+          "optional_attribution": [
+            "blocked_by_jobs",
+            "blocked_by_tasks"
+          ]
+        }
+      },
+      "tasks": [
+        "Represent unmet dependencies as wait_reason=dependencies with blocked_by task ids.",
+        "Represent resource locks held by active jobs as wait_reason=resource_lock.",
+        "Prevent serial tasks from being dispatchable when another job is active, and prevent other tasks from being dispatchable while a serial task is active.",
+        "Represent task_lane.stop_leasing as a stable no-dispatch reason.",
+        "Preserve existing sequential Get-NextAction behavior."
+      ],
+      "candidate_files": [
+        "app/core/workflow-engine.ps1",
+        "app/core/run-state-store.ps1",
+        "tests/task-parallelization-scheduler.ps1"
+      ],
+      "acceptance": [
+        "A task with unmet dependencies reports wait_reason dependencies and blocked_by task ids.",
+        "A task with a resource lock held by an active job reports wait_reason resource_lock.",
+        "For wait_reason resource_lock, blocked_by contains resource lock ids; helpers may additionally expose blocked_by_jobs and blocked_by_tasks.",
+        "A task with parallel_safety serial is not dispatchable when any other job is active, and no other task is dispatchable while a serial task is active.",
+        "task_lane.stop_leasing prevents new dispatch and produces a stable wait reason.",
+        "Existing sequential Get-NextAction still dispatches the first ready task when no active job exists."
+      ],
+      "verification": [
+        "Run targeted scheduler tests for dependencies, resource locks, stop_leasing, and normal sequential dispatch."
+      ]
+    },
+    {
+      "id": "CPS-03",
+      "title": "Task lane observability",
+      "priority": "P1",
+      "depends_on": [
+        "CPS-02"
+      ],
+      "goal": "Expose scheduler explanations in task-lane monitor data.",
+      "relationship_to_prep_plan": "Builds on TPP-06 by adding ready_queue, resource_lock waits, serial-safety explanation, and stall reasons. Do not reimplement existing active job display or basic lane counts.",
+      "tasks": [
+        "Add ready_queue to New-TaskLaneSummary.",
+        "Include wait_reason and blocked_by in waiting task rows.",
+        "Expose lane stall reason such as job_in_progress, stop_leasing, no_ready_tasks, or resource_locked.",
+        "Render ready queue and waiting reasons in watch-run."
+      ],
+      "candidate_files": [
+        "app/ui/task-lane-summary.ps1",
+        "watch-run.ps1",
+        "app/ui/dashboard-renderer.ps1",
+        "app/ui/run-summary-renderer.ps1",
+        "tests/task-parallelization-scheduler.ps1"
+      ],
+      "acceptance": [
+        "New-TaskLaneSummary includes ready_queue.",
+        "Waiting rows include wait_reason and blocked_by when known.",
+        "Summary exposes a lane-level stall_reason.",
+        "watch-run can render ready queue and blocked/waiting reasons."
+      ],
+      "verification": [
+        "Run targeted summary tests against fixture run states.",
+        "Verify with string assertions or a fixture snapshot that rendered monitor data contains ready_queue entries and waiting rows with wait_reason and blocked_by."
+      ]
+    },
+    {
+      "id": "CPS-04",
+      "title": "Scheduler regression coverage",
+      "priority": "P0",
+      "depends_on": [
+        "CPS-01",
+        "CPS-02",
+        "CPS-03"
+      ],
+      "goal": "Lock in the conservative scheduler foundation before enabling real parallel execution.",
+      "tasks": [
+        "Add tests for optional Phase4 safety fields.",
+        "Add tests for invalid parallel_safety.",
+        "Add tests for resource-lock conflict visibility.",
+        "Add tests for stop-leasing stall reason.",
+        "Add tests that normal sequential dispatch still works."
+      ],
+      "candidate_files": [
+        "tests/task-parallelization-scheduler.ps1",
+        "tests/regression.ps1"
+      ],
+      "acceptance": [
+        "Targeted scheduler tests cover contract fields, resource locks, stop_leasing, and sequential dispatch.",
+        "Regression tests preserve backwards compatibility for Phase4 tasks without optional safety fields."
+      ],
+      "verification": [
+        "Run tests/task-parallelization-scheduler.ps1.",
+        "Run tests/task-parallelization-prep.ps1.",
+        "Run tests/regression.ps1."
+      ]
+    }
+  ],
+  "recommended_order": [
+    "CPS-01",
+    "CPS-02",
+    "CPS-03",
+    "CPS-04"
+  ],
+  "worker_split": [
+    {
+      "worker": "A",
+      "owns": [
+        "CPS-01"
+      ],
+      "write_scope": [
+        "app/core/artifact-validator.ps1",
+        "app/prompts/phases/phase4.md",
+        "app/prompts/phases/phase4-1.md"
+      ],
+      "notes": "Do not touch scheduler helpers or UI summary files. Parent owns regression.ps1 edits if needed."
+    },
+    {
+      "worker": "B",
+      "owns": [
+        "CPS-02"
+      ],
+      "write_scope": [
+        "app/core/workflow-engine.ps1",
+        "app/core/run-state-store.ps1",
+        "tests/task-parallelization-scheduler.ps1"
+      ],
+      "notes": "Do not enable max_parallel_jobs > 1 execution."
+    },
+    {
+      "worker": "C",
+      "owns": [
+        "CPS-03"
+      ],
+      "write_scope": [
+        "app/ui/task-lane-summary.ps1",
+        "watch-run.ps1",
+        "app/ui/dashboard-renderer.ps1",
+        "app/ui/run-summary-renderer.ps1",
+        "tests/task-parallelization-scheduler.ps1"
+      ],
+      "notes": "Use public helper functions from workflow-engine if present; do not duplicate scheduler policy in renderers. If tests/task-parallelization-scheduler.ps1 already exists, append UI summary assertions in a separate section and avoid editing Worker B's assertions."
+    }
+  ],
+  "global_acceptance": [
+    "Plans exist as Markdown and JSON under docs/plans.",
+    "Existing task-parallelization-prep tests still pass.",
+    "Existing regression suite still passes.",
+    "No production path leases more than one job.",
+    "Task-lane state and monitor data can explain ready, dependency wait, resource lock wait, stop-leasing, and active-job capacity states."
+  ],
+  "llm_execution_guidance": {
+    "preferred_first_slice": "Implement CPS-01, CPS-02, and CPS-03 as separate write scopes, then add or adjust tests through CPS-04.",
+    "do_not_do": [
+      "Do not enable more than one active job.",
+      "Do not run provider execution outside the existing sequential step.",
+      "Do not implement worker pools.",
+      "Do not remove compatibility fields.",
+      "Do not rewrite unrelated phase logic."
+    ],
+    "verification_policy": "Workers may add targeted tests, but the parent agent runs final targeted and full regression checks."
+  }
+}
