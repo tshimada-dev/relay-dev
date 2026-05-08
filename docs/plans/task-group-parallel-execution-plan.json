@@ -1,0 +1,311 @@
+{
+  "plan_id": "task-group-parallel-execution",
+  "title": "Task Group Parallel Execution Plan",
+  "status": "draft",
+  "source_markdown": "docs/plans/task-group-parallel-execution-plan.md",
+  "purpose": "Move relay-dev task parallelization from phase-level parallelism to task-lifecycle parallelism, where each worker owns one task from Phase5 through Phase6 and the parent group completes only after every worker reaches an accepted Phase6 result.",
+  "current_model": {
+    "name": "phase-level parallelism",
+    "shape": [
+      "T-01 Phase5",
+      "T-02 Phase5",
+      "T-03 Phase5"
+    ],
+    "known_problems": [
+      "A worker failure in Phase5 can fail the parent run while sibling workers are still running.",
+      "Failed job attribution can diverge from the parent current_task_id.",
+      "Parent run-state observes partial per-task phase transitions instead of a coherent group result.",
+      "Artifact paths are fragile when a worker writes artifacts inside an isolated workspace but the parent validator expects parent-side staged artifacts.",
+      "Automatic failed-run recovery can retry the parent cursor rather than the actual failed worker task."
+    ]
+  },
+  "target_model": {
+    "name": "task-lifecycle parallelism",
+    "worker_lifecycle": [
+      "Phase5",
+      "Phase5-1",
+      "Phase5-2",
+      "Phase6"
+    ],
+    "group_completion_rule": "All workers finish Phase6 with accepted go or conditional_go semantics, then group merge and commit succeed.",
+    "parent_state_rule": "Parent run-state records group progress and final worker results, but does not advance through each worker's intermediate task phases as the canonical workflow cursor."
+  },
+  "non_goals": [
+    "Do not remove the existing sequential step path.",
+    "Do not make group execution the only parallel implementation in the first slice.",
+    "Do not bypass Phase5, Phase5-1, Phase5-2, or Phase6 validators.",
+    "Do not allow workers to commit directly to canonical parent artifacts mid-lifecycle.",
+    "Do not auto-resolve merge conflicts.",
+    "Do not let failed group recovery retry the parent cursor without worker/task attribution.",
+    "Do not infer broad directory conflicts beyond exact changed_files overlap in the first slice."
+  ],
+  "first_slice_decisions": [
+    "Implement only group data model, deterministic group dry-run planning, read-only show rendering, and scheduler/file-lock tests.",
+    "Do not run worker lifecycles in the first slice.",
+    "Do not merge product changes or commit group artifacts in the first slice.",
+    "Default group policy is wait_for_siblings: no fail-fast unless explicitly configured later.",
+    "Future group commit policy starts as all-or-nothing: if any worker fails or merge fails, the group does not partially commit canonical outputs.",
+    "Approval-capable worker execution is deferred. Until worker lifecycle exists, group planning must not imply approval handling is implemented.",
+    "Recovery implementation is deferred. The first slice may add data fields needed for attribution, but it must not auto-retry groups."
+  ],
+  "data_model": {
+    "task_groups": {
+      "key": "group_id",
+      "fields": [
+        "status",
+        "phase_range",
+        "worker_ids",
+        "created_at",
+        "updated_at",
+        "failure_summary"
+      ],
+      "statuses": [
+        "running",
+        "succeeded",
+        "failed",
+        "waiting_approval",
+        "partial_failed"
+      ]
+    },
+    "task_group_workers": {
+      "key": "worker_id",
+      "fields": [
+        "group_id",
+        "task_id",
+        "status",
+        "current_phase",
+        "workspace_path",
+        "lease_token",
+        "declared_changed_files",
+        "resource_locks",
+        "result_summary"
+      ],
+      "statuses": [
+        "queued",
+        "running",
+        "succeeded",
+        "failed",
+        "waiting_approval"
+      ]
+    }
+  },
+  "tasks": [
+    {
+      "id": "TGP-01",
+      "title": "Group Planning And Leasing",
+      "summary": "Add a group planner that uses the existing batch scheduler but produces one group package instead of independent phase jobs.",
+      "acceptance": [
+        "Group candidates respect dependencies, parallel_safety, explicit resource_locks, and implicit file:<changed_file> locks.",
+        "The planner emits a deterministic group_id.",
+        "Each worker package includes task contract, declared files, phase range, workspace path, and initial lease metadata.",
+        "Parent run-state records the group as active before worker processes launch.",
+        "Existing parallel-step behavior remains available for comparison until the group path is validated.",
+        "First-slice test coverage includes dry-run group planning, deterministic group ids, and explicit plus implicit lock conflicts."
+      ],
+      "candidate_files": [
+        "app/cli.ps1",
+        "app/core/workflow-engine.ps1",
+        "app/core/parallel-job-packages.ps1",
+        "app/core/run-state-store.ps1"
+      ],
+      "dependencies": [],
+      "test_requirements": [
+        "Dry-run group planning returns a deterministic group package without launching workers.",
+        "Explicit resource_locks and implicit file locks both prevent same-group conflicts.",
+        "Existing parallel-step behavior remains unchanged."
+      ],
+      "risk": "high"
+    },
+    {
+      "id": "TGP-02",
+      "title": "Worker-Local Phase Loop",
+      "summary": "Add a worker command that runs the task lifecycle loop locally.",
+      "acceptance": [
+        "A worker starts at Phase5 for its assigned task.",
+        "After each phase, the worker validates required artifacts before moving to the next phase.",
+        "Phase5-1 and Phase5-2 consume worker-local Phase5 artifacts, not parent canonical artifacts.",
+        "Phase6 consumes worker-local validated outputs.",
+        "Worker status is heartbeated to the parent group state.",
+        "A worker stops on invalid artifact, provider error, timeout, approval pause, or invalid transition.",
+        "Test coverage includes a fake-provider worker loop through Phase5 to Phase6 and invalid-artifact stop behavior."
+      ],
+      "candidate_files": [
+        "app/cli.ps1",
+        "app/core/parallel-worker.ps1",
+        "app/core/phase-execution-transaction.ps1",
+        "app/core/phase-validation-pipeline.ps1"
+      ],
+      "dependencies": [
+        "TGP-01",
+        "TGP-03"
+      ],
+      "test_requirements": [
+        "Fake-provider worker loop completes Phase5 through Phase6 for one task.",
+        "Invalid worker-local artifacts stop the worker before advancing."
+      ],
+      "risk": "high"
+    },
+    {
+      "id": "TGP-03",
+      "title": "Worker Artifact Repository Boundary",
+      "summary": "Make artifact storage explicit for group workers.",
+      "acceptance": [
+        "Worker output paths resolve inside the worker package artifact root.",
+        "Worker validators read the same artifact root that prompts tell providers to write.",
+        "Parent canonical artifacts are not touched until group commit.",
+        "Artifact paths are recorded with enough metadata for debugging and replay.",
+        "The old isolated-workspace path mismatch is covered by a regression test.",
+        "Test coverage proves worker prompts and validators resolve the same artifact root."
+      ],
+      "candidate_files": [
+        "app/core/artifact-repository.ps1",
+        "app/core/phase-validation-pipeline.ps1",
+        "app/core/phase-completion-committer.ps1",
+        "app/core/parallel-worker.ps1"
+      ],
+      "dependencies": [
+        "TGP-01"
+      ],
+      "test_requirements": [
+        "Worker prompt output paths and validation paths resolve to the same artifact root.",
+        "Parent canonical artifacts remain untouched during worker-local validation."
+      ],
+      "risk": "high"
+    },
+    {
+      "id": "TGP-04",
+      "title": "Group Coordinator And Result Aggregation",
+      "summary": "Add a parent coordinator that launches workers, waits for them, and aggregates results before mutating the parent workflow.",
+      "acceptance": [
+        "Parent does not mark the run failed while sibling workers are still running unless the configured policy is fail-fast.",
+        "Default policy lets running siblings finish, then reports a group-level result.",
+        "Group result includes one row per worker with task id, final phase, status, errors, artifact refs, and changed files.",
+        "Parent JSON output exposes group status and worker summaries.",
+        "show renders active group state without pretending the parent cursor is a single worker task.",
+        "Test coverage includes one worker failing while sibling workers finish and parent reports a group-level failure."
+      ],
+      "candidate_files": [
+        "app/core/parallel-launcher.ps1",
+        "app/core/workflow-engine.ps1",
+        "app/ui/task-lane-summary.ps1",
+        "app/ui/run-summary-renderer.ps1"
+      ],
+      "dependencies": [
+        "TGP-01",
+        "TGP-02",
+        "TGP-03"
+      ],
+      "test_requirements": [
+        "Parent aggregation waits for sibling workers by default.",
+        "Group-level failure preserves per-worker status and errors.",
+        "show exposes active group state without misleading current_task_id attribution."
+      ],
+      "risk": "high"
+    },
+    {
+      "id": "TGP-05",
+      "title": "Group Merge And Commit",
+      "summary": "Move product merge and canonical artifact commit to the group boundary.",
+      "acceptance": [
+        "Only workers that reached accepted Phase6 are eligible for merge.",
+        "Merge checks parent workspace drift before copying worker changes.",
+        "Exact changed_files overlap is prevented by scheduling, but merge still detects conflicts.",
+        "Canonical artifacts for Phase5 through Phase6 are committed after successful worker validation and group merge.",
+        "If merge fails, the group fails with conflict details and no partial canonical commit.",
+        "Test coverage includes successful all-or-nothing commit and rejected conflict with no partial canonical commit."
+      ],
+      "candidate_files": [
+        "app/core/parallel-workspace.ps1",
+        "app/core/phase-completion-committer.ps1",
+        "app/core/artifact-repository.ps1",
+        "app/core/workflow-engine.ps1"
+      ],
+      "dependencies": [
+        "TGP-02",
+        "TGP-03",
+        "TGP-04"
+      ],
+      "test_requirements": [
+        "All successful workers can be merged and committed atomically.",
+        "Merge conflicts fail the group and do not partially commit canonical artifacts."
+      ],
+      "risk": "high"
+    },
+    {
+      "id": "TGP-06",
+      "title": "Recovery And Retry Semantics",
+      "summary": "Make recovery group-aware.",
+      "acceptance": [
+        "Failed group recovery keys include group_id, worker_id, task_id, and final phase.",
+        "Automatic failed-run resume must not retry the parent cursor when a worker-specific failure caused the group failure.",
+        "Retrying a failed worker preserves successful sibling outputs unless the group policy chooses full group retry.",
+        "Stale worker recovery uses heartbeat plus process liveness and can clear or mark only the affected worker.",
+        "Manual stop leaves the group in a state that resumes predictably.",
+        "Test coverage includes failed-worker attribution and no parent-cursor retry on worker-specific failures."
+      ],
+      "candidate_files": [
+        "agent-loop.ps1",
+        "app/cli.ps1",
+        "app/core/workflow-engine.ps1",
+        "app/core/run-state-store.ps1"
+      ],
+      "dependencies": [
+        "TGP-01",
+        "TGP-04",
+        "TGP-05"
+      ],
+      "test_requirements": [
+        "Failed-worker recovery attribution includes group_id, worker_id, task_id, and final phase.",
+        "Auto-resume does not retry parent current_task_id for worker-specific group failures."
+      ],
+      "risk": "high"
+    },
+    {
+      "id": "TGP-07",
+      "title": "Tests And Rollout",
+      "summary": "Add cross-slice tests before making group execution the default path. Per-slice tests are attached to each implementation task.",
+      "acceptance": [
+        "Unit tests cover group planning with explicit and implicit file locks.",
+        "Headless group execution test runs at least two workers through Phase5 to Phase6 using a fake provider.",
+        "Regression test covers worker-local artifacts being found and validated.",
+        "Regression test covers one worker failing while siblings finish and parent reports a group-level failure.",
+        "Recovery test covers failed worker retry attribution.",
+        "Existing sequential step and current parallel-step tests continue to pass."
+      ],
+      "candidate_files": [
+        "tests/task-group-parallel-execution.ps1",
+        "tests/task-parallelization-headless-execution.ps1",
+        "tests/task-parallelization-scheduler.ps1",
+        "tests/regression.ps1"
+      ],
+      "dependencies": [
+        "TGP-01",
+        "TGP-02",
+        "TGP-03",
+        "TGP-04",
+        "TGP-05",
+        "TGP-06"
+      ],
+      "test_requirements": [
+        "Full fake-provider group execution test passes.",
+        "Sequential step and existing parallel-step regressions continue to pass."
+      ],
+      "risk": "medium"
+    }
+  ],
+  "rollout": [
+    "Add data model and read-only show rendering for active groups.",
+    "Add group-step --dry-run to produce candidate groups without launching workers.",
+    "Add fake-provider headless group execution.",
+    "Add worker-local artifact root and validation.",
+    "Add group boundary merge/commit.",
+    "Add recovery and retry behavior.",
+    "Gate default step to prefer group execution only after the above tests pass with a real provider smoke run."
+  ],
+  "deferred_questions": [
+    "Should a later group merge require an explicit group-level review phase after all worker Phase6 results pass?",
+    "Should a later version support partial successful-worker commit after all-or-nothing group commit is stable?",
+    "Should Phase5-1 and Phase5-2 reviewers run as separate provider invocations inside the same worker process, or as child worker commands with the same worker artifact root?",
+    "How should group execution interact with human approval phases once approval-capable workers are implemented?"
+  ]
+}

@@ -1,0 +1,300 @@
+{
+  "plan_id": "task-group-parallel-lifecycle-implementation",
+  "parent_plan": "docs/plans/task-group-parallel-execution-plan.json",
+  "status": "draft-for-review",
+  "purpose": "Implement the next task-group slice after dry-run planning: worker-local lifecycle execution, group coordination, all-or-nothing merge/commit, and group-aware recovery.",
+  "already_available": [
+    "Run-state compatibility fields: task_groups and task_group_workers.",
+    "Deterministic dry-run group planner: New-TaskGroupParallelPlan.",
+    "CLI dry-run entrypoint: group-step.",
+    "Read-only show summary for task groups and workers.",
+    "Scheduler file-lock protection based on changed_files."
+  ],
+  "slice_boundaries": {
+    "in_scope": [
+      "Create executable task-group packages from the dry-run planner.",
+      "Run one worker through Phase5, Phase5-1, Phase5-2, and Phase6 using worker-local artifact roots.",
+      "Launch multiple group workers and wait for all siblings by default.",
+      "Aggregate per-worker result rows into parent task group state.",
+      "Merge successful worker product changes and canonical artifacts at the group boundary only.",
+      "Record group-aware failure and stale recovery attribution."
+    ],
+    "out_of_scope": [
+      "Making group execution the default step path.",
+      "Human approval-capable group workers beyond reporting waiting_approval.",
+      "Automatic conflict resolution.",
+      "Partial successful-worker commit.",
+      "Broad directory-level conflict inference beyond exact declared changed_files."
+    ],
+    "default_policies": {
+      "sibling_failure_policy": "wait_for_siblings",
+      "commit_policy": "all_or_nothing",
+      "retry_policy": "minimal_worker_attribution_recovery_for_this_slice"
+    }
+  },
+  "shared_contracts": {
+    "status_schema_note": "This slice extends the parent plan status schema. planned is used after executable package creation and before coordinator launch. running is set when the coordinator begins launching workers. stale is used for attributed stale worker/group recovery. Existing first-slice readers must continue to tolerate unknown future statuses by rendering them as strings.",
+    "task_group_status_rules": {
+      "planned": "Executable group package exists and parent run-state has queued workers, but no worker process launch has begun.",
+      "running": "Coordinator has started launching or waiting for worker processes.",
+      "succeeded": "Every worker succeeded through accepted Phase6 and group merge/commit succeeded.",
+      "partial_failed": "At least one worker succeeded and at least one worker failed, or a later merge/commit failure occurred after one or more worker successes.",
+      "failed": "No worker produced a successful accepted Phase6 result, or package/coordinator setup failed before any worker could succeed.",
+      "waiting_approval": "At least one worker or group boundary is paused for approval.",
+      "stale": "Recovery detected stale group or worker execution and attributed it without retrying the parent cursor."
+    },
+    "task_group_statuses": [
+      "planned",
+      "running",
+      "succeeded",
+      "failed",
+      "waiting_approval",
+      "partial_failed",
+      "stale"
+    ],
+    "task_group_worker_statuses": [
+      "queued",
+      "running",
+      "succeeded",
+      "failed",
+      "waiting_approval",
+      "stale"
+    ],
+    "worker_phase_sequence": [
+      "Phase5",
+      "Phase5-1",
+      "Phase5-2",
+      "Phase6"
+    ],
+    "group_package_minimum_fields": [
+      "schema_version",
+      "package_kind",
+      "run_id",
+      "group_id",
+      "phase_range",
+      "created_at",
+      "workers",
+      "provider_spec",
+      "workspace_mode",
+      "commit_policy"
+    ],
+    "worker_package_minimum_fields": [
+      "worker_id",
+      "group_id",
+      "task_id",
+      "phase_sequence",
+      "selected_task",
+      "workspace_path",
+      "artifact_root",
+      "declared_changed_files",
+      "resource_locks",
+      "lease_token"
+    ],
+    "worker_result_minimum_fields": [
+      "worker_id",
+      "group_id",
+      "task_id",
+      "status",
+      "final_phase",
+      "errors",
+      "artifact_refs",
+      "changed_files",
+      "workspace_path"
+    ]
+  },
+  "implementation_tasks": [
+    {
+      "id": "LCR-01",
+      "title": "Executable Group Package And Parent Leasing",
+      "goal": "Turn a dry-run task-group plan into a persisted executable group package and parent run-state lease without launching workers.",
+      "write_scope": [
+        "app/core/parallel-job-packages.ps1",
+        "app/core/run-state-store.ps1",
+        "tests/task-group-parallel-package.ps1"
+      ],
+      "acceptance": [
+        "Executable group package reuses scheduler-selected candidates and deterministic group_id.",
+        "Parent run-state records one planned task_group and queued task_group_workers before launch.",
+        "The package contains one worker package per candidate with artifact_root and workspace_path.",
+        "No canonical phase artifacts or product changes are committed during package creation.",
+        "Existing group-step dry-run behavior remains unchanged unless an explicit execute/create-package switch is used internally."
+      ],
+      "tests": [
+        "Package creation mutates only task_groups/task_group_workers and active lease metadata needed for fencing.",
+        "Dry-run still leaves task_groups/task_group_workers empty.",
+        "Package worker entries include artifact_root matching validator expectations."
+      ],
+      "depends_on": []
+    },
+    {
+      "id": "LCR-02",
+      "title": "Worker-Local Artifact Boundary",
+      "goal": "Make artifact reads/writes explicit for group workers so prompts and validators use the same worker-local artifact root.",
+      "write_scope": [
+        "app/core/artifact-repository.ps1",
+        "app/core/phase-validation-pipeline.ps1",
+        "app/core/phase-completion-committer.ps1",
+        "tests/task-group-parallel-artifacts.ps1"
+      ],
+      "acceptance": [
+        "Worker artifact paths resolve under the worker artifact_root.",
+        "Worker validation reads from the same artifact_root advertised to provider prompts.",
+        "Parent canonical artifact roots are untouched until group commit.",
+        "Artifact refs are serializable into worker result rows."
+      ],
+      "tests": [
+        "Prompt output path and validator input path are identical for worker-local artifacts.",
+        "Worker-local validation does not create or overwrite parent canonical artifacts."
+      ],
+      "depends_on": [
+        "LCR-01"
+      ]
+    },
+    {
+      "id": "LCR-03",
+      "title": "Worker Phase Loop",
+      "goal": "Add a worker command that runs Phase5 -> Phase5-1 -> Phase5-2 -> Phase6 for exactly one task.",
+      "write_scope": [
+        "app/cli.ps1",
+        "app/core/parallel-worker.ps1",
+        "app/core/phase-execution-transaction.ps1",
+        "tests/task-group-parallel-worker-loop.ps1"
+      ],
+      "acceptance": [
+        "Worker starts at Phase5 and advances only after phase validation passes.",
+        "Worker updates parent group worker status and heartbeat after each phase.",
+        "Worker stops with failed status on provider error, invalid artifact, timeout, or invalid transition.",
+        "Worker returns a worker_result row with final_phase, errors, artifact_refs, changed_files, and workspace_path.",
+        "Worker does not directly commit canonical parent artifacts."
+      ],
+      "tests": [
+        "Fake-provider worker completes Phase5 through Phase6.",
+        "Invalid artifact stops the worker before advancing and records failed attribution."
+      ],
+      "depends_on": [
+        "LCR-01",
+        "LCR-02"
+      ]
+    },
+    {
+      "id": "LCR-04",
+      "title": "Group Coordinator And Aggregation",
+      "goal": "Add parent coordinator execution that launches group workers, waits for all siblings, and writes group-level results.",
+      "write_scope": [
+        "app/core/parallel-launcher.ps1",
+        "app/cli.ps1",
+        "app/ui/task-lane-summary.ps1",
+        "tests/task-group-parallel-coordinator.ps1"
+      ],
+      "acceptance": [
+        "Coordinator launches one worker process per worker package.",
+        "Default behavior waits for siblings even when one worker fails.",
+        "While one worker has failed and at least one sibling is still running, the parent run and task_group must not be marked as terminal failed.",
+        "Coordinator moves the task_group from planned to running before launching worker processes.",
+        "Group state becomes succeeded only when every worker succeeds.",
+        "Group state becomes partial_failed when at least one worker succeeded and at least one worker failed.",
+        "Group state becomes failed when no worker produced a successful accepted Phase6 result, or coordinator setup failed before worker success.",
+        "Parent JSON output exposes group and worker results."
+      ],
+      "tests": [
+        "One failed worker plus one successful sibling produces group-level failure after both finish.",
+        "A failed worker while a sibling is still running keeps the group non-terminal until the sibling finishes.",
+        "All successful workers produce a succeeded group result before merge/commit is attempted."
+      ],
+      "depends_on": [
+        "LCR-03"
+      ]
+    },
+    {
+      "id": "LCR-05",
+      "title": "All-Or-Nothing Group Merge And Commit",
+      "goal": "Merge worker product changes and canonical artifacts only at the group boundary.",
+      "write_scope": [
+        "app/core/parallel-workspace.ps1",
+        "app/core/phase-completion-committer.ps1",
+        "app/core/artifact-repository.ps1",
+        "tests/task-group-parallel-merge.ps1"
+      ],
+      "acceptance": [
+        "Only succeeded Phase6 workers are eligible for merge.",
+        "Merge validates parent workspace drift before copying declared changed_files.",
+        "Merge conflict fails the group and records conflict details.",
+        "No partial canonical artifact commit occurs when any merge fails.",
+        "Successful group commit copies worker artifacts to canonical parent artifacts after product merge succeeds."
+      ],
+      "tests": [
+        "Two successful non-conflicting workers merge and commit atomically.",
+        "A merge conflict fails without partial product or canonical artifact commit."
+      ],
+      "depends_on": [
+        "LCR-02",
+        "LCR-04"
+      ]
+    },
+    {
+      "id": "LCR-06",
+      "title": "Minimal Group-Aware Recovery Behavior",
+      "goal": "Prevent worker-specific failures from being recovered as parent cursor retries, and mark stale workers with group/task attribution.",
+      "write_scope": [
+        "app/core/workflow-engine.ps1",
+        "app/core/run-state-store.ps1",
+        "agent-loop.ps1",
+        "tests/task-group-parallel-recovery.ps1"
+      ],
+      "acceptance": [
+        "Failed group recovery metadata includes group_id, worker_id, task_id, and final_phase.",
+        "Automatic failed-run resume does not retry parent current_task_id for worker-specific group failures.",
+        "A failed run resumed by CLI or agent-loop must not re-dispatch the same parent current_phase/current_task_id when the failure source is a task_group worker.",
+        "Worker attribution remains visible after resume suppression so the operator can choose worker retry or full group retry later.",
+        "Stale worker recovery marks only the affected worker and updates group status without clearing sibling success.",
+        "Manual stop leaves group state resumable with explicit group recovery metadata."
+      ],
+      "tests": [
+        "Worker-specific failure is not converted into parent cursor retry.",
+        "A failed-run resume scenario preserves group_id, worker_id, task_id, and final_phase and does not enqueue the parent cursor again.",
+        "Stale worker recovery marks the affected worker while preserving sibling result rows."
+      ],
+      "depends_on": [
+        "LCR-04",
+        "LCR-05"
+      ]
+    }
+  ],
+  "parallelization_strategy": {
+    "stage_1_serial": [
+      "LCR-01"
+    ],
+    "stage_2_after_lcr_01": [
+      "LCR-02"
+    ],
+    "stage_3_after_lcr_02": [
+      "LCR-03"
+    ],
+    "stage_4_after_lcr_03": [
+      "LCR-04"
+    ],
+    "stage_5_after_lcr_04": [
+      "LCR-05"
+    ],
+    "stage_6_after_group_commit_shape": [
+      "LCR-06"
+    ],
+    "parallelizable_support_work": [
+      "Dedicated focused tests may be authored in parallel with implementation when they do not edit the same production files.",
+      "Read-only UI summary refinements may run in parallel with recovery implementation if they avoid workflow-engine, run-state-store, and agent-loop.",
+      "Core production implementation should follow the serial dependency chain unless a reviewer identifies a smaller disjoint write scope."
+    ],
+    "parent_responsibilities": [
+      "Own TODO status updates.",
+      "Resolve integration conflicts between workers.",
+      "Run final parse/build/test checks.",
+      "Do not delegate final verification."
+    ]
+  },
+  "review_questions": [
+    "Are dependencies strict enough to avoid workers implementing against unstable shared contracts?",
+    "Are write scopes sufficiently separated for low-conflict parallel workers?",
+    "Is the recovery task appropriately limited to minimal worker-attribution behavior after group commit shape exists?",
+    "Are acceptance tests concrete enough to catch the previous failed-run resume loop and artifact-root mismatch?"
+  ]
+}

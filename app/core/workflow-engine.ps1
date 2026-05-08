@@ -14,6 +14,54 @@ function Test-TaskScopedPhase {
     return $Phase -in @("Phase5", "Phase5-1", "Phase5-2", "Phase6")
 }
 
+function Get-ConfiguredExecutionMode {
+    $modeVariable = Get-Variable -Name ExecutionMode -Scope Script -ErrorAction SilentlyContinue
+    $mode = if ($modeVariable) { [string]$modeVariable.Value } else { "auto" }
+    $mode = $mode.Trim().ToLowerInvariant()
+    if ($mode -notin @("single", "auto", "parallel")) {
+        return "auto"
+    }
+
+    return $mode
+}
+
+function Get-ConfiguredMaxParallelJobs {
+    $maxVariable = Get-Variable -Name ExecutionMaxParallelJobs -Scope Script -ErrorAction SilentlyContinue
+    $maxParallelJobs = 2
+    if ($maxVariable) {
+        [void][int]::TryParse([string]$maxVariable.Value, [ref]$maxParallelJobs)
+    }
+    if ($maxParallelJobs -lt 1) {
+        $maxParallelJobs = 1
+    }
+
+    return $maxParallelJobs
+}
+
+function Enable-ConfiguredTaskLaneParallelism {
+    param([Parameter(Mandatory)]$RunState)
+
+    $state = Initialize-RunStateCompatibilityFields -RunState $RunState
+    $mode = Get-ConfiguredExecutionMode
+    if ($mode -eq "single") {
+        return $state
+    }
+
+    $taskLane = ConvertTo-RelayHashtable -InputObject $state["task_lane"]
+    if (-not $taskLane) {
+        $taskLane = [ordered]@{}
+    }
+
+    $taskLane["mode"] = "parallel"
+    $taskLane["max_parallel_jobs"] = Get-ConfiguredMaxParallelJobs
+    if (-not $taskLane.ContainsKey("stop_leasing") -or $null -eq $taskLane["stop_leasing"]) {
+        $taskLane["stop_leasing"] = $false
+    }
+    $state["task_lane"] = $taskLane
+
+    return $state
+}
+
 function New-TaskState {
     param(
         [Parameter(Mandatory)][string]$TaskId,
@@ -225,6 +273,63 @@ function Get-TaskContractResourceLocks {
     return @($locks.ToArray())
 }
 
+function Merge-TaskSchedulerLocks {
+    param([AllowNull()]$Locks)
+
+    $merged = New-Object System.Collections.Generic.List[string]
+    foreach ($lockId in @($Locks)) {
+        $normalizedLockId = ([string]$lockId).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($normalizedLockId) -and $normalizedLockId -notin @($merged.ToArray())) {
+            $merged.Add($normalizedLockId)
+        }
+    }
+
+    return @($merged.ToArray())
+}
+
+function Get-TaskContractChangedFileLocks {
+    param([AllowNull()]$TaskContract)
+
+    $task = ConvertTo-RelayHashtable -InputObject $TaskContract
+    if (-not ($task -is [System.Collections.IDictionary]) -or -not $task.ContainsKey("changed_files")) {
+        return @()
+    }
+
+    $locks = New-Object System.Collections.Generic.List[string]
+    foreach ($rawPath in @($task["changed_files"])) {
+        $normalized = ([string]$rawPath).Trim()
+        if ([string]::IsNullOrWhiteSpace($normalized)) {
+            continue
+        }
+
+        $normalized = $normalized -replace '\\', '/'
+        while ($normalized.StartsWith("./")) {
+            $normalized = $normalized.Substring(2)
+        }
+        $normalized = $normalized.Trim("/")
+        if (
+            [string]::IsNullOrWhiteSpace($normalized) -or
+            [System.IO.Path]::IsPathRooted($normalized) -or
+            $normalized -match '(^|/)\.\.(/|$)'
+        ) {
+            continue
+        }
+
+        $lockId = "file:$($normalized.ToLowerInvariant())"
+        if ($lockId -notin @($locks.ToArray())) {
+            $locks.Add($lockId)
+        }
+    }
+
+    return @($locks.ToArray())
+}
+
+function Get-TaskContractSchedulingLocks {
+    param([AllowNull()]$TaskContract)
+
+    return (Merge-TaskSchedulerLocks -Locks (@(Get-TaskContractResourceLocks -TaskContract $TaskContract) + @(Get-TaskContractChangedFileLocks -TaskContract $TaskContract)))
+}
+
 function Get-TaskContractParallelSafety {
     param([AllowNull()]$TaskContract)
 
@@ -266,7 +371,8 @@ function Get-ActiveTaskSchedulerConstraints {
             $contract = Resolve-TaskContract -ProjectRoot $ProjectRoot -RunId $runId -RunState $state -TaskId $taskId
         }
 
-        $locks = if ($lease.ContainsKey("resource_locks")) { @($lease["resource_locks"]) } else { @(Get-TaskContractResourceLocks -TaskContract $contract) }
+        $leaseLocks = if ($lease.ContainsKey("resource_locks")) { @($lease["resource_locks"]) } else { @(Get-TaskContractResourceLocks -TaskContract $contract) }
+        $locks = Merge-TaskSchedulerLocks -Locks (@($leaseLocks) + @(Get-TaskContractChangedFileLocks -TaskContract $contract))
         $parallelSafety = if (-not [string]::IsNullOrWhiteSpace([string]$lease["parallel_safety"])) { [string]$lease["parallel_safety"] } else { Get-TaskContractParallelSafety -TaskContract $contract }
 
         $active.Add([ordered]@{
@@ -292,10 +398,10 @@ function Test-TaskDispatchEligibility {
     $runId = [string]$state["run_id"]
     $taskState = if ($state["task_states"].ContainsKey($TaskId)) { ConvertTo-RelayHashtable -InputObject $state["task_states"][$TaskId] } else { $null }
     $contract = if ($taskState) { Resolve-TaskContract -ProjectRoot $ProjectRoot -RunId $runId -RunState $state -TaskId $TaskId } else { $null }
-    $resourceLocks = @(Get-TaskContractResourceLocks -TaskContract $contract)
+    $resourceLocks = @(Get-TaskContractSchedulingLocks -TaskContract $contract)
     $parallelSafety = Get-TaskContractParallelSafety -TaskContract $contract
-    if ($resourceLocks.Count -eq 0 -and $taskState -and $taskState.ContainsKey("resource_locks")) {
-        $resourceLocks = @(Get-TaskContractResourceLocks -TaskContract $taskState)
+    if ($taskState) {
+        $resourceLocks = @(Merge-TaskSchedulerLocks -Locks (@($resourceLocks) + @(Get-TaskContractSchedulingLocks -TaskContract $taskState)))
     }
     if ($taskState -and $taskState.ContainsKey("parallel_safety") -and -not [string]::IsNullOrWhiteSpace([string]$taskState["parallel_safety"])) {
         $taskStateSafety = ([string]$taskState["parallel_safety"]).Trim().ToLowerInvariant()
@@ -410,6 +516,25 @@ function Get-TaskDispatchEligibility {
     return @($items.ToArray())
 }
 
+function Resolve-TaskLaneCandidatePhase {
+    param(
+        [Parameter(Mandatory)]$TaskState,
+        [Parameter(Mandatory)][string]$CurrentPhase
+    )
+
+    $taskPhase = if ($TaskState -and $TaskState.ContainsKey("phase_cursor")) { [string]$TaskState["phase_cursor"] } else { "" }
+    if (-not [string]::IsNullOrWhiteSpace($taskPhase)) {
+        return $taskPhase
+    }
+
+    $taskStatus = if ($TaskState -and $TaskState.ContainsKey("status")) { [string]$TaskState["status"] } else { "" }
+    if ($taskStatus -eq "ready") {
+        return "Phase5"
+    }
+
+    return $CurrentPhase
+}
+
 function Get-BatchLeaseCandidates {
     param(
         [Parameter(Mandatory)]$RunState,
@@ -462,6 +587,16 @@ function Get-BatchLeaseCandidates {
 
         $taskId = [string]$taskIdRaw
         if ([string]::IsNullOrWhiteSpace($taskId) -or $taskId -in $activeTaskIds -or $taskId -in @($selectedTaskIds.ToArray())) {
+            continue
+        }
+
+        if (-not $state["task_states"].ContainsKey($taskId)) {
+            continue
+        }
+
+        $taskState = ConvertTo-RelayHashtable -InputObject $state["task_states"][$taskId]
+        $candidatePhase = Resolve-TaskLaneCandidatePhase -TaskState $taskState -CurrentPhase $phase
+        if ($candidatePhase -ne $phase) {
             continue
         }
 
@@ -914,6 +1049,7 @@ function Repair-StaleActiveJobState {
                 [datetime]::TryParse([string]$activeLease["last_heartbeat_at"], [ref]$lastHeartbeatAt) -and
                 [datetime]::TryParse([string]$activeLease["lease_expires_at"], [ref]$leaseExpiresAt) -and
                 $lastHeartbeatAt -le $now -and
+                $lastHeartbeatAt -ge $now.AddMinutes(-15) -and
                 $leaseExpiresAt -gt $now
             ) {
                 $activeLeaseHasFreshHeartbeat = $true
@@ -1204,6 +1340,7 @@ function Apply-JobResult {
 
     if ($phase -eq "Phase4" -and $artifactObject) {
         $state = Register-PlannedTasks -RunState $state -TasksArtifact $artifactObject
+        $state = Enable-ConfiguredTaskLaneParallelism -RunState $state
     }
 
     if ($phase -eq "Phase7" -and $artifactObject -and [string]$artifactObject["verdict"] -eq "conditional_go") {

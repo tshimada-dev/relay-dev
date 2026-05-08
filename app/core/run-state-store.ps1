@@ -414,12 +414,348 @@ function Initialize-RunStateParallelFields {
     return $state
 }
 
+function New-RunStateTaskGroup {
+    param(
+        [Parameter(Mandatory)][string]$GroupId,
+        [string]$Status = "running",
+        [string]$Phase = "Phase5..Phase6",
+        [string[]]$TaskIds = @(),
+        [string[]]$WorkerIds = @(),
+        [string]$CreatedAt,
+        [string]$UpdatedAt,
+        [string]$FailureSummary
+    )
+
+    $now = (Get-Date).ToString("o")
+    $resolvedCreatedAt = if (-not [string]::IsNullOrWhiteSpace($CreatedAt)) { $CreatedAt } else { $now }
+    $resolvedUpdatedAt = if (-not [string]::IsNullOrWhiteSpace($UpdatedAt)) { $UpdatedAt } else { $resolvedCreatedAt }
+
+    return [ordered]@{
+        id = $GroupId
+        status = $Status
+        phase = $Phase
+        phase_range = $Phase
+        task_ids = @($TaskIds)
+        worker_ids = @($WorkerIds)
+        created_at = $resolvedCreatedAt
+        updated_at = $resolvedUpdatedAt
+        failure_summary = $FailureSummary
+    }
+}
+
+function New-RunStateTaskGroupWorker {
+    param(
+        [Parameter(Mandatory)][string]$WorkerId,
+        [Parameter(Mandatory)][string]$GroupId,
+        [Parameter(Mandatory)][string]$TaskId,
+        [string]$Status = "queued",
+        [string]$Phase = "Phase5",
+        [string]$CreatedAt,
+        [string]$UpdatedAt
+    )
+
+    $now = (Get-Date).ToString("o")
+    $resolvedCreatedAt = if (-not [string]::IsNullOrWhiteSpace($CreatedAt)) { $CreatedAt } else { $now }
+    $resolvedUpdatedAt = if (-not [string]::IsNullOrWhiteSpace($UpdatedAt)) { $UpdatedAt } else { $resolvedCreatedAt }
+
+    return [ordered]@{
+        id = $WorkerId
+        group_id = $GroupId
+        task_id = $TaskId
+        status = $Status
+        phase = $Phase
+        current_phase = $Phase
+        created_at = $resolvedCreatedAt
+        updated_at = $resolvedUpdatedAt
+    }
+}
+
+function Initialize-RunStateTaskGroupFields {
+    param([Parameter(Mandatory)]$RunState)
+
+    $state = ConvertTo-RelayHashtable -InputObject $RunState
+
+    if (-not $state.ContainsKey("task_groups") -or $null -eq $state["task_groups"]) {
+        $state["task_groups"] = @{}
+    }
+    else {
+        $taskGroups = ConvertTo-RelayHashtable -InputObject $state["task_groups"]
+        foreach ($groupId in @($taskGroups.Keys)) {
+            $group = ConvertTo-RelayHashtable -InputObject $taskGroups[$groupId]
+            $resolvedGroupId = if (-not [string]::IsNullOrWhiteSpace([string]$group["id"])) { [string]$group["id"] } else { [string]$groupId }
+            $now = (Get-Date).ToString("o")
+
+            if (-not $group.ContainsKey("id") -or [string]::IsNullOrWhiteSpace([string]$group["id"])) {
+                $group["id"] = $resolvedGroupId
+            }
+            if (-not $group.ContainsKey("status") -or [string]::IsNullOrWhiteSpace([string]$group["status"])) {
+                $group["status"] = "running"
+            }
+            if (-not $group.ContainsKey("phase") -or [string]::IsNullOrWhiteSpace([string]$group["phase"])) {
+                $group["phase"] = if (-not [string]::IsNullOrWhiteSpace([string]$group["phase_range"])) { [string]$group["phase_range"] } else { "Phase5..Phase6" }
+            }
+            if (-not $group.ContainsKey("phase_range") -or [string]::IsNullOrWhiteSpace([string]$group["phase_range"])) {
+                $group["phase_range"] = [string]$group["phase"]
+            }
+            if (-not $group.ContainsKey("task_ids") -or $null -eq $group["task_ids"]) {
+                $group["task_ids"] = @()
+            }
+            else {
+                $group["task_ids"] = @($group["task_ids"])
+            }
+            if (-not $group.ContainsKey("worker_ids") -or $null -eq $group["worker_ids"]) {
+                $group["worker_ids"] = @()
+            }
+            else {
+                $group["worker_ids"] = @($group["worker_ids"])
+            }
+            if (-not $group.ContainsKey("created_at") -or [string]::IsNullOrWhiteSpace([string]$group["created_at"])) {
+                $group["created_at"] = $now
+            }
+            if (-not $group.ContainsKey("updated_at") -or [string]::IsNullOrWhiteSpace([string]$group["updated_at"])) {
+                $group["updated_at"] = [string]$group["created_at"]
+            }
+            if (-not $group.ContainsKey("failure_summary")) {
+                $group["failure_summary"] = $null
+            }
+
+            $taskGroups[$groupId] = $group
+        }
+        $state["task_groups"] = $taskGroups
+    }
+
+    if (-not $state.ContainsKey("task_group_workers") -or $null -eq $state["task_group_workers"]) {
+        $state["task_group_workers"] = @{}
+    }
+    else {
+        $taskGroupWorkers = ConvertTo-RelayHashtable -InputObject $state["task_group_workers"]
+        foreach ($workerId in @($taskGroupWorkers.Keys)) {
+            $worker = ConvertTo-RelayHashtable -InputObject $taskGroupWorkers[$workerId]
+            $resolvedWorkerId = if (-not [string]::IsNullOrWhiteSpace([string]$worker["id"])) { [string]$worker["id"] } else { [string]$workerId }
+            $now = (Get-Date).ToString("o")
+
+            if (-not $worker.ContainsKey("id") -or [string]::IsNullOrWhiteSpace([string]$worker["id"])) {
+                $worker["id"] = $resolvedWorkerId
+            }
+            if (-not $worker.ContainsKey("group_id")) {
+                $worker["group_id"] = $null
+            }
+            if (-not $worker.ContainsKey("task_id")) {
+                $worker["task_id"] = $null
+            }
+            if (-not $worker.ContainsKey("status") -or [string]::IsNullOrWhiteSpace([string]$worker["status"])) {
+                $worker["status"] = "queued"
+            }
+            if (-not $worker.ContainsKey("phase") -or [string]::IsNullOrWhiteSpace([string]$worker["phase"])) {
+                $worker["phase"] = if (-not [string]::IsNullOrWhiteSpace([string]$worker["current_phase"])) { [string]$worker["current_phase"] } else { "Phase5" }
+            }
+            if (-not $worker.ContainsKey("current_phase") -or [string]::IsNullOrWhiteSpace([string]$worker["current_phase"])) {
+                $worker["current_phase"] = [string]$worker["phase"]
+            }
+            if (-not $worker.ContainsKey("created_at") -or [string]::IsNullOrWhiteSpace([string]$worker["created_at"])) {
+                $worker["created_at"] = $now
+            }
+            if (-not $worker.ContainsKey("updated_at") -or [string]::IsNullOrWhiteSpace([string]$worker["updated_at"])) {
+                $worker["updated_at"] = [string]$worker["created_at"]
+            }
+            foreach ($field in @("workspace_path", "artifact_root", "lease_token")) {
+                if (-not $worker.ContainsKey($field)) {
+                    $worker[$field] = $null
+                }
+            }
+            foreach ($field in @("declared_changed_files", "resource_locks")) {
+                if (-not $worker.ContainsKey($field) -or $null -eq $worker[$field]) {
+                    $worker[$field] = @()
+                }
+                else {
+                    $worker[$field] = @($worker[$field])
+                }
+            }
+
+            $taskGroupWorkers[$workerId] = $worker
+        }
+        $state["task_group_workers"] = $taskGroupWorkers
+    }
+
+    return $state
+}
+
 function Initialize-RunStateCompatibilityFields {
     param([Parameter(Mandatory)]$RunState)
 
     $state = Initialize-RunStateActiveAttempt -RunState $RunState
     $state = Initialize-RunStateParallelFields -RunState $state
+    $state = Initialize-RunStateTaskGroupFields -RunState $state
     return $state
+}
+
+function New-TaskGroupRecoveryContext {
+    param(
+        [Parameter(Mandatory)][string]$GroupId,
+        [Parameter(Mandatory)][string]$WorkerId,
+        [string]$TaskId,
+        [string]$FinalPhase
+    )
+
+    return [ordered]@{
+        group_id = $GroupId
+        worker_id = $WorkerId
+        task_id = $TaskId
+        final_phase = $FinalPhase
+    }
+}
+
+function Get-RunStateTaskGroupFailureRecoveryContext {
+    param([Parameter(Mandatory)]$RunState)
+
+    $state = Initialize-RunStateCompatibilityFields -RunState $RunState
+    $candidates = New-Object System.Collections.Generic.List[object]
+    $workers = ConvertTo-RelayHashtable -InputObject $state["task_group_workers"]
+    $groups = ConvertTo-RelayHashtable -InputObject $state["task_groups"]
+
+    foreach ($workerId in @($workers.Keys)) {
+        $worker = ConvertTo-RelayHashtable -InputObject $workers[$workerId]
+        $workerResult = ConvertTo-RelayHashtable -InputObject $worker["worker_result"]
+        $status = if ($workerResult -and -not [string]::IsNullOrWhiteSpace([string]$workerResult["status"])) {
+            [string]$workerResult["status"]
+        }
+        else {
+            [string]$worker["status"]
+        }
+        if ($status -notin @("failed", "partial_failed")) {
+            continue
+        }
+
+        $candidates.Add([ordered]@{
+            group_id = [string]$worker["group_id"]
+            worker_id = if (-not [string]::IsNullOrWhiteSpace([string]$worker["id"])) { [string]$worker["id"] } else { [string]$workerId }
+            task_id = if ($workerResult -and -not [string]::IsNullOrWhiteSpace([string]$workerResult["task_id"])) { [string]$workerResult["task_id"] } else { [string]$worker["task_id"] }
+            final_phase = if ($workerResult -and -not [string]::IsNullOrWhiteSpace([string]$workerResult["final_phase"])) { [string]$workerResult["final_phase"] } else { [string]$worker["final_phase"] }
+            observed_at = if (-not [string]::IsNullOrWhiteSpace([string]$worker["updated_at"])) { [string]$worker["updated_at"] } else { [string]$worker["created_at"] }
+        })
+    }
+
+    foreach ($groupId in @($groups.Keys)) {
+        $group = ConvertTo-RelayHashtable -InputObject $groups[$groupId]
+        foreach ($resultRaw in @($group["worker_results"])) {
+            $result = ConvertTo-RelayHashtable -InputObject $resultRaw
+            if (-not $result -or [string]$result["status"] -notin @("failed", "partial_failed")) {
+                continue
+            }
+
+            $candidates.Add([ordered]@{
+                group_id = if (-not [string]::IsNullOrWhiteSpace([string]$result["group_id"])) { [string]$result["group_id"] } else { [string]$groupId }
+                worker_id = [string]$result["worker_id"]
+                task_id = [string]$result["task_id"]
+                final_phase = [string]$result["final_phase"]
+                observed_at = if (-not [string]::IsNullOrWhiteSpace([string]$result["completed_at"])) { [string]$result["completed_at"] } else { [string]$group["updated_at"] }
+            })
+        }
+    }
+
+    $latest = @($candidates.ToArray()) |
+        Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_["group_id"]) -and -not [string]::IsNullOrWhiteSpace([string]$_["worker_id"]) } |
+        Sort-Object @{ Expression = { [string]$_["observed_at"] }; Descending = $true } |
+        Select-Object -First 1
+
+    if (-not $latest) {
+        return $null
+    }
+
+    return (New-TaskGroupRecoveryContext -GroupId ([string]$latest["group_id"]) -WorkerId ([string]$latest["worker_id"]) -TaskId ([string]$latest["task_id"]) -FinalPhase ([string]$latest["final_phase"]))
+}
+
+function Get-RunStateGroupRecoveryAttemptSuffix {
+    param([Parameter(Mandatory)]$RunState)
+
+    $context = Get-RunStateTaskGroupFailureRecoveryContext -RunState $RunState
+    if (-not $context) {
+        return ""
+    }
+
+    return ":group=$([string]$context['group_id']):worker=$([string]$context['worker_id']):task=$([string]$context['task_id']):final=$([string]$context['final_phase'])"
+}
+
+function Repair-StaleTaskGroupWorkerState {
+    param(
+        [Parameter(Mandatory)]$RunState,
+        [datetime]$Now = (Get-Date),
+        [int]$StaleAfterMinutes = 10
+    )
+
+    $state = Initialize-RunStateCompatibilityFields -RunState $RunState
+    $changed = $false
+    $recoveredWorkers = New-Object System.Collections.Generic.List[object]
+    $cutoff = $Now.AddMinutes(-1 * $StaleAfterMinutes)
+    $workers = ConvertTo-RelayHashtable -InputObject $state["task_group_workers"]
+    $groups = ConvertTo-RelayHashtable -InputObject $state["task_groups"]
+
+    foreach ($workerId in @($workers.Keys)) {
+        $worker = ConvertTo-RelayHashtable -InputObject $workers[$workerId]
+        if ([string]$worker["status"] -ne "running") {
+            continue
+        }
+
+        $heartbeatText = if (-not [string]::IsNullOrWhiteSpace([string]$worker["last_heartbeat_at"])) {
+            [string]$worker["last_heartbeat_at"]
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace([string]$worker["heartbeat_at"])) {
+            [string]$worker["heartbeat_at"]
+        }
+        else {
+            [string]$worker["updated_at"]
+        }
+        $heartbeatAt = [datetime]::MinValue
+        if (-not [datetime]::TryParse($heartbeatText, [ref]$heartbeatAt) -or $heartbeatAt -gt $cutoff) {
+            continue
+        }
+
+        $worker["status"] = "stale"
+        $worker["updated_at"] = $Now.ToString("o")
+        if (-not [string]::IsNullOrWhiteSpace([string]$worker["current_phase"])) {
+            $worker["final_phase"] = [string]$worker["current_phase"]
+        }
+        $workers[$workerId] = $worker
+        $changed = $true
+
+        $context = New-TaskGroupRecoveryContext -GroupId ([string]$worker["group_id"]) -WorkerId ([string]$worker["id"]) -TaskId ([string]$worker["task_id"]) -FinalPhase ([string]$worker["final_phase"])
+        $recoveredWorkers.Add($context)
+
+        $groupId = [string]$worker["group_id"]
+        if (-not [string]::IsNullOrWhiteSpace($groupId) -and $groups.ContainsKey($groupId)) {
+            $group = ConvertTo-RelayHashtable -InputObject $groups[$groupId]
+            $succeededCount = 0
+            foreach ($siblingId in @($group["worker_ids"])) {
+                if (-not $workers.ContainsKey([string]$siblingId)) {
+                    continue
+                }
+                $sibling = ConvertTo-RelayHashtable -InputObject $workers[[string]$siblingId]
+                $siblingResult = ConvertTo-RelayHashtable -InputObject $sibling["worker_result"]
+                if ([string]$sibling["status"] -eq "succeeded" -or ($siblingResult -and [string]$siblingResult["status"] -eq "succeeded")) {
+                    $succeededCount++
+                }
+            }
+
+            $group["status"] = if ($succeededCount -gt 0) { "partial_failed" } else { "stale" }
+            $group["updated_at"] = $Now.ToString("o")
+            if ([string]::IsNullOrWhiteSpace([string]$group["failure_summary"])) {
+                $group["failure_summary"] = "stale_task_group_worker"
+            }
+            $groups[$groupId] = $group
+        }
+    }
+
+    $state["task_group_workers"] = $workers
+    $state["task_groups"] = $groups
+    if ($changed) {
+        $state["updated_at"] = $Now.ToString("o")
+    }
+
+    return [ordered]@{
+        changed = $changed
+        run_state = $state
+        recovered_workers = @($recoveredWorkers.ToArray())
+    }
 }
 
 function New-RunStateLeaseToken {
@@ -690,6 +1026,8 @@ function New-RunState {
         current_task_id = $null
         active_job_id = $null
         active_jobs = @{}
+        task_groups = @{}
+        task_group_workers = @{}
         active_attempt = $null
         pending_approval = $null
         open_requirements = @()

@@ -7,16 +7,21 @@
 
 cli:
   command: "codex"
-  flags: "--ask-for-approval never exec --skip-git-repo-check --sandbox workspace-write"
+  flags: "--ask-for-approval never --model gpt-5.4 exec --skip-git-repo-check --sandbox workspace-write"
   implementer_command: ""
   implementer_flags: ""
   reviewer_command: ""
   reviewer_flags: ""
 
 escalation:
-  phase1_timeout_sec: 300
-  phase2_timeout_sec: 600
-  phase3_timeout_sec: 1200
+  phase1_timeout_sec: 1500
+  phase2_timeout_sec: 3000
+  phase3_timeout_sec: 6000
+
+execution:
+  mode: auto
+  max_parallel_jobs: 2
+  allow_single_parallel_job: true
 
 watcher:
   poll_fallback_sec: 5

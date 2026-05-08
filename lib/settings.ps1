@@ -8,6 +8,7 @@ function Test-ConfigValues {
         "escalation.phase1_timeout_sec",
         "escalation.phase2_timeout_sec",
         "escalation.phase3_timeout_sec",
+        "execution.max_parallel_jobs",
         "watcher.poll_fallback_sec",
         "lock.retry_count",
         "lock.retry_delay_ms",
@@ -35,6 +36,21 @@ function Test-ConfigValues {
     }
     if ($phase2 -ge $phase3) {
         $errors += "Config error: escalation.phase2_timeout_sec ($phase2) must be less than phase3_timeout_sec ($phase3)"
+    }
+
+    $executionMode = (Get-DefaultValue $ConfigHash["execution.mode"] "auto").ToString().Trim().ToLowerInvariant()
+    if ($executionMode -notin @("single", "auto", "parallel")) {
+        $errors += "Config error: execution.mode must be single, auto, or parallel (got '$executionMode')"
+    }
+
+    $maxParallelJobs = [int](Get-DefaultValue $ConfigHash["execution.max_parallel_jobs"] "2")
+    if ($maxParallelJobs -lt 1) {
+        $errors += "Config error: execution.max_parallel_jobs ($maxParallelJobs) must be at least 1"
+    }
+
+    $allowSingleParallelJob = (Get-DefaultValue $ConfigHash["execution.allow_single_parallel_job"] "true").ToString().Trim().ToLowerInvariant()
+    if ($allowSingleParallelJob -notin @("true", "false")) {
+        $errors += "Config error: execution.allow_single_parallel_job must be true or false (got '$allowSingleParallelJob')"
     }
     
     if ($errors.Count -gt 0) {
@@ -98,6 +114,12 @@ function Initialize-Settings {
     
     # Watcher settings
     $script:FallbackSec = [int](Get-DefaultValue $Config["watcher.poll_fallback_sec"]          "5")
+
+    # Execution settings. Default auto keeps run-scoped phases sequential and dispatches
+    # task-scoped work through the conservative parallel scheduler when possible.
+    $script:ExecutionMode = (Get-DefaultValue $Config["execution.mode"] "auto").ToString().Trim().ToLowerInvariant()
+    $script:ExecutionMaxParallelJobs = [int](Get-DefaultValue $Config["execution.max_parallel_jobs"] "2")
+    $script:ExecutionAllowSingleParallelJob = ((Get-DefaultValue $Config["execution.allow_single_parallel_job"] "true").ToString().Trim().ToLowerInvariant() -eq "true")
     
     # Escalation settings
     $script:EscPhase1Sec = [int](Get-DefaultValue $Config["escalation.phase1_timeout_sec"]      "120")

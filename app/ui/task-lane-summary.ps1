@@ -86,6 +86,24 @@ function ConvertTo-TaskLaneStringArray {
     )
 }
 
+function Copy-TaskLaneArrayFieldIfPresent {
+    param(
+        [Parameter(Mandatory)]$Source,
+        [Parameter(Mandatory)]$Target,
+        [Parameter(Mandatory)][string]$FieldName
+    )
+
+    if ($Source.ContainsKey($FieldName) -and $null -ne $Source[$FieldName]) {
+        $Target[$FieldName] = @(ConvertTo-TaskLaneStringArray -Value $Source[$FieldName])
+    }
+}
+
+function Test-TaskLaneActiveTaskGroupStatus {
+    param([AllowNull()][string]$Status)
+
+    return ($Status -in @("running", "waiting_approval", "partial_failed"))
+}
+
 function Resolve-TaskLaneStallReason {
     param(
         [Parameter(Mandatory)]$Lane,
@@ -263,6 +281,94 @@ function New-TaskLaneSummary {
         $activeJobRows.Add($row) | Out-Null
     }
 
+    $taskGroups = ConvertTo-RelayHashtable -InputObject $state["task_groups"]
+    if (-not $taskGroups) {
+        $taskGroups = @{}
+    }
+
+    $taskGroupWorkers = ConvertTo-RelayHashtable -InputObject $state["task_group_workers"]
+    if (-not $taskGroupWorkers) {
+        $taskGroupWorkers = @{}
+    }
+
+    $taskGroupRows = New-Object System.Collections.Generic.List[object]
+    $taskGroupWorkerRows = New-Object System.Collections.Generic.List[object]
+    $activeTaskGroupCount = 0
+    $runningTaskGroupCount = 0
+    $runningTaskGroupWorkerCount = 0
+
+    foreach ($groupId in @($taskGroups.Keys | Sort-Object)) {
+        $group = ConvertTo-RelayHashtable -InputObject $taskGroups[$groupId]
+        if (-not $group) {
+            $group = @{}
+        }
+
+        $resolvedGroupId = if ($group.ContainsKey("id") -and -not [string]::IsNullOrWhiteSpace([string]$group["id"])) { [string]$group["id"] } else { [string]$groupId }
+        $phase = if (-not [string]::IsNullOrWhiteSpace([string]$group["phase"])) { [string]$group["phase"] } else { [string]$group["phase_range"] }
+        $phaseRange = if (-not [string]::IsNullOrWhiteSpace([string]$group["phase_range"])) { [string]$group["phase_range"] } else { $phase }
+        if ([string]::IsNullOrWhiteSpace($phase)) {
+            $phase = "Phase5..Phase6"
+        }
+        if ([string]::IsNullOrWhiteSpace($phaseRange)) {
+            $phaseRange = $phase
+        }
+
+        $status = if (-not [string]::IsNullOrWhiteSpace([string]$group["status"])) { [string]$group["status"] } else { "running" }
+        if (Test-TaskLaneActiveTaskGroupStatus -Status $status) {
+            $activeTaskGroupCount++
+        }
+        if ($status -eq "running") {
+            $runningTaskGroupCount++
+        }
+
+        $row = [ordered]@{
+            group_id = $resolvedGroupId
+            status = $status
+            phase = $phase
+            current_phase = $phase
+            phase_range = $phaseRange
+            task_ids = @(ConvertTo-TaskLaneStringArray -Value $group["task_ids"])
+            worker_ids = @(ConvertTo-TaskLaneStringArray -Value $group["worker_ids"])
+        }
+        foreach ($field in @("created_at", "updated_at", "failure_summary")) {
+            Copy-TaskLaneFieldIfPresent -Source $group -Target $row -FieldName $field
+        }
+        $taskGroupRows.Add($row) | Out-Null
+    }
+
+    foreach ($workerId in @($taskGroupWorkers.Keys | Sort-Object)) {
+        $worker = ConvertTo-RelayHashtable -InputObject $taskGroupWorkers[$workerId]
+        if (-not $worker) {
+            $worker = @{}
+        }
+
+        $resolvedWorkerId = if ($worker.ContainsKey("id") -and -not [string]::IsNullOrWhiteSpace([string]$worker["id"])) { [string]$worker["id"] } else { [string]$workerId }
+        $phase = if (-not [string]::IsNullOrWhiteSpace([string]$worker["current_phase"])) { [string]$worker["current_phase"] } else { [string]$worker["phase"] }
+        if ([string]::IsNullOrWhiteSpace($phase)) {
+            $phase = "Phase5"
+        }
+        $status = if (-not [string]::IsNullOrWhiteSpace([string]$worker["status"])) { [string]$worker["status"] } else { "queued" }
+        if ($status -eq "running") {
+            $runningTaskGroupWorkerCount++
+        }
+
+        $row = [ordered]@{
+            worker_id = $resolvedWorkerId
+            group_id = [string]$worker["group_id"]
+            task_id = [string]$worker["task_id"]
+            status = $status
+            phase = $phase
+            current_phase = $phase
+        }
+        foreach ($field in @("workspace_path", "lease_token", "result_summary", "created_at", "updated_at")) {
+            Copy-TaskLaneFieldIfPresent -Source $worker -Target $row -FieldName $field
+        }
+        foreach ($field in @("declared_changed_files", "resource_locks")) {
+            Copy-TaskLaneArrayFieldIfPresent -Source $worker -Target $row -FieldName $field
+        }
+        $taskGroupWorkerRows.Add($row) | Out-Null
+    }
+
     $waitingTaskRows = New-Object System.Collections.Generic.List[object]
     $readyQueueRows = New-Object System.Collections.Generic.List[object]
     $readyCount = 0
@@ -380,6 +486,11 @@ function New-TaskLaneSummary {
         completed_count = $completedCount
         repair_count = $repairCount
         active_jobs = @($activeJobRows.ToArray())
+        task_groups = @($taskGroupRows.ToArray())
+        task_group_workers = @($taskGroupWorkerRows.ToArray())
+        active_task_group_count = $activeTaskGroupCount
+        running_task_group_count = $runningTaskGroupCount
+        running_task_group_worker_count = $runningTaskGroupWorkerCount
         ready_queue = @($readyQueueRows.ToArray())
         waiting_tasks = @($waitingTaskRows.ToArray())
         stall_reason = $stallReason

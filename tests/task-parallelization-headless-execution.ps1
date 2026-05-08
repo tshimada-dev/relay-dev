@@ -98,6 +98,10 @@ escalation:
   phase1_timeout_sec: 300
   phase2_timeout_sec: 3600
   phase3_timeout_sec: 5400
+execution:
+  mode: auto
+  max_parallel_jobs: 2
+  allow_single_parallel_job: true
 watcher:
   poll_fallback_sec: 5
 lock:
@@ -216,6 +220,42 @@ try {
     Assert-True (Test-Path -LiteralPath (Join-Path $productDir "T-b.txt") -PathType Leaf) "T-b product file should be merged back."
     Assert-Equal $finalState.task_states."T-a".last_completed_phase "Phase5" "T-a should complete Phase5."
     Assert-Equal $finalState.task_states."T-b".last_completed_phase "Phase5" "T-b should complete Phase5."
+
+    $script:ExecutionMode = "auto"
+    $script:ExecutionMaxParallelJobs = 2
+    $phase4State = New-RunState -RunId "$runId-phase4" -ProjectRoot $repoRoot -CurrentPhase "Phase4" -CurrentRole "implementer"
+    $phase4Mutation = Apply-JobResult -RunState $phase4State -JobResult @{
+        job_id = "job-phase4"
+        phase = "Phase4"
+        task_id = ""
+        result_status = "succeeded"
+        exit_code = 0
+    } -ValidationResult @{ valid = $true } -Artifact $tasksArtifact -ProjectRoot $repoRoot -ApprovalPhases @()
+    $phase4NextState = ConvertTo-RelayHashtable -InputObject $phase4Mutation["run_state"]
+    Assert-Equal $phase4NextState["task_lane"]["mode"] "parallel" "Phase4 task registration should enable parallel lane in auto mode."
+    Assert-Equal ([int]$phase4NextState["task_lane"]["max_parallel_jobs"]) 2 "Phase4 task registration should apply configured max_parallel_jobs."
+
+    if (Test-Path -LiteralPath $productDir) {
+        Remove-Item -LiteralPath $productDir -Recurse -Force
+    }
+
+    $autoRunId = "$runId-auto-step"
+    Save-Artifact -ProjectRoot $repoRoot -RunId $autoRunId -Scope run -Phase "Phase4" -ArtifactId "phase4_tasks.json" -Content $tasksArtifact -AsJson | Out-Null
+    $autoState = New-RunState -RunId $autoRunId -ProjectRoot $repoRoot -CurrentPhase "Phase5" -CurrentRole "implementer"
+    $autoState = Register-PlannedTasks -RunState $autoState -TasksArtifact $tasksArtifact
+    $autoState["task_lane"]["mode"] = "parallel"
+    $autoState["task_lane"]["max_parallel_jobs"] = 2
+    Write-RunState -ProjectRoot $repoRoot -RunState $autoState | Out-Null
+
+    $autoOutput = & pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repoRoot "app\cli.ps1") step -RunId $autoRunId -ConfigFile $configPath -Provider generic-cli -ProviderCommand $providerPath 2>&1
+    $autoJsonLine = @($autoOutput | ForEach-Object { [string]$_ } | Where-Object { $_.TrimStart().StartsWith("{") } | Select-Object -Last 1)
+    Assert-True (-not [string]::IsNullOrWhiteSpace([string]$autoJsonLine)) "auto step should emit a JSON summary."
+    $autoSummary = if (-not [string]::IsNullOrWhiteSpace([string]$autoJsonLine)) { $autoJsonLine | ConvertFrom-Json } else { $null }
+    if ($autoSummary) {
+        Assert-Equal $autoSummary.mode "parallel-step" "step should prefer parallel-step in auto mode for task-scoped parallel lanes."
+        Assert-Equal $autoSummary.status "completed" "auto parallel step should complete the worker batch."
+        Assert-Equal $autoSummary.leased_count 2 "auto parallel step should lease two jobs."
+    }
 }
 finally {
     foreach ($path in @($configPath, $providerPath)) {

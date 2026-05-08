@@ -332,7 +332,7 @@ function Invoke-IsolatedWorkspaceMergeBack {
         $isolatedPath = Join-Path $isolatedRoot ($relative -replace '/', [System.IO.Path]::DirectorySeparatorChar)
         $baseline = $baselineEntries[$relative]
         $baselineExists = $baseline -and [bool]$baseline["exists"]
-        $baselineHash = if ($baseline) { [string]$baseline["hash"] } else { $null }
+        $baselineHash = if ($baseline -and $null -ne $baseline["hash"]) { [string]$baseline["hash"] } else { $null }
         $mainExists = Test-Path -LiteralPath $mainPath -PathType Leaf
         $mainHash = Get-ParallelWorkspacePathHash -Path $mainPath
 
@@ -385,6 +385,181 @@ function Invoke-IsolatedWorkspaceMergeBack {
     return [ordered]@{
         ok = $true
         reason = "merged"
+        copied_files = @($copied.ToArray())
+        deleted_files = @($deleted.ToArray())
+        merged_at = (Get-Date).ToUniversalTime().ToString("o")
+    }
+}
+
+function Get-TaskGroupWorkerMergeBaseline {
+    param(
+        [AllowNull()]$WorkerResult,
+        [AllowNull()]$WorkerRow
+    )
+
+    foreach ($source in @($WorkerResult, $WorkerRow)) {
+        $object = ConvertTo-RelayHashtable -InputObject $source
+        if (-not $object) {
+            continue
+        }
+        foreach ($field in @("baseline_snapshot", "workspace_baseline", "baseline")) {
+            if ($object.ContainsKey($field) -and $object[$field]) {
+                return (ConvertTo-RelayHashtable -InputObject $object[$field])
+            }
+        }
+        if ($object.ContainsKey("workspace") -and $object["workspace"]) {
+            $workspace = ConvertTo-RelayHashtable -InputObject $object["workspace"]
+            if ($workspace -and $workspace["baseline"]) {
+                return (ConvertTo-RelayHashtable -InputObject $workspace["baseline"])
+            }
+        }
+    }
+
+    return $null
+}
+
+function Get-TaskGroupWorkerChangedFiles {
+    param(
+        [AllowNull()]$WorkerResult,
+        [AllowNull()]$WorkerRow
+    )
+
+    $result = ConvertTo-RelayHashtable -InputObject $WorkerResult
+    $row = ConvertTo-RelayHashtable -InputObject $WorkerRow
+    foreach ($source in @($result, $row)) {
+        if (-not $source) {
+            continue
+        }
+        foreach ($field in @("declared_changed_files", "changed_files")) {
+            if ($source.ContainsKey($field) -and @($source[$field]).Count -gt 0) {
+                return @($source[$field])
+            }
+        }
+    }
+
+    return @()
+}
+
+function Test-TaskGroupMergeBackPlan {
+    param(
+        [Parameter(Mandatory)][string]$MainWorkspace,
+        [Parameter(Mandatory)]$WorkerMergeSpecs
+    )
+
+    $mainRoot = [System.IO.Path]::GetFullPath($MainWorkspace)
+    $conflicts = New-Object System.Collections.Generic.List[object]
+    $planned = New-Object System.Collections.Generic.List[object]
+    $claimedPaths = @{}
+
+    foreach ($specRaw in @($WorkerMergeSpecs)) {
+        $spec = ConvertTo-RelayHashtable -InputObject $specRaw
+        $workerId = [string]$spec["worker_id"]
+        $isolatedWorkspace = [string]$spec["workspace_path"]
+        $baseline = ConvertTo-RelayHashtable -InputObject $spec["baseline"]
+        $acceptedChangedFiles = @($spec["accepted_changed_files"])
+
+        if ([string]::IsNullOrWhiteSpace($isolatedWorkspace) -or -not (Test-Path -LiteralPath $isolatedWorkspace -PathType Container)) {
+            $conflicts.Add([ordered]@{ worker_id = $workerId; path = $null; reason = "worker_workspace_missing"; workspace_path = $isolatedWorkspace }) | Out-Null
+            continue
+        }
+        if (-not $baseline -or -not $baseline["entries"]) {
+            $conflicts.Add([ordered]@{ worker_id = $workerId; path = $null; reason = "worker_baseline_missing"; workspace_path = $isolatedWorkspace }) | Out-Null
+            continue
+        }
+
+        foreach ($file in @($acceptedChangedFiles)) {
+            if ([string]::IsNullOrWhiteSpace($file)) {
+                continue
+            }
+
+            $relative = ConvertTo-ParallelWorkspaceRelativePath -WorkspaceRoot $mainRoot -Path $file
+            $claimKey = $relative.ToLowerInvariant()
+            if ($claimedPaths.ContainsKey($claimKey)) {
+                $conflicts.Add([ordered]@{
+                    worker_id = $workerId
+                    path = $relative
+                    reason = "worker_changed_file_overlap"
+                    other_worker_id = [string]$claimedPaths[$claimKey]
+                }) | Out-Null
+                continue
+            }
+            $claimedPaths[$claimKey] = $workerId
+
+            $mainPath = Join-Path $mainRoot ($relative -replace '/', [System.IO.Path]::DirectorySeparatorChar)
+            $baselineEntries = $baseline["entries"]
+            $baselineEntry = $baselineEntries[$relative]
+            $baselineExists = $baselineEntry -and [bool]$baselineEntry["exists"]
+            $baselineHash = if ($baselineEntry -and $null -ne $baselineEntry["hash"]) { [string]$baselineEntry["hash"] } else { $null }
+            $mainExists = Test-Path -LiteralPath $mainPath -PathType Leaf
+            $mainHash = Get-ParallelWorkspacePathHash -Path $mainPath
+
+            if ($baselineExists -ne $mainExists -or $baselineHash -ne $mainHash) {
+                $conflicts.Add([ordered]@{
+                    worker_id = $workerId
+                    path = $relative
+                    reason = "main_target_drift"
+                    baseline_hash = $baselineHash
+                    main_hash = $mainHash
+                    baseline_exists = $baselineExists
+                    main_exists = $mainExists
+                }) | Out-Null
+                continue
+            }
+        }
+
+        $planned.Add([ordered]@{
+            worker_id = $workerId
+            workspace_path = $isolatedWorkspace
+            baseline = $baseline
+            accepted_changed_files = @($acceptedChangedFiles)
+        }) | Out-Null
+    }
+
+    return [ordered]@{
+        ok = ($conflicts.Count -eq 0)
+        reason = if ($conflicts.Count -eq 0) { "merge_plan_valid" } else { "merge_conflict" }
+        conflicts = @($conflicts.ToArray())
+        planned_workers = @($planned.ToArray())
+    }
+}
+
+function Invoke-TaskGroupProductMerge {
+    param(
+        [Parameter(Mandatory)][string]$MainWorkspace,
+        [Parameter(Mandatory)]$WorkerMergeSpecs
+    )
+
+    $plan = ConvertTo-RelayHashtable -InputObject (Test-TaskGroupMergeBackPlan -MainWorkspace $MainWorkspace -WorkerMergeSpecs $WorkerMergeSpecs)
+    if (-not [bool]$plan["ok"]) {
+        return [ordered]@{
+            ok = $false
+            reason = [string]$plan["reason"]
+            conflicts = @($plan["conflicts"])
+            merged_workers = @()
+            copied_files = @()
+            deleted_files = @()
+        }
+    }
+
+    $mergedWorkers = New-Object System.Collections.Generic.List[object]
+    $copied = New-Object System.Collections.Generic.List[string]
+    $deleted = New-Object System.Collections.Generic.List[string]
+    foreach ($plannedRaw in @($plan["planned_workers"])) {
+        $planned = ConvertTo-RelayHashtable -InputObject $plannedRaw
+        $mergeResult = ConvertTo-RelayHashtable -InputObject (Invoke-IsolatedWorkspaceMergeBack -MainWorkspace $MainWorkspace -IsolatedWorkspace ([string]$planned["workspace_path"]) -BaselineSnapshot $planned["baseline"] -AcceptedChangedFiles @($planned["accepted_changed_files"]))
+        if (-not [bool]$mergeResult["ok"]) {
+            throw "Unexpected task group merge conflict after preflight for worker '$($planned["worker_id"])'."
+        }
+        foreach ($file in @($mergeResult["copied_files"])) { $copied.Add([string]$file) | Out-Null }
+        foreach ($file in @($mergeResult["deleted_files"])) { $deleted.Add([string]$file) | Out-Null }
+        $mergedWorkers.Add([ordered]@{ worker_id = [string]$planned["worker_id"]; merge = $mergeResult }) | Out-Null
+    }
+
+    return [ordered]@{
+        ok = $true
+        reason = "merged"
+        conflicts = @()
+        merged_workers = @($mergedWorkers.ToArray())
         copied_files = @($copied.ToArray())
         deleted_files = @($deleted.ToArray())
         merged_at = (Get-Date).ToUniversalTime().ToString("o")

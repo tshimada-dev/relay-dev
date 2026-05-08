@@ -141,11 +141,13 @@ Phase0 -> Phase1 -> [Phase2 fallback] -> Phase3 -> Phase3-1
 ```powershell
 pwsh -NoLogo -NoProfile -File .\app\cli.ps1 new      # 新しい run を作成
 pwsh -NoLogo -NoProfile -File .\app\cli.ps1 resume   # 既存 run を再開
-pwsh -NoLogo -NoProfile -File .\app\cli.ps1 step     # 1 step 進める
+pwsh -NoLogo -NoProfile -File .\app\cli.ps1 step     # 1 step 進める（task lane は既定で auto parallel）
 pwsh -NoLogo -NoProfile -File .\app\cli.ps1 show     # 現在の run-state を表示
 ```
 
 `start-agents.*` と `agent-loop.ps1` は CLI を呼ぶ薄い wrapper です。Windows は `start-agents.ps1` が `cli.ps1 new|resume` → stale worker 停止 → Windows Terminal で `agent-loop.ps1 -Role orchestrator` を起動。Linux / macOS は `start-agents.sh` が tmux 上に orchestrator worker と `watch-run.ps1` の 2 pane を作る、いずれも visible な単一 orchestrator worker 構成です。
+
+`execution.mode` の既定は `auto` です。run-scoped phase は従来どおり single dispatch、Phase5 以降の task-scoped lane は Phase4 task 登録後に `parallel` lane へ切り替わり、`parallel_safety: parallel` かつ `resource_locks` が衝突しない task だけを isolated workspace の `parallel-step` でまとめて実行します。安全に並列化できない task は同じ `step` 経路内で single dispatch に落ちます。デバッグ時は `config/settings.yaml` の `execution.mode: single` で従来動作に戻せます。
 
 ### 推奨運用（AI が起動準備まで担当）
 
@@ -219,7 +221,7 @@ relay-dev/
 ├── tasks/                     # tasks/task.md（run の external input）
 ├── tests/regression.ps1       # ~3k LoC regression harness
 ├── scripts/                   # public-example sanitizer 等
-├── agent-loop.ps1             # polling wrapper around cli.ps1 step
+├── agent-loop.ps1             # polling wrapper around cli.ps1 step (auto parallel aware)
 ├── watch-run.ps1              # monitor pane
 ├── start-agents.ps1 / .sh     # visible worker launcher
 └── lib/, logs/, dashboard.md

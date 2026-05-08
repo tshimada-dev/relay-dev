@@ -105,7 +105,9 @@ function Invoke-PhaseExecutionTransaction {
         [scriptblock]$OnRetry,
         [scriptblock]$OnAbort,
         [scriptblock]$OnRepairStart,
-        [scriptblock]$PreCommitGuard
+        [scriptblock]$PreCommitGuard,
+        [ValidateSet("auto", "job", "attempt")][string]$ArtifactStorageScope = "auto",
+        [bool]$CommitValidatedArtifacts = $true
     )
 
     $job = ConvertTo-RelayHashtable -InputObject $JobSpec
@@ -165,6 +167,15 @@ function Invoke-PhaseExecutionTransaction {
     $finalAttemptStartedAt = [string]$executionResult["final_attempt_started_at"]
     $attemptStartedAtUtc = Convert-PhaseExecutionDateTimeToUtc -Value $finalAttemptStartedAt
     $artifactCompletionCutoffUtc = Resolve-PhaseExecutionArtifactCompletionCutoffUtc -PhaseStartedAtUtc $PhaseStartedAtUtc -AttemptStartedAtUtc $attemptStartedAtUtc
+    $resolvedArtifactStorageScope = if ($ArtifactStorageScope -eq "auto") {
+        if (-not [string]::IsNullOrWhiteSpace($attemptId)) { "attempt" } else { "job" }
+    }
+    else {
+        $ArtifactStorageScope
+    }
+    if ($resolvedArtifactStorageScope -eq "attempt" -and [string]::IsNullOrWhiteSpace($attemptId)) {
+        throw "Attempt-scoped artifact storage requires an execution attempt id."
+    }
 
     $outputSyncParams = @{
         ProjectRoot = $ProjectRoot
@@ -172,7 +183,7 @@ function Invoke-PhaseExecutionTransaction {
         PhaseName = $PhaseName
         PhaseDefinition = $PhaseDefinition
         JobId = $jobId
-        StorageScope = if (-not [string]::IsNullOrWhiteSpace($attemptId)) { "attempt" } else { "job" }
+        StorageScope = $resolvedArtifactStorageScope
         AttemptStartedAtUtc = $attemptStartedAtUtc
     }
     if (-not [string]::IsNullOrWhiteSpace($TaskId)) {
@@ -241,7 +252,19 @@ function Invoke-PhaseExecutionTransaction {
                 })
         }
 
-        if ($commitGuardResult -and -not [bool]$commitGuardResult["valid"]) {
+        if (-not $CommitValidatedArtifacts) {
+            $commitResult = [ordered]@{
+                committed = @()
+                summary = [ordered]@{
+                    committed_count = 0
+                    artifact_ids = @()
+                }
+                skipped = $true
+                reason = "commit_validated_artifacts_disabled"
+            }
+            $validationResult["commit"] = $commitResult
+        }
+        elseif ($commitGuardResult -and -not [bool]$commitGuardResult["valid"]) {
             $validatorStatus["valid"] = $false
             $validatorStatus["errors"] = @($validatorStatus["errors"]) + @($commitGuardResult["errors"])
             $validationResult["validation"] = $validatorStatus
@@ -294,6 +317,8 @@ function Invoke-PhaseExecutionTransaction {
         artifact_completion_cutoff_utc = if ($artifactCompletionCutoffUtc) { $artifactCompletionCutoffUtc.ToString("o") } else { $null }
         output_sync_result = $outputSyncResult
         validation_result = $validationResult
+        artifact_refs = @(New-ArtifactRefsFromMaterializedArtifacts -MaterializedArtifacts @($outputSyncResult["materialized"]) -StorageScope $resolvedArtifactStorageScope -JobId $jobId -AttemptId $attemptId)
+        artifact_storage_scope = $resolvedArtifactStorageScope
         commit_guard_result = $commitGuardResult
         commit_result = $commitResult
         repair_result = $repairResult

@@ -10,8 +10,14 @@ if (-not (Get-Command Append-Event -ErrorAction SilentlyContinue)) {
 if (-not (Get-Command Invoke-PhaseExecutionTransaction -ErrorAction SilentlyContinue)) {
     . (Join-Path $PSScriptRoot "phase-execution-transaction.ps1")
 }
+if (-not (Get-Command Resolve-PhaseContractArtifactPath -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "phase-validation-pipeline.ps1")
+}
 if (-not (Get-Command Apply-JobResult -ErrorAction SilentlyContinue)) {
     . (Join-Path $PSScriptRoot "workflow-engine.ps1")
+}
+if (-not (Get-Command Get-PhaseDefinition -ErrorAction SilentlyContinue)) {
+    . (Join-Path (Join-Path $PSScriptRoot "..\phases") "phase-registry.ps1")
 }
 
 function Append-LeasedJobRunStatusChangedEvent {
@@ -55,6 +61,214 @@ function Import-LeasedJobPackage {
     }
 
     return (ConvertTo-RelayHashtable -InputObject $Package)
+}
+
+function Import-TaskGroupWorkerPackage {
+    param(
+        [Parameter(Mandatory)]$Package,
+        [string]$WorkerId
+    )
+
+    $packageObject = Import-LeasedJobPackage -Package $Package
+    if ([string]$packageObject["package_kind"] -eq "task-group-leased-package") {
+        foreach ($workerRaw in @($packageObject["workers"])) {
+            $worker = ConvertTo-RelayHashtable -InputObject $workerRaw
+            if ([string]::IsNullOrWhiteSpace($WorkerId) -or [string]$worker["worker_id"] -eq $WorkerId -or [string]$worker["id"] -eq $WorkerId) {
+                foreach ($field in @("run_id", "group_id", "provider_spec", "workspace_mode", "commit_policy")) {
+                    if (-not $worker.ContainsKey($field) -and $packageObject.ContainsKey($field)) {
+                        $worker[$field] = $packageObject[$field]
+                    }
+                }
+                return $worker
+            }
+        }
+        throw "Worker '$WorkerId' was not found in task group package."
+    }
+
+    return $packageObject
+}
+
+function New-TaskGroupWorkerPromptText {
+    param(
+        [Parameter(Mandatory)][string]$ProjectRoot,
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][string]$WorkerId,
+        [Parameter(Mandatory)][string]$TaskId,
+        [Parameter(Mandatory)][string]$PhaseName,
+        [Parameter(Mandatory)]$PhaseDefinition,
+        [AllowNull()]$WorkerPackage
+    )
+
+    $definition = ConvertTo-RelayHashtable -InputObject $PhaseDefinition
+    $worker = ConvertTo-RelayHashtable -InputObject $WorkerPackage
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add("Run task group worker phase $PhaseName for task $TaskId.") | Out-Null
+    if ($worker -and $worker["selected_task"]) {
+        $lines.Add("Selected task: $((ConvertTo-RelayHashtable -InputObject $worker["selected_task"]) | ConvertTo-Json -Depth 20 -Compress)") | Out-Null
+    }
+    $lines.Add("Write the required output artifacts exactly at these paths:") | Out-Null
+    foreach ($contractRaw in @($definition["output_contract"])) {
+        $contract = ConvertTo-RelayHashtable -InputObject $contractRaw
+        $artifactPath = Resolve-PhaseContractArtifactPath -ProjectRoot $ProjectRoot -RunId $RunId -PhaseName $PhaseName -ContractItem $contract -TaskId $TaskId -JobId $WorkerId -StorageScope "job"
+        $lines.Add("$($contract["artifact_id"]) => $artifactPath (write)") | Out-Null
+    }
+
+    return ($lines.ToArray() -join "`n")
+}
+
+function Update-TaskGroupWorkerRunState {
+    param(
+        [Parameter(Mandatory)][string]$ProjectRoot,
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][string]$WorkerId,
+        [Parameter(Mandatory)]$Patch,
+        [int]$LockTimeoutSec = 30
+    )
+
+    $lock = $null
+    try {
+        $lock = Acquire-RunLock -ProjectRoot $ProjectRoot -RunId $RunId -RetryCount 0 -RetryDelayMs 200 -TimeoutSec $LockTimeoutSec
+        $state = Read-RunState -ProjectRoot $ProjectRoot -RunId $RunId
+        if (-not $state) {
+            throw "Run '$RunId' does not exist."
+        }
+        $state = Initialize-RunStateCompatibilityFields -RunState $state
+        $workers = ConvertTo-RelayHashtable -InputObject $state["task_group_workers"]
+        $entry = ConvertTo-RelayHashtable -InputObject $workers[$WorkerId]
+        if (-not $entry) {
+            $entry = [ordered]@{ id = $WorkerId; worker_id = $WorkerId }
+        }
+
+        $now = (Get-Date).ToString("o")
+        foreach ($key in @($Patch.Keys)) {
+            $entry[$key] = $Patch[$key]
+        }
+        $entry["updated_at"] = $now
+        $entry["last_heartbeat_at"] = $now
+        $workers[$WorkerId] = $entry
+        $state["task_group_workers"] = $workers
+        $state["updated_at"] = $now
+        Write-RunState -ProjectRoot $ProjectRoot -RunState $state | Out-Null
+        return $entry
+    }
+    finally {
+        if ($lock) {
+            Release-RunLock -LockHandle $lock
+        }
+    }
+}
+
+function Invoke-TaskGroupWorkerPackage {
+    param(
+        [Parameter(Mandatory)]$Package,
+        [Parameter(Mandatory)][string]$ProjectRoot,
+        [string]$WorkerId,
+        [Parameter(Mandatory)]$TimeoutPolicy,
+        [scriptblock]$PhaseDefinitionFactory,
+        [scriptblock]$PromptFactory,
+        [scriptblock]$TransactionFactory,
+        [scriptblock]$ArtifactCompletionProbe,
+        [int]$LockTimeoutSec = 30
+    )
+
+    $worker = Import-TaskGroupWorkerPackage -Package $Package -WorkerId $WorkerId
+    $runId = [string]$worker["run_id"]
+    $workerId = [string]$worker["worker_id"]
+    if ([string]::IsNullOrWhiteSpace($workerId)) { $workerId = [string]$worker["id"] }
+    $groupId = [string]$worker["group_id"]
+    $taskId = [string]$worker["task_id"]
+    if ([string]::IsNullOrWhiteSpace($runId) -or [string]::IsNullOrWhiteSpace($workerId) -or [string]::IsNullOrWhiteSpace($groupId) -or [string]::IsNullOrWhiteSpace($taskId)) {
+        throw "Task group worker package requires run_id, worker_id, group_id, and task_id."
+    }
+
+    $phaseSequence = @($worker["phase_sequence"])
+    if ($phaseSequence.Count -eq 0) {
+        $phaseSequence = @("Phase5", "Phase5-1", "Phase5-2", "Phase6")
+    }
+    $workspacePath = if ([string]::IsNullOrWhiteSpace([string]$worker["workspace_path"])) { $ProjectRoot } else { [string]$worker["workspace_path"] }
+    $provider = ConvertTo-RelayHashtable -InputObject $worker["provider_spec"]
+    $artifactRefs = New-Object System.Collections.Generic.List[object]
+    $errors = New-Object System.Collections.Generic.List[string]
+    $finalPhase = $null
+
+    Update-TaskGroupWorkerRunState -ProjectRoot $ProjectRoot -RunId $runId -WorkerId $workerId -LockTimeoutSec $LockTimeoutSec -Patch @{
+        status = "running"; current_phase = [string]$phaseSequence[0]; group_id = $groupId; task_id = $taskId
+        errors = @(); result_summary = $null; artifact_refs = @(); workspace_path = $workspacePath
+    } | Out-Null
+
+    foreach ($phaseName in $phaseSequence) {
+        $finalPhase = [string]$phaseName
+        Update-TaskGroupWorkerRunState -ProjectRoot $ProjectRoot -RunId $runId -WorkerId $workerId -LockTimeoutSec $LockTimeoutSec -Patch @{ status = "running"; current_phase = $finalPhase } | Out-Null
+
+        try {
+            $phaseDefinition = if ($PhaseDefinitionFactory) {
+                & $PhaseDefinitionFactory $finalPhase $provider $worker
+            }
+            else {
+                Get-PhaseDefinition -ProjectRoot $ProjectRoot -Phase $finalPhase -Provider ([string]$provider["provider"])
+            }
+            $phaseDefinition = ConvertTo-RelayHashtable -InputObject $phaseDefinition
+            $promptText = if ($PromptFactory) {
+                [string](& $PromptFactory $worker $finalPhase $phaseDefinition)
+            }
+            else {
+                New-TaskGroupWorkerPromptText -ProjectRoot $ProjectRoot -RunId $runId -WorkerId $workerId -TaskId $taskId -PhaseName $finalPhase -PhaseDefinition $phaseDefinition -WorkerPackage $worker
+            }
+            $jobSpec = [ordered]@{
+                run_id = $runId; job_id = $workerId; worker_id = $workerId; group_id = $groupId
+                task_id = $taskId; phase = $finalPhase; role = if ($phaseDefinition["role"]) { [string]$phaseDefinition["role"] } else { "implementer" }
+                attempt = 1; provider = [string]$provider["provider"]; command = [string]$provider["command"]; flags = [string]$provider["flags"]
+                selected_task = (ConvertTo-RelayHashtable -InputObject $worker["selected_task"])
+                workspace_path = $workspacePath; lease_token = [string]$worker["lease_token"]
+            }
+            $transaction = if ($TransactionFactory) {
+                & $TransactionFactory $worker $finalPhase $phaseDefinition $promptText $jobSpec
+            }
+            else {
+                $transactionParams = @{
+                    JobSpec = $jobSpec; PromptText = $promptText; ProjectRoot = $ProjectRoot; WorkingDirectory = $workspacePath
+                    TimeoutPolicy = $TimeoutPolicy; RunId = $runId; PhaseName = $finalPhase; PhaseDefinition = $phaseDefinition; TaskId = $taskId
+                    PhaseStartedAtUtc = [datetime]::UtcNow; ArtifactStorageScope = "job"; CommitValidatedArtifacts = $false
+                }
+                if ($ArtifactCompletionProbe) { $transactionParams["ArtifactCompletionProbe"] = $ArtifactCompletionProbe }
+                Invoke-PhaseExecutionTransaction @transactionParams
+            }
+            $transaction = ConvertTo-RelayHashtable -InputObject $transaction
+            foreach ($artifactRef in @($transaction["artifact_refs"])) {
+                $artifactRefs.Add((ConvertTo-RelayHashtable -InputObject $artifactRef)) | Out-Null
+            }
+            $validation = ConvertTo-RelayHashtable -InputObject $transaction["validation_result"]["validation"]
+            $effective = ConvertTo-RelayHashtable -InputObject $transaction["effective_execution_result"]
+            if (($effective -and [string]$effective["result_status"] -eq "failed") -or ($validation -and -not [bool]$validation["valid"])) {
+                if ($effective -and $effective["failure_class"]) { $errors.Add([string]$effective["failure_class"]) | Out-Null }
+                foreach ($error in @($validation["errors"])) { $errors.Add([string]$error) | Out-Null }
+                break
+            }
+        }
+        catch {
+            $errors.Add($_.Exception.Message) | Out-Null
+            break
+        }
+    }
+
+    $status = if ($errors.Count -eq 0 -and $finalPhase -eq "Phase6") { "succeeded" } else { "failed" }
+    $result = [ordered]@{
+        worker_id = $workerId
+        group_id = $groupId
+        task_id = $taskId
+        status = $status
+        final_phase = $finalPhase
+        errors = @($errors.ToArray())
+        artifact_refs = @($artifactRefs.ToArray())
+        changed_files = @($worker["declared_changed_files"])
+        workspace_path = $workspacePath
+    }
+    Update-TaskGroupWorkerRunState -ProjectRoot $ProjectRoot -RunId $runId -WorkerId $workerId -LockTimeoutSec $LockTimeoutSec -Patch @{
+        status = $status; current_phase = $finalPhase; result_summary = $status; errors = @($result["errors"]); artifact_refs = @($result["artifact_refs"])
+        final_phase = $finalPhase; worker_result = $result
+    } | Out-Null
+
+    return $result
 }
 
 function New-LeasedJobCommitRejectedResult {

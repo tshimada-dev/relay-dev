@@ -51,6 +51,16 @@ function Assert-ArrayContains {
     Assert-True ($Expected -in @($Items)) $Message
 }
 
+function Assert-ArrayNotContains {
+    param(
+        [AllowNull()]$Items,
+        [Parameter(Mandatory)][string]$Expected,
+        [Parameter(Mandatory)][string]$Message
+    )
+
+    Assert-True ($Expected -notin @($Items)) $Message
+}
+
 function New-TestBoundaryContract {
     param([string]$ModuleName)
 
@@ -80,13 +90,16 @@ function New-TestTask {
         [Parameter(Mandatory)][string]$TaskId,
         [string[]]$Dependencies = @(),
         [string[]]$ResourceLocks = @(),
-        [string]$ParallelSafety = "cautious"
+        [string]$ParallelSafety = "cautious",
+        [string[]]$ChangedFiles = @()
     )
+
+    $effectiveChangedFiles = if (@($ChangedFiles).Count -gt 0) { @($ChangedFiles) } else { @("src/$TaskId.txt") }
 
     return [ordered]@{
         task_id = $TaskId
         purpose = "Exercise scheduler policy for $TaskId"
-        changed_files = @("src/$TaskId.txt")
+        changed_files = @($effectiveChangedFiles)
         acceptance_criteria = @("Policy is explained")
         boundary_contract = (New-TestBoundaryContract -ModuleName "application/$TaskId")
         visual_contract = (New-TestVisualContract)
@@ -186,6 +199,41 @@ Assert-ArrayContains $resourceEligibility["blocked_by"] "db-schema" "Resource lo
 Assert-ArrayContains $resourceEligibility["blocked_by_jobs"] "job-db" "Resource lock waits may include blocking job attribution."
 Assert-ArrayContains $resourceEligibility["blocked_by_tasks"] "T-db" "Resource lock waits may include blocking task attribution."
 
+$fileOverlapRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("relay-scheduler-file-lock-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $fileOverlapRoot -Force | Out-Null
+$fileOverlapRunId = "run-file-lock"
+$fileOverlapTasksArtifact = [ordered]@{
+    tasks = @(
+        (New-TestTask -TaskId "T-file-a" -ResourceLocks @("alpha") -ParallelSafety "parallel" -ChangedFiles @("src/shared.js")),
+        (New-TestTask -TaskId "T-file-b" -ResourceLocks @("beta") -ParallelSafety "parallel" -ChangedFiles @(".\src\shared.js")),
+        (New-TestTask -TaskId "T-file-c" -ResourceLocks @("gamma") -ParallelSafety "parallel" -ChangedFiles @("src/independent.js"))
+    )
+}
+Save-Artifact -ProjectRoot $fileOverlapRoot -RunId $fileOverlapRunId -Scope run -Phase "Phase4" -ArtifactId "phase4_tasks.json" -Content $fileOverlapTasksArtifact -AsJson | Out-Null
+$fileOverlapState = New-RunState -RunId $fileOverlapRunId -ProjectRoot $fileOverlapRoot -CurrentPhase "Phase5" -CurrentRole "implementer"
+$fileOverlapState = Register-PlannedTasks -RunState $fileOverlapState -TasksArtifact $fileOverlapTasksArtifact
+$fileOverlapState["task_lane"]["mode"] = "parallel"
+$fileOverlapState["task_lane"]["max_parallel_jobs"] = 3
+$fileOverlapCandidates = @(Get-BatchLeaseCandidates -RunState $fileOverlapState -ProjectRoot $fileOverlapRoot)
+$fileOverlapCandidateIds = @($fileOverlapCandidates | ForEach-Object { [string]$_["task_id"] })
+Assert-Equal $fileOverlapCandidates.Count 2 "Changed file overlap should reduce the batch to non-conflicting tasks."
+Assert-ArrayContains $fileOverlapCandidateIds "T-file-a" "The first task touching a file should remain launchable."
+Assert-ArrayNotContains $fileOverlapCandidateIds "T-file-b" "A second task touching the same changed file should not be selected in the same batch."
+Assert-ArrayContains $fileOverlapCandidateIds "T-file-c" "A task touching an independent file should remain launchable."
+
+$fileOverlapLease = Add-RunStateActiveJobLease -RunState $fileOverlapState -JobSpec @{
+    job_id = "job-file-a"
+    task_id = "T-file-a"
+    phase = "Phase5"
+    role = "implementer"
+    resource_locks = @("alpha")
+    parallel_safety = "parallel"
+}
+$fileOverlapEligibility = Test-TaskDispatchEligibility -RunState $fileOverlapLease["run_state"] -ProjectRoot $fileOverlapRoot -TaskId "T-file-b"
+Assert-Equal ([bool]$fileOverlapEligibility["eligible"]) $false "Changed file overlap with an active job should block dispatch even when explicit resource_locks differ."
+Assert-Equal $fileOverlapEligibility["wait_reason"] "resource_lock" "Implicit file lock conflicts should use the resource_lock wait reason."
+Assert-ArrayContains $fileOverlapEligibility["blocked_by"] "file:src/shared.js" "Implicit file locks should appear in blocked_by for diagnosis."
+
 $independentEligibility = Test-TaskDispatchEligibility -RunState $resourceState -ProjectRoot $root -TaskId "T-api"
 Assert-Equal ([bool]$independentEligibility["eligible"]) $true "Cautious/parallel tasks should stay eligible when dependencies and resource locks allow them."
 Assert-True ($null -eq $independentEligibility["wait_reason"]) "Eligible tasks should not have a wait reason."
@@ -225,6 +273,17 @@ Assert-Equal $nextAction["task_id"] "T-ready" "Get-NextAction should still pick 
 
 $allEligibility = @(Get-TaskDispatchEligibility -RunState $sequentialFixture["state"] -ProjectRoot ([string]$sequentialFixture["root"]))
 Assert-Equal $allEligibility.Count 6 "Scheduler helper should derive one eligibility row per task without persisting ready_queue."
+
+$phaseFixture = New-SchedulerFixture
+$phaseState = $phaseFixture["state"]
+$phaseState["task_lane"]["mode"] = "parallel"
+$phaseState["task_lane"]["max_parallel_jobs"] = 3
+$phaseCandidates = @(Get-BatchLeaseCandidates -RunState $phaseState -ProjectRoot ([string]$phaseFixture["root"]))
+Assert-True ($phaseCandidates.Count -gt 0) "Ready tasks without a cursor should be launchable in Phase5."
+
+$reviewPhaseState = Set-RunStateCursor -RunState $phaseState -Phase "Phase5-1" -TaskId "T-ready"
+$reviewPhaseCandidates = @(Get-BatchLeaseCandidates -RunState $reviewPhaseState -ProjectRoot ([string]$phaseFixture["root"]))
+Assert-Equal $reviewPhaseCandidates.Count 0 "Ready tasks without a cursor should not be promoted into a reviewer phase batch."
 
 # CPS-03 UI summary/rendering assertions. Keep this separate from scheduler policy tests.
 $uiRunState = [ordered]@{

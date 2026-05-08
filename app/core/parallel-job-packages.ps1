@@ -219,6 +219,301 @@ function New-ParallelStepJobPackageContent {
     }
 }
 
+function New-StableTaskGroupPlanId {
+    param(
+        [Parameter(Mandatory)][string]$Prefix,
+        [Parameter(Mandatory)][string]$RunId,
+        [AllowNull()]$StateRevision,
+        [Parameter(Mandatory)][string]$CurrentPhase,
+        [Parameter(Mandatory)][string[]]$TaskIds,
+        [string]$WorkerTaskId
+    )
+
+    $revisionText = if ($null -ne $StateRevision -and -not [string]::IsNullOrWhiteSpace([string]$StateRevision)) { [string]$StateRevision } else { "0" }
+    $basisParts = @($RunId, $revisionText, $CurrentPhase) + @($TaskIds)
+    if (-not [string]::IsNullOrWhiteSpace($WorkerTaskId)) {
+        $basisParts += $WorkerTaskId
+    }
+    $basis = ($basisParts -join "|")
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($basis)
+        $hashBytes = $sha256.ComputeHash($bytes)
+        $hash = ([System.BitConverter]::ToString($hashBytes).Replace("-", "").ToLowerInvariant()).Substring(0, 16)
+        return "$Prefix-$hash"
+    }
+    finally {
+        $sha256.Dispose()
+    }
+}
+
+function New-TaskGroupParallelPlan {
+    param(
+        [Parameter(Mandatory)][string]$ProjectRoot,
+        [Parameter(Mandatory)]$RunState,
+        [switch]$AllowSingleParallelJob,
+        [switch]$AllowNonParallelSafety,
+        [switch]$AllowEmptyChangedFiles
+    )
+
+    $state = Initialize-RunStateCompatibilityFields -RunState $RunState
+    $runId = [string]$state["run_id"]
+    if ([string]::IsNullOrWhiteSpace($runId)) {
+        throw "run_id is required to create a task group plan."
+    }
+
+    $taskLane = ConvertTo-RelayHashtable -InputObject $state["task_lane"]
+    if ([string]$taskLane["mode"] -ne "parallel") {
+        return [ordered]@{ status = "wait"; reason = "task_lane.mode must be parallel"; group = $null; workers = @(); rejected_candidates = @(); run_state = $state }
+    }
+    if ([int]$taskLane["max_parallel_jobs"] -le 1) {
+        return [ordered]@{ status = "wait"; reason = "task_lane.max_parallel_jobs must be greater than 1"; group = $null; workers = @(); rejected_candidates = @(); run_state = $state }
+    }
+    if (-not (Test-TaskScopedPhase -Phase ([string]$state["current_phase"]))) {
+        return [ordered]@{ status = "wait"; reason = "current_phase is not task-scoped"; group = $null; workers = @(); rejected_candidates = @(); run_state = $state }
+    }
+
+    $candidates = @(Get-BatchLeaseCandidates -RunState $state -ProjectRoot $ProjectRoot)
+    $launchable = New-Object System.Collections.Generic.List[object]
+    $rejected = New-Object System.Collections.Generic.List[object]
+    foreach ($candidate in $candidates) {
+        $test = Test-ParallelStepLaunchableCandidate -Candidate $candidate -AllowNonParallelSafety:$AllowNonParallelSafety -AllowEmptyChangedFiles:$AllowEmptyChangedFiles
+        if ([bool]$test["launchable"]) {
+            $launchable.Add((ConvertTo-RelayHashtable -InputObject $candidate)) | Out-Null
+        }
+        else {
+            $rejected.Add([ordered]@{ candidate = (ConvertTo-RelayHashtable -InputObject $candidate); launchability = $test }) | Out-Null
+        }
+    }
+
+    if ($launchable.Count -eq 0) {
+        return [ordered]@{ status = "wait"; reason = "no launchable candidates"; group = $null; workers = @(); rejected_candidates = @($rejected.ToArray()); run_state = $state }
+    }
+    if (-not $AllowSingleParallelJob -and $launchable.Count -lt 2) {
+        return [ordered]@{ status = "wait"; reason = "fewer than two launchable candidates"; group = $null; workers = @(); rejected_candidates = @($rejected.ToArray()); run_state = $state }
+    }
+
+    $taskIds = @($launchable.ToArray() | ForEach-Object { [string]$_["task_id"] })
+    $groupId = New-StableTaskGroupPlanId -Prefix "task-group" -RunId $runId -StateRevision $state["state_revision"] -CurrentPhase ([string]$state["current_phase"]) -TaskIds $taskIds
+    $workers = New-Object System.Collections.Generic.List[object]
+    $workerIds = New-Object System.Collections.Generic.List[string]
+    foreach ($candidate in @($launchable.ToArray())) {
+        $taskId = [string]$candidate["task_id"]
+        $workerId = New-StableTaskGroupPlanId -Prefix "task-worker" -RunId $runId -StateRevision $state["state_revision"] -CurrentPhase ([string]$state["current_phase"]) -TaskIds $taskIds -WorkerTaskId $taskId
+        $metadata = New-ParallelStepPackageMetadata -Candidate $candidate -JobSpec $candidate
+        $workerIds.Add($workerId) | Out-Null
+        $workers.Add([ordered]@{
+            id = $workerId
+            worker_id = $workerId
+            group_id = $groupId
+            task_id = $taskId
+            status = "queued"
+            phase = "Phase5"
+            current_phase = "Phase5"
+            phase_range = "Phase5..Phase6"
+            selected_task = (ConvertTo-RelayHashtable -InputObject $candidate["selected_task"])
+            declared_changed_files = @($metadata["declared_changed_files"])
+            resource_locks = @($metadata["resource_locks"])
+            parallel_safety = [string]$metadata["parallel_safety"]
+            slot_id = [string]$metadata["slot_id"]
+            workspace_id = if ([string]::IsNullOrWhiteSpace([string]$metadata["workspace_id"])) { "workspace-$workerId" } else { [string]$metadata["workspace_id"] }
+        }) | Out-Null
+    }
+
+    $group = [ordered]@{
+        id = $groupId
+        group_id = $groupId
+        status = "planned"
+        phase = "Phase5..Phase6"
+        phase_range = "Phase5..Phase6"
+        task_ids = @($taskIds)
+        worker_ids = @($workerIds.ToArray())
+        policy = "wait_for_siblings"
+        dry_run = $true
+    }
+
+    return [ordered]@{
+        status = "planned"
+        reason = "planned $($workers.Count) task group worker(s)"
+        group = $group
+        workers = @($workers.ToArray())
+        rejected_candidates = @($rejected.ToArray())
+        run_state = $state
+    }
+}
+
+function New-TaskGroupJobPackage {
+    param(
+        [Parameter(Mandatory)][string]$ProjectRoot,
+        [Parameter(Mandatory)]$RunState,
+        [Parameter(Mandatory)]$ProviderSpec,
+        [string]$PackageRoot,
+        [string]$WorkspaceRoot,
+        [string]$WorkspaceMode = "isolated-copy-experimental",
+        [string]$CommitPolicy = "all_or_nothing",
+        [int]$LeaseDurationMinutes = 120,
+        [switch]$AllowSingleParallelJob,
+        [switch]$AllowNonParallelSafety,
+        [switch]$AllowEmptyChangedFiles
+    )
+
+    $plan = New-TaskGroupParallelPlan -ProjectRoot $ProjectRoot -RunState $RunState -AllowSingleParallelJob:$AllowSingleParallelJob -AllowNonParallelSafety:$AllowNonParallelSafety -AllowEmptyChangedFiles:$AllowEmptyChangedFiles
+    if ([string]$plan["status"] -ne "planned") {
+        return [ordered]@{
+            status = [string]$plan["status"]
+            reason = [string]$plan["reason"]
+            package_path = $null
+            package = $null
+            run_state = $plan["run_state"]
+            rejected_candidates = @($plan["rejected_candidates"])
+        }
+    }
+
+    $state = Initialize-RunStateCompatibilityFields -RunState $plan["run_state"]
+    $runId = [string]$state["run_id"]
+    $group = ConvertTo-RelayHashtable -InputObject $plan["group"]
+    $groupId = [string]$group["group_id"]
+    if ([string]::IsNullOrWhiteSpace($groupId)) {
+        $groupId = [string]$group["id"]
+    }
+
+    if ([string]::IsNullOrWhiteSpace($PackageRoot)) {
+        $PackageRoot = Get-RunJobPath -ProjectRoot $ProjectRoot -RunId $runId -JobId $groupId
+    }
+    if ([string]::IsNullOrWhiteSpace($WorkspaceRoot)) {
+        $WorkspaceRoot = Join-Path (Get-RunRootPath -ProjectRoot $ProjectRoot -RunId $runId) "workspaces"
+    }
+    foreach ($path in @($PackageRoot, $WorkspaceRoot)) {
+        if (-not (Test-Path $path)) {
+            New-Item -ItemType Directory -Path $path -Force | Out-Null
+        }
+    }
+
+    $now = (Get-Date).ToString("o")
+    $leaseExpiresAt = (Get-Date).AddMinutes($LeaseDurationMinutes).ToString("o")
+    $provider = ConvertTo-RelayHashtable -InputObject $ProviderSpec
+    $workerPackages = New-Object System.Collections.Generic.List[object]
+    $workerIds = New-Object System.Collections.Generic.List[string]
+    $taskIds = New-Object System.Collections.Generic.List[string]
+
+    foreach ($workerPlan in @($plan["workers"])) {
+        $worker = ConvertTo-RelayHashtable -InputObject $workerPlan
+        $workerId = [string]$worker["worker_id"]
+        if ([string]::IsNullOrWhiteSpace($workerId)) {
+            $workerId = [string]$worker["id"]
+        }
+        $taskId = [string]$worker["task_id"]
+        $workspacePath = Join-Path $WorkspaceRoot $workerId
+        $artifactRoot = if (Get-Command Get-JobArtifactsRootPath -ErrorAction SilentlyContinue) {
+            Get-JobArtifactsRootPath -ProjectRoot $ProjectRoot -RunId $runId -JobId $workerId
+        }
+        else {
+            Join-Path (Get-RunJobPath -ProjectRoot $ProjectRoot -RunId $runId -JobId $workerId) "artifacts"
+        }
+        foreach ($path in @($workspacePath, $artifactRoot)) {
+            if (-not (Test-Path $path)) {
+                New-Item -ItemType Directory -Path $path -Force | Out-Null
+            }
+        }
+
+        $leaseToken = New-RunStateLeaseToken
+        $workerIds.Add($workerId) | Out-Null
+        $taskIds.Add($taskId) | Out-Null
+        $workerPackage = [ordered]@{
+            worker_id = $workerId
+            group_id = $groupId
+            task_id = $taskId
+            phase_sequence = @("Phase5", "Phase5-1", "Phase5-2", "Phase6")
+            selected_task = (ConvertTo-RelayHashtable -InputObject $worker["selected_task"])
+            workspace_path = $workspacePath
+            artifact_root = $artifactRoot
+            declared_changed_files = @($worker["declared_changed_files"])
+            resource_locks = @($worker["resource_locks"])
+            lease_token = $leaseToken
+        }
+        $workerPackages.Add($workerPackage) | Out-Null
+
+        $state["task_group_workers"][$workerId] = [ordered]@{
+            id = $workerId
+            worker_id = $workerId
+            group_id = $groupId
+            task_id = $taskId
+            status = "queued"
+            phase = "Phase5"
+            current_phase = "Phase5"
+            phase_sequence = @("Phase5", "Phase5-1", "Phase5-2", "Phase6")
+            workspace_path = $workspacePath
+            artifact_root = $artifactRoot
+            declared_changed_files = @($worker["declared_changed_files"])
+            resource_locks = @($worker["resource_locks"])
+            lease_token = $leaseToken
+            lease_expires_at = $leaseExpiresAt
+            created_at = $now
+            updated_at = $now
+        }
+    }
+
+    $state["task_groups"][$groupId] = [ordered]@{
+        id = $groupId
+        group_id = $groupId
+        status = "planned"
+        phase = "Phase5..Phase6"
+        phase_range = "Phase5..Phase6"
+        task_ids = @($taskIds.ToArray())
+        worker_ids = @($workerIds.ToArray())
+        package_path = (Join-Path $PackageRoot "task-group-package.json")
+        workspace_mode = $WorkspaceMode
+        commit_policy = $CommitPolicy
+        policy = "wait_for_siblings"
+        created_at = $now
+        updated_at = $now
+        failure_summary = $null
+    }
+
+    $content = [ordered]@{
+        schema_version = 1
+        package_kind = "task-group-leased-package"
+        run_id = $runId
+        group_id = $groupId
+        phase_range = "Phase5..Phase6"
+        created_at = $now
+        workers = @($workerPackages.ToArray())
+        provider_spec = $provider
+        workspace_mode = $WorkspaceMode
+        commit_policy = $CommitPolicy
+    }
+    $packagePath = Join-Path $PackageRoot "task-group-package.json"
+    Set-Content -Path $packagePath -Value (($content | ConvertTo-Json -Depth 50) + "`n") -Encoding UTF8
+
+    return [ordered]@{
+        status = "planned"
+        reason = "created task group package with $($workerPackages.Count) queued worker(s)"
+        group_id = $groupId
+        package_path = $packagePath
+        package = $content
+        run_state = $state
+        rejected_candidates = @($plan["rejected_candidates"])
+    }
+}
+
+function New-TaskGroupJobPackages {
+    param(
+        [Parameter(Mandatory)][string]$ProjectRoot,
+        [Parameter(Mandatory)]$RunState,
+        [Parameter(Mandatory)]$ProviderSpec,
+        [string]$PackageRoot,
+        [string]$WorkspaceRoot,
+        [string]$WorkspaceMode = "isolated-copy-experimental",
+        [string]$CommitPolicy = "all_or_nothing",
+        [int]$LeaseDurationMinutes = 120,
+        [switch]$AllowSingleParallelJob,
+        [switch]$AllowNonParallelSafety,
+        [switch]$AllowEmptyChangedFiles
+    )
+
+    return New-TaskGroupJobPackage -ProjectRoot $ProjectRoot -RunState $RunState -ProviderSpec $ProviderSpec -PackageRoot $PackageRoot -WorkspaceRoot $WorkspaceRoot -WorkspaceMode $WorkspaceMode -CommitPolicy $CommitPolicy -LeaseDurationMinutes $LeaseDurationMinutes -AllowSingleParallelJob:$AllowSingleParallelJob -AllowNonParallelSafety:$AllowNonParallelSafety -AllowEmptyChangedFiles:$AllowEmptyChangedFiles
+}
+
 function New-ParallelStepJobPackages {
     param(
         [Parameter(Mandatory)][string]$ProjectRoot,
