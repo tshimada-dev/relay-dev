@@ -1,0 +1,433 @@
+{
+  "id": "task-parallelization-prep",
+  "title": "Task Parallelization Preparation Plan",
+  "version": 1,
+  "status": "draft",
+  "source_documents": [
+    "docs/plans/task-parallelization-prep-plan.md",
+    "docs/ideas/task-parallel-execution-proposal.md"
+  ],
+  "goal": "Prepare relay-dev's control plane for future task parallelization while keeping runtime behavior sequential with max_parallel_jobs=1.",
+  "summary": "Refactor the single-job execution path into a lease/execute/commit model, add future-proof multi-job state fields, make task phase cursors explicit, and update monitoring surfaces before enabling real parallel execution.",
+  "non_goals": [
+    "Do not enable official max_parallel_jobs > 1 operation.",
+    "Do not make same-workspace parallel execution the default.",
+    "Do not complete isolated workspace or git worktree merge-back.",
+    "Do not launch visible worker terminals per slot.",
+    "Do not fully migrate to pending_approvals.",
+    "Do not remove compatibility fields current_phase, current_task_id, or active_job_id."
+  ],
+  "principles": [
+    {
+      "id": "P-01",
+      "title": "Keep sequential behavior stable",
+      "description": "Every implementation slice must preserve the current one-job-at-a-time cli.ps1 step behavior."
+    },
+    {
+      "id": "P-02",
+      "title": "Preserve single writer",
+      "description": "Only the control plane writes events.jsonl and run-state.json. Workers and providers return results but do not mutate canonical state directly."
+    },
+    {
+      "id": "P-03",
+      "title": "Make commit the only canonicalization gate",
+      "description": "Provider execution completion is not phase completion. Validation, promotion, event append, state write, and lease clear happen through commit."
+    },
+    {
+      "id": "P-04",
+      "title": "Keep compatibility views explicit",
+      "description": "New fields may become canonical candidates, but existing current_phase, current_task_id, and active_job_id remain compatibility projections during this prep phase."
+    },
+    {
+      "id": "P-05",
+      "title": "Teach monitoring multi-job state first",
+      "description": "Show, watch, dashboard, and summaries should be able to render active_jobs and task_lane state before real parallel execution is enabled."
+    }
+  ],
+  "target_state_shape": {
+    "max_parallel_jobs": 1,
+    "fields": {
+      "state_revision": "Monotonically increasing run-state revision.",
+      "active_jobs": "Map of job_id to active job lease metadata. Prep phase keeps cardinality <= 1.",
+      "task_lane": "Task-lane runtime controls such as mode, max_parallel_jobs, and stop_leasing.",
+      "task_states[].phase_cursor": "Task-local phase cursor for Phase5 through Phase6.",
+      "task_states[].active_job_id": "Task-local active job reference.",
+      "task_states[].wait_reason": "Machine-readable reason a task is waiting or blocked."
+    },
+    "compatibility_fields": [
+      "current_phase",
+      "current_task_id",
+      "active_job_id",
+      "pending_approval"
+    ],
+    "active_job_metadata": [
+      "job_id",
+      "task_id",
+      "phase",
+      "role",
+      "lease_token",
+      "leased_at",
+      "lease_expires_at",
+      "last_heartbeat_at",
+      "lease_owner",
+      "slot_id",
+      "workspace_id",
+      "state_revision"
+    ]
+  },
+  "implementation_steps": [
+    {
+      "id": "TPP-01",
+      "title": "Extend RunState schema for parallel-ready state",
+      "priority": "P0",
+      "depends_on": [],
+      "goal": "Add active_jobs, task_lane, state_revision, and task-local cursor fields without changing sequential behavior.",
+      "tasks": [
+        "Add active_jobs and task_lane to newly initialized run-state.",
+        "Add state_revision and increment it on state writes.",
+        "Add task_states[].phase_cursor, task_states[].active_job_id, and task_states[].wait_reason.",
+        "Treat active_job_id as a compatibility view derived from active_jobs where possible."
+      ],
+      "candidate_files": [
+        "app/core/run-state-store.ps1",
+        "app/core/workflow-engine.ps1",
+        "app/core/event-store.ps1",
+        "tests/regression.ps1"
+      ],
+      "acceptance": [
+        "New run-state includes active_jobs, task_lane, and state_revision.",
+        "Existing sequential step behavior is unchanged.",
+        "Existing code that reads active_job_id still works.",
+        "state_revision increases monotonically after state writes."
+      ],
+      "verification": [
+        "Run the regression suite or the relevant run-state initialization tests.",
+        "Inspect a newly created run-state fixture for the new fields."
+      ]
+    },
+    {
+      "id": "TPP-02",
+      "title": "Introduce single-job lease model",
+      "priority": "P0",
+      "depends_on": [
+        "TPP-01"
+      ],
+      "goal": "Represent the current single active job as an active_jobs entry with lease metadata.",
+      "tasks": [
+        "Create active_jobs[job_id] at dispatch or lease time.",
+        "Populate lease_token, lease_expires_at, last_heartbeat_at, lease_owner, slot_id, and workspace_id.",
+        "Update active_jobs[job_id] and task_states[task_id].active_job_id under the same run lock.",
+        "Keep cli.ps1 step as a single-process lease-then-execute flow for now."
+      ],
+      "candidate_files": [
+        "app/core/workflow-engine.ps1",
+        "app/cli.ps1",
+        "app/core/run-lock.ps1",
+        "app/core/run-state-store.ps1"
+      ],
+      "acceptance": [
+        "At most one active job is present per sequential step.",
+        "A job.leased event is emitted after lease creation.",
+        "The lease token is carried into the job result or commit path.",
+        "Failed recovery can inspect active_jobs as well as the compatibility active_job_id."
+      ],
+      "verification": [
+        "Run a fake-provider step and inspect active job metadata during dispatch.",
+        "Assert job.leased appears in events.jsonl."
+      ]
+    },
+    {
+      "id": "TPP-03",
+      "title": "Separate execute and commit boundaries",
+      "priority": "P0",
+      "depends_on": [
+        "TPP-02"
+      ],
+      "goal": "Make provider execution completion distinct from canonical commit.",
+      "tasks": [
+        "Move Invoke-EngineStep internals toward lease, execute, and commit function boundaries.",
+        "Reload latest run-state at commit start.",
+        "Validate lease fencing before artifact promotion or state transition.",
+        "Emit job.committed on success and job.commit_rejected on fencing rejection."
+      ],
+      "candidate_files": [
+        "app/cli.ps1",
+        "app/core/phase-execution-transaction.ps1",
+        "app/core/phase-completion-committer.ps1",
+        "app/core/phase-validation-pipeline.ps1",
+        "app/core/workflow-engine.ps1"
+      ],
+      "acceptance": [
+        "A successful execute result cannot update canonical artifacts if commit fencing fails.",
+        "Successful commit emits job.committed.",
+        "Rejected commit emits job.commit_rejected.",
+        "Validation failure and repairer flows keep their existing behavior."
+      ],
+      "verification": [
+        "Add or run tests for lease token mismatch and expired lease commit rejection.",
+        "Run existing repairer and validation regression coverage."
+      ]
+    },
+    {
+      "id": "TPP-04",
+      "title": "Make task phase cursor a canonical candidate",
+      "priority": "P1",
+      "depends_on": [
+        "TPP-01",
+        "TPP-03"
+      ],
+      "goal": "Record Phase5 through Phase6 progress on each task state while preserving current coarse run fields.",
+      "tasks": [
+        "Update task_states[task_id].phase_cursor for task-scoped Phase5 through Phase6 transitions.",
+        "Keep current_phase and current_task_id as coarse compatibility views.",
+        "Move task-local rollback state updates toward task state.",
+        "Ensure completed task state drives next task or Phase7 progression."
+      ],
+      "candidate_files": [
+        "app/core/workflow-engine.ps1",
+        "app/core/transition-resolver.ps1",
+        "app/core/run-state-store.ps1",
+        "app/cli.ps1"
+      ],
+      "acceptance": [
+        "After Phase4-1 go, the selected task phase_cursor is Phase5.",
+        "Phase5 -> Phase5-1 -> Phase5-2 -> Phase6 updates are reflected in task state.",
+        "Phase6 go marks the task completed and proceeds to the next task or Phase7 as before.",
+        "Existing dashboard and status projections remain equivalent for sequential runs."
+      ],
+      "verification": [
+        "Run scenario regression for Phase4-1 go through Phase6 go.",
+        "Inspect run-state task_states after each task-scoped phase transition."
+      ]
+    },
+    {
+      "id": "TPP-05",
+      "title": "Make commit transaction explicit",
+      "priority": "P0",
+      "depends_on": [
+        "TPP-03"
+      ],
+      "goal": "Group validation, artifact promotion, transition calculation, event append, state write, and lease clear into an explicit commit transaction.",
+      "tasks": [
+        "Define a commit transaction boundary in the control plane.",
+        "Keep artifact validation and promotion inside the commit path.",
+        "Ensure active job and lease clear occur consistently with event and state updates.",
+        "Keep stale or rejected job artifacts as forensic artifacts instead of promoting them."
+      ],
+      "candidate_files": [
+        "app/core/phase-completion-committer.ps1",
+        "app/core/phase-execution-transaction.ps1",
+        "app/core/artifact-repository.ps1",
+        "app/core/workflow-engine.ps1"
+      ],
+      "acceptance": [
+        "Canonical artifacts are not partially updated when commit fails.",
+        "active_jobs is cleared after successful commit.",
+        "Expired lease commits are rejected.",
+        "Stale job artifacts can remain available for forensic inspection."
+      ],
+      "verification": [
+        "Run commit failure regression using fake-provider or fixture artifacts.",
+        "Inspect canonical artifact directories after rejected commit."
+      ]
+    },
+    {
+      "id": "TPP-06",
+      "title": "Extract task-lane summary for monitor and show",
+      "priority": "P1",
+      "depends_on": [
+        "TPP-01",
+        "TPP-02"
+      ],
+      "goal": "Centralize active job and task lane summary rendering inputs before actual parallel execution exists.",
+      "tasks": [
+        "Add a summary helper that reads run-state and events.",
+        "Update cli.ps1 show to display active jobs and task lane counts.",
+        "Update watch-run, dashboard-renderer, and run-summary-renderer to consume the same summary where practical.",
+        "Add display slots for stale lease, approval wait, dependency wait, and blocked tasks."
+      ],
+      "candidate_files": [
+        "app/ui/task-lane-summary.ps1",
+        "app/ui/run-summary-renderer.ps1",
+        "app/ui/dashboard-renderer.ps1",
+        "watch-run.ps1",
+        "app/cli.ps1"
+      ],
+      "acceptance": [
+        "show displays active jobs and task lane counts.",
+        "watch-run no longer depends only on a single current job view.",
+        "Stale lease, approval wait, and dependency wait have explicit display fields.",
+        "Renderers do not duplicate task-lane inference logic."
+      ],
+      "verification": [
+        "Run cli.ps1 show against a fixture state with active_jobs.",
+        "Run or inspect watch-run rendering against a fixture state."
+      ]
+    },
+    {
+      "id": "TPP-07",
+      "title": "Add approval block compatibility behavior",
+      "priority": "P1",
+      "depends_on": [
+        "TPP-01",
+        "TPP-06"
+      ],
+      "goal": "Keep pending_approval single for now while representing lane-level stop_leasing during approval waits.",
+      "tasks": [
+        "Set task_lane.stop_leasing=true when approval is requested.",
+        "Clear stop_leasing when approval is resolved.",
+        "Set wait_reason=approval for the relevant task when applicable.",
+        "Reserve a future migration path toward pending_approvals without fully implementing it."
+      ],
+      "candidate_files": [
+        "app/approval/approval-manager.ps1",
+        "app/approval/terminal-adapter.ps1",
+        "app/core/workflow-engine.ps1",
+        "app/core/run-state-store.ps1"
+      ],
+      "acceptance": [
+        "New leases stop while approval is pending.",
+        "stop_leasing is cleared after approval resolution.",
+        "The approval target task and phase are visible in monitor or show output.",
+        "Existing terminal approval flow still works."
+      ],
+      "verification": [
+        "Run approval-request and approval-resolve regression scenarios.",
+        "Inspect run-state task_lane and wait_reason during approval wait."
+      ]
+    },
+    {
+      "id": "TPP-08",
+      "title": "Expand regression coverage for parallelization prep",
+      "priority": "P0",
+      "depends_on": [
+        "TPP-01",
+        "TPP-02",
+        "TPP-03",
+        "TPP-04",
+        "TPP-05",
+        "TPP-06",
+        "TPP-07"
+      ],
+      "goal": "Lock in the single-job multi-state behavior so later parallelization cannot regress it.",
+      "tasks": [
+        "Add tests for initial active_jobs and task_lane fields.",
+        "Add tests preventing duplicate lease of the same task.",
+        "Add tests for lease token mismatch commit rejection.",
+        "Add tests for expired lease commit rejection.",
+        "Add tests that active_jobs is empty after successful commit.",
+        "Add tests for task phase_cursor through Phase5-6 transitions.",
+        "Add tests for approval stop_leasing.",
+        "Add tests for show or summary output with active_jobs."
+      ],
+      "candidate_files": [
+        "tests/regression.ps1",
+        "tests/fixtures",
+        "app/execution/providers/fake-provider.ps1"
+      ],
+      "acceptance": [
+        "Regression suite covers lease, commit, stale recovery, task cursor, approval block, and monitor summary prep behavior.",
+        "Tests pass in sequential max_parallel_jobs=1 mode."
+      ],
+      "verification": [
+        "Run tests/regression.ps1 or the targeted regression subset.",
+        "Record any skipped tests and the reason in the worklog."
+      ]
+    }
+  ],
+  "recommended_order": [
+    "TPP-01",
+    "TPP-02",
+    "TPP-03",
+    "TPP-05",
+    "TPP-04",
+    "TPP-06",
+    "TPP-07",
+    "TPP-08"
+  ],
+  "global_acceptance": {
+    "P0": [
+      "Existing cli.ps1 step sequential flow passes.",
+      "run-state.json has future-proof active_jobs, task_lane, and state_revision fields.",
+      "active_jobs and active_job_id remain consistent.",
+      "Commit validates lease token.",
+      "Stale or expired job commits do not update canonical artifacts."
+    ],
+    "P1": [
+      "Phase5 through Phase6 task cursor is reflected in task state.",
+      "show and watch-run can display active jobs and task lane summary.",
+      "Approval wait can be represented with stop_leasing.",
+      "Regression tests cover main lease, commit, and monitor cases."
+    ],
+    "P2": [
+      "Invoke-EngineStep internals are separated into lease, execute, and commit responsibilities.",
+      "A future worker pool can be inserted at the execute boundary.",
+      "Future same-workspace parallel and isolated workspace work have clear extension points."
+    ]
+  },
+  "risks": [
+    {
+      "id": "R-01",
+      "title": "Compatibility fields become duplicate sources of truth",
+      "mitigation": "Keep compatibility projection logic centralized and document which fields are canonical candidates."
+    },
+    {
+      "id": "R-02",
+      "title": "Commit transaction becomes too large",
+      "mitigation": "Keep the transaction boundary explicit but split validation, promotion, transition, and event append into helpers."
+    },
+    {
+      "id": "R-03",
+      "title": "Approval model generalizes too early",
+      "mitigation": "Use pending_approval plus stop_leasing during this prep plan; leave pending_approvals to a later design."
+    },
+    {
+      "id": "R-04",
+      "title": "Team treats prep completion as same-workspace parallel approval",
+      "mitigation": "State clearly that this plan does not enable production parallel execution."
+    }
+  ],
+  "follow_up_plans": [
+    {
+      "title": "Conservative parallel scheduler plan",
+      "scope": [
+        "max_parallel_jobs > 1",
+        "ready queue",
+        "resource locks",
+        "same-workspace experiment mode"
+      ]
+    },
+    {
+      "title": "Isolated workspace execution plan",
+      "scope": [
+        "per-task workspace",
+        "serial merge-back",
+        "merge conflict handling",
+        "rebase queue"
+      ]
+    },
+    {
+      "title": "Visible worker slot launcher plan",
+      "scope": [
+        "monitor, control, and worker slot terminals",
+        "slot title updates",
+        "worker slot lifecycle"
+      ]
+    }
+  ],
+  "llm_execution_guidance": {
+    "preferred_first_slice": "Implement TPP-01 with tests, then stop for review before touching lease execution behavior.",
+    "do_not_do": [
+      "Do not enable more than one active job.",
+      "Do not remove compatibility fields.",
+      "Do not add same-workspace parallel execution.",
+      "Do not rewrite unrelated phase logic."
+    ],
+    "worktree_safety": [
+      "Read current git status before implementation.",
+      "Do not revert unrelated user changes.",
+      "Keep changes scoped to the listed candidate files for the selected task."
+    ],
+    "verification_policy": "Run targeted regression tests for each slice. If full regression is too expensive, record the skipped scope and reason."
+  }
+}
