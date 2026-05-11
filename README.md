@@ -1,5 +1,8 @@
 # Relay-Dev
 
+> [!WARNING]
+> **Work in progress:** relay-dev は現在開発中です。仕様、artifact schema、CLI、実行フローは変更される可能性があります。
+
 > **Phase-driven AI development runner with reviewable artifacts and human approval gates.**
 > `tasks/task.md` と `DESIGN.md` を入力に、Phase0〜Phase8 の typed artifacts と承認履歴を生成するオーケストレーター。AI provider は CLI として差し替え可能。
 
