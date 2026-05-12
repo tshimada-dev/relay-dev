@@ -1,0 +1,154 @@
+{
+  "objective": "Resolve the highest-value residual issues from the Phase5 parallel run investigation while preserving the current strict default scheduler behavior.",
+  "scope": [
+    "Parallel-step launch policy for cautious task lanes",
+    "Operator visibility in show/lane summary for blocked or rejected lane candidates",
+    "Rejected Phase6 task-state recovery and display consistency",
+    "Focused regression coverage for scheduler, package, recovery, and UI summary behavior",
+    "Investigation memo status updates after implementation"
+  ],
+  "out_of_scope": [
+    "Directly rewriting existing run-state files under runs/",
+    "Changing the sample app product files under examples/parallel_smoke_system/",
+    "Making cautious lanes launch by default",
+    "Broad redesign of task grouping semantics",
+    "Full task contract lint/preflight for every possible file reference pattern unless it is needed by the implemented slice"
+  ],
+  "constraints": [
+    "Preserve unrelated user changes in tasks/, outputs/, docs/worklog/, docs/investigations/, and examples/parallel_smoke_system/.",
+    "Use normal relay-dev entrypoints and tests; do not manually patch canonical run-state to force progress.",
+    "Workers are not alone in the codebase and must not revert or overwrite edits outside their assigned write scope.",
+    "Parent agent owns final integration, full regression, and final reporting."
+  ],
+  "assumptions": [
+    "The strict default should continue to reject non-parallel lanes unless an explicit opt-in is supplied.",
+    "A cautious opt-in should allow cautious lanes but should not accidentally allow serial lanes.",
+    "Operator visibility can be improved without changing scheduler eligibility semantics.",
+    "The current run inconsistency is best handled by code-level repair/display improvements, not direct mutation of the run files.",
+    "Non-task-scoped rollback targets such as Phase4 are broader planning rollback decisions and remain out of scope for automatic task-lane repair in this slice."
+  ],
+  "tasks": [
+    {
+      "id": "IRD-01",
+      "title": "Add cautious lane opt-in",
+      "intent": "Let operators explicitly launch cautious lanes while keeping default parallel-step strict.",
+      "write_scope": [
+        "app/cli.ps1",
+        "app/core/parallel-job-packages.ps1",
+        "tests/task-parallelization-headless-execution.ps1",
+        "tests/task-group-parallel-package.ps1"
+      ],
+      "dependencies": [],
+      "parallel_group": "policy",
+      "worker_role": "worker",
+      "acceptance": [
+        "CLI exposes an explicit AllowCautious-style switch for parallel-step.",
+        "Default parallel-step still rejects cautious and serial candidates.",
+        "The new opt-in allows cautious candidates only; serial candidates remain rejected unless an existing broader non-parallel test path explicitly allows them.",
+        "Rejected candidate errors distinguish cautious from serial where practical."
+      ],
+      "tests": [
+        "pwsh -NoLogo -NoProfile -File tests/task-group-parallel-package.ps1",
+        "pwsh -NoLogo -NoProfile -File tests/task-parallelization-headless-execution.ps1"
+      ],
+      "risks": [
+        "Existing internal AllowNonParallelSafety behavior may be shared by group-step tests and must not be broken.",
+        "CLI parameter naming must remain compatible with existing scripts."
+      ],
+      "status": "completed"
+    },
+    {
+      "id": "IRD-02",
+      "title": "Explain lane blocking in show",
+      "intent": "Make running-but-idle and ready-but-not-launchable states understandable from show output.",
+      "write_scope": [
+        "app/ui/task-lane-summary.ps1",
+        "tests/task-parallelization-ready-ui.ps1",
+        "tests/task-group-parallel-ui.ps1"
+      ],
+      "dependencies": [
+        "IRD-01"
+      ],
+      "parallel_group": "serial",
+      "worker_role": "worker",
+      "acceptance": [
+        "lane_summary waiting tasks include a concrete reason for cautious, serial, dependency, active job, and non task-scoped current phase cases when detectable.",
+        "lane_summary exposes additive blocking detail that aligns with the cautious opt-in introduced by IRD-01, dependency repair, or normal waiting.",
+        "Existing summary fields remain backward compatible."
+      ],
+      "tests": [
+        "pwsh -NoLogo -NoProfile -File tests/task-parallelization-ready-ui.ps1",
+        "pwsh -NoLogo -NoProfile -File tests/task-group-parallel-ui.ps1"
+      ],
+      "risks": [
+        "Show output is consumed as JSON, so new fields should be additive.",
+        "Do not make the UI summary depend on package creation side effects."
+      ],
+      "status": "completed"
+    },
+    {
+      "id": "IRD-03",
+      "title": "Clarify rejected Phase6 recovery limits",
+      "intent": "Strengthen coverage for supported task-scoped Phase6 reject recovery and explicitly preserve non-task rollback as a remaining design issue.",
+      "write_scope": [
+        "app/core/workflow-engine.ps1",
+        "tests/task-parallelization-scheduler.ps1",
+        "tests/task-parallelization-ready-recovery.ps1"
+      ],
+      "dependencies": [],
+      "parallel_group": "recovery",
+      "worker_role": "worker",
+      "acceptance": [
+        "Repair-RejectedPhase6TaskState continues to reopen stale rejected Phase6 lanes to a valid task-scoped rollback_phase such as Phase5.",
+        "Tests cover a task with last_completed_phase Phase6, status in_progress, phase_cursor Phase6, and canonical reject artifact rollback_phase Phase5.",
+        "Tests make clear that non-task rollback_phase values such as Phase4 are not automatically task-lane repaired in this slice."
+      ],
+      "tests": [
+        "pwsh -NoLogo -NoProfile -File tests/task-parallelization-scheduler.ps1",
+        "pwsh -NoLogo -NoProfile -File tests/task-parallelization-ready-recovery.ps1"
+      ],
+      "risks": [
+        "Rollback to Phase4 is not task-scoped in existing helpers and must remain documented as a residual design issue.",
+        "A repair must not override active sibling jobs or pending approvals."
+      ],
+      "status": "completed"
+    },
+    {
+      "id": "IRD-04",
+      "title": "Update investigation memo",
+      "intent": "Keep docs/investigations accurate after implementation and verification.",
+      "write_scope": [
+        "docs/investigations/phase5-parallel-run-monitoring-2026-05-11.md"
+      ],
+      "dependencies": [
+        "IRD-01",
+        "IRD-02",
+        "IRD-03"
+      ],
+      "parallel_group": "serial",
+      "worker_role": "parent",
+      "acceptance": [
+        "Implemented items move from 未対応 to 対応済み or 一部緩和済み with test evidence.",
+        "Remaining issues explicitly include any intentionally deferred task contract lint/preflight work.",
+        "The current-run description no longer overstates rollback if run-state and artifact state remain different."
+      ],
+      "tests": [
+        "manual doc review"
+      ],
+      "risks": [
+        "Docs must not claim that sample run files were mutated if only code/tests changed."
+      ],
+      "status": "completed"
+    }
+  ],
+  "verification": [
+    "pwsh -NoLogo -NoProfile -File tests/task-parallelization-scheduler.ps1",
+    "pwsh -NoLogo -NoProfile -File tests/task-parallelization-ready-recovery.ps1",
+    "pwsh -NoLogo -NoProfile -File tests/task-parallelization-ready-ui.ps1",
+    "pwsh -NoLogo -NoProfile -File tests/task-group-parallel-package.ps1",
+    "pwsh -NoLogo -NoProfile -File tests/task-group-parallel-ui.ps1",
+    "pwsh -NoLogo -NoProfile -File tests/task-parallelization-headless-execution.ps1",
+    "pwsh -NoLogo -NoProfile -File tests/regression.ps1"
+  ],
+  "review_status": "passed"
+}

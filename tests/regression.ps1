@@ -435,6 +435,13 @@ try {
     Assert-Equal $defaultRunState["current_phase"] "Phase0" "New-RunState should default to Phase0"
     Assert-True ($defaultRunState.Keys -contains "active_attempt") "New-RunState should initialize active_attempt"
     Assert-True ($null -eq $defaultRunState["active_attempt"]) "New-RunState should default active_attempt to null"
+    Assert-True ($defaultRunState.Keys -contains "active_jobs") "New-RunState should initialize active_jobs"
+    Assert-Equal @($defaultRunState["active_jobs"].Keys).Count 0 "New-RunState should default active_jobs to empty"
+    Assert-True ($defaultRunState.Keys -contains "task_lane") "New-RunState should initialize task_lane"
+    Assert-Equal $defaultRunState["task_lane"]["mode"] "single" "New-RunState should default task_lane mode to single"
+    Assert-Equal ([int]$defaultRunState["task_lane"]["max_parallel_jobs"]) 1 "New-RunState should default max_parallel_jobs to 1"
+    Assert-Equal ([bool]$defaultRunState["task_lane"]["stop_leasing"]) $false "New-RunState should default stop_leasing to false"
+    Assert-Equal ([int]$defaultRunState["state_revision"]) 0 "New-RunState should start state_revision at 0 before first write"
     $runState = New-RunState -RunId $runId -ProjectRoot $tempRoot -CurrentPhase "Phase3" -CurrentRole "implementer"
     Write-RunState -ProjectRoot $tempRoot -RunState $runState | Out-Null
     Set-CurrentRunPointer -ProjectRoot $tempRoot -RunId $runId | Out-Null
@@ -445,6 +452,42 @@ try {
     Assert-Equal $readState["current_phase"] "Phase3" "Read-RunState should preserve current_phase"
     Assert-Equal @($readState["open_requirements"]).Count 0 "Read-RunState should preserve empty arrays"
     Assert-True ($readState.Keys -contains "active_attempt") "Read-RunState should preserve active_attempt compatibility field"
+    Assert-True ($readState.Keys -contains "active_jobs") "Read-RunState should preserve active_jobs compatibility field"
+    Assert-Equal @($readState["active_jobs"].Keys).Count 0 "Read-RunState should preserve empty active_jobs"
+    Assert-Equal $readState["task_lane"]["mode"] "single" "Read-RunState should preserve task_lane mode"
+    Assert-Equal ([int]$readState["state_revision"]) 1 "Write-RunState should increment state_revision on first write"
+    Write-RunState -ProjectRoot $tempRoot -RunState $readState | Out-Null
+    $readStateAfterSecondWrite = Read-RunState -ProjectRoot $tempRoot -RunId $runId
+    Assert-Equal ([int]$readStateAfterSecondWrite["state_revision"]) 2 "Write-RunState should increment state_revision monotonically"
+    $leaseProbe = Add-RunStateActiveJobLease -RunState $readStateAfterSecondWrite -JobSpec @{
+        job_id = "job-lease"
+        phase = "Phase3"
+        role = "implementer"
+    } -LeaseOwner "test-owner" -SlotId "slot-test" -WorkspaceId "main"
+    $leasedState = ConvertTo-RelayHashtable -InputObject $leaseProbe["run_state"]
+    $lease = ConvertTo-RelayHashtable -InputObject $leaseProbe["lease"]
+    Assert-Equal $leasedState["active_job_id"] "job-lease" "Add-RunStateActiveJobLease should set compatibility active_job_id"
+    Assert-True ($leasedState["active_jobs"].ContainsKey("job-lease")) "Add-RunStateActiveJobLease should add active_jobs entry"
+    Assert-Equal $lease["lease_owner"] "test-owner" "Add-RunStateActiveJobLease should preserve lease_owner"
+    $validLeaseCheck = Test-RunStateActiveJobLease -RunState $leasedState -JobId "job-lease" -LeaseToken ([string]$lease["lease_token"]) -Phase "Phase3"
+    Assert-True ([bool]$validLeaseCheck["valid"]) "Test-RunStateActiveJobLease should accept matching lease metadata"
+    $mismatchedLeaseCheck = Test-RunStateActiveJobLease -RunState $leasedState -JobId "job-lease" -LeaseToken "wrong-token" -Phase "Phase3"
+    Assert-True (-not [bool]$mismatchedLeaseCheck["valid"]) "Test-RunStateActiveJobLease should reject mismatched lease tokens"
+    $expiredLeaseState = ConvertTo-RelayHashtable -InputObject $leasedState
+    $expiredLeaseState["active_jobs"]["job-lease"]["lease_expires_at"] = (Get-Date).AddMinutes(-5).ToString("o")
+    $expiredLeaseCheck = Test-RunStateActiveJobLease -RunState $expiredLeaseState -JobId "job-lease" -LeaseToken ([string]$lease["lease_token"]) -Phase "Phase3"
+    Assert-True (-not [bool]$expiredLeaseCheck["valid"]) "Test-RunStateActiveJobLease should reject expired leases"
+    $duplicateLeaseRejected = $false
+    try {
+        $null = Add-RunStateActiveJobLease -RunState $leasedState -JobSpec @{ job_id = "job-other"; phase = "Phase3"; role = "implementer" }
+    }
+    catch {
+        $duplicateLeaseRejected = $true
+    }
+    Assert-True $duplicateLeaseRejected "Add-RunStateActiveJobLease should reject a second active job in single mode"
+    $clearedLeaseState = Clear-RunStateActiveJobLease -RunState $leasedState -JobId "job-lease"
+    Assert-Equal $clearedLeaseState["active_job_id"] $null "Clear-RunStateActiveJobLease should clear compatibility active_job_id"
+    Assert-Equal @($clearedLeaseState["active_jobs"].Keys).Count 0 "Clear-RunStateActiveJobLease should clear active_jobs entry"
     Assert-Equal (Resolve-ActiveRunId -ProjectRoot $tempRoot) $runId "Resolve-ActiveRunId should use current-run pointer"
     Assert-Equal @((Get-Events -ProjectRoot $tempRoot -RunId $runId)).Count 2 "Get-Events should return appended events"
     Assert-Equal (Get-LastEvent -ProjectRoot $tempRoot -RunId $runId -Type "job.finished")["job_id"] "job-1" "Get-LastEvent should return the latest matching event"
@@ -1385,6 +1428,21 @@ try {
         Assert-True ([bool]$artifactWrite["validation"]["valid"]) "Remaining phase artifact should validate: $($artifactEntry['name'])"
     }
 
+    $validPhase51NonBlockingChecks = Test-ArtifactContract -ArtifactId "phase5-1_verdict.json" -Artifact @{
+        task_id = "T-01"
+        verdict = "go"
+        rollback_phase = $null
+        must_fix = @()
+        warnings = @("Companion task evidence is not available yet.")
+        evidence = @("checked")
+        acceptance_criteria_checks = @(New-Phase51AcceptanceChecks -Status "pass")
+        review_checks = New-Phase51ReviewChecks -StatusOverrides @{
+            test_evidence_review = "warning"
+            visual_contract_alignment = "not_applicable"
+        }
+    } -Phase "Phase5-1"
+    Assert-True ([bool]$validPhase51NonBlockingChecks["valid"]) "Phase5-1 go verdict should allow non-blocking warning and not_applicable review checks."
+
     $invalidPhase51 = Test-ArtifactContract -ArtifactId "phase5-1_verdict.json" -Artifact @{
         task_id = "T-01"
         verdict = "go"
@@ -1717,6 +1775,12 @@ try {
     $registered = Register-PlannedTasks -RunState $runState -TasksArtifact $phase4Tasks
     Assert-Equal $registered["task_states"]["T-01"]["status"] "ready" "Register-PlannedTasks should mark dependency-free tasks ready"
     Assert-Equal $registered["task_states"]["T-02"]["status"] "not_started" "Register-PlannedTasks should keep blocked tasks not_started"
+    Assert-True ($registered["task_states"]["T-01"].ContainsKey("phase_cursor")) "New task states should include phase_cursor"
+    Assert-True ($null -eq $registered["task_states"]["T-01"]["phase_cursor"]) "New task states should default phase_cursor to null"
+    Assert-True ($registered["task_states"]["T-01"].ContainsKey("active_job_id")) "New task states should include active_job_id"
+    Assert-True ($null -eq $registered["task_states"]["T-01"]["active_job_id"]) "New task states should default active_job_id to null"
+    Assert-True ($registered["task_states"]["T-01"].ContainsKey("wait_reason")) "New task states should include wait_reason"
+    Assert-True ($null -eq $registered["task_states"]["T-01"]["wait_reason"]) "New task states should default wait_reason to null"
 
     $selectedState = Set-RunStateCursor -RunState $registered -Phase "Phase5" -TaskId $null
     $nextAction = Get-NextAction -RunState $selectedState -ProjectRoot $tempEngineRoot
@@ -1735,6 +1799,7 @@ try {
     } -ValidationResult @{ valid = $true } -Artifact @{ verdict = "go"; rollback_phase = $null } -ProjectRoot $tempEngineRoot
     Assert-Equal $phase41Mutation["run_state"]["current_phase"] "Phase5" "Phase4-1 go should advance to Phase5"
     Assert-Equal $phase41Mutation["run_state"]["current_task_id"] "T-01" "Phase4-1 go should select the first ready task"
+    Assert-Equal $phase41Mutation["run_state"]["task_states"]["T-01"]["phase_cursor"] "Phase5" "Phase4-1 go should set the selected task phase_cursor"
 
     $phase41ApprovalMutation = Apply-JobResult -RunState $phase41State -JobResult @{
         phase = "Phase4-1"
@@ -1742,6 +1807,7 @@ try {
         exit_code = 0
     } -ValidationResult @{ valid = $true } -Artifact @{ verdict = "go"; rollback_phase = $null } -ProjectRoot $tempEngineRoot -ApprovalPhases @("Phase4-1")
     Assert-Equal $phase41ApprovalMutation["action"]["type"] "RequestApproval" "Configured approval phases should request approval"
+    Assert-Equal ([bool]$phase41ApprovalMutation["run_state"]["task_lane"]["stop_leasing"]) $true "Approval requests should stop new task-lane leases"
     Assert-Equal (@($phase41ApprovalMutation["run_state"]["pending_approval"]["allowed_reject_phases"]) -join ",") "Phase3,Phase4" "Approval request should preserve all valid reject targets"
 
     $phase41ConditionalApprovalMutation = Apply-JobResult -RunState $phase41State -JobResult @{
@@ -1767,6 +1833,7 @@ try {
         decision = "approve"
     }
     Assert-Equal $phase41ConditionalApproved["run_state"]["current_phase"] "Phase4" "Approving conditional_go should resume the proposed Phase4 action"
+    Assert-Equal ([bool]$phase41ConditionalApproved["run_state"]["task_lane"]["stop_leasing"]) $false "Approval resolution should unblock task-lane leasing"
     Assert-Equal @($phase41ConditionalApproved["run_state"]["open_requirements"]).Count 2 "Approving conditional_go should preserve reviewer must-fix items as open requirements"
     Assert-Equal $phase41ConditionalApproved["run_state"]["open_requirements"][0]["source_phase"] "Phase4-1" "Auto-carried requirements should keep the reviewer phase as source"
     Assert-Equal $phase41ConditionalApproved["run_state"]["open_requirements"][0]["verify_in_phase"] "Phase4" "Auto-carried requirements should target the resumed phase for verification"
@@ -1865,6 +1932,8 @@ try {
     } -ProjectRoot $tempEngineRoot
     Assert-Equal $phase6Conditional["run_state"]["current_phase"] "Phase5" "Phase6 conditional_go should return to Phase5 when next task exists"
     Assert-Equal $phase6Conditional["run_state"]["current_task_id"] "T-02" "Phase6 conditional_go should move to the next ready task"
+    Assert-Equal $phase6Conditional["run_state"]["task_states"]["T-01"]["active_job_id"] $null "Apply-JobResult should clear task active_job_id after commit"
+    Assert-Equal $phase6Conditional["run_state"]["task_states"]["T-01"]["status"] "completed" "Phase6 completion should mark the task completed"
     Assert-Equal @($phase6Conditional["run_state"]["open_requirements"]).Count 1 "Phase6 conditional_go should register open requirements"
 
     $phase6Reject = Apply-JobResult -RunState $phase6State -JobResult @{
@@ -2842,6 +2911,7 @@ finally {
 Write-Host "[13/13] Testing reviewer prompt deduplication..."
 $implementerPrompt = Get-Content -Path (Join-Path $repoRoot "app/prompts/system/implementer.md") -Raw
 $reviewerPrompt = Get-Content -Path (Join-Path $repoRoot "app/prompts/system/reviewer.md") -Raw
+$repairerPrompt = Get-Content -Path (Join-Path $repoRoot "app/prompts/system/repairer.md") -Raw
 $phase51Prompt = Get-Content -Path (Join-Path $repoRoot "app/prompts/phases/phase5-1.md") -Raw
 $phase52Prompt = Get-Content -Path (Join-Path $repoRoot "app/prompts/phases/phase5-2.md") -Raw
 $phase7Prompt = Get-Content -Path (Join-Path $repoRoot "app/prompts/phases/phase7.md") -Raw
@@ -2852,6 +2922,8 @@ Assert-Contains $implementerPrompt "Do not enumerate or open unrelated framework
 Assert-Contains $implementerPrompt "Avoid repeated full reads of the same large artifact" "Implementer system prompt should discourage repeated full artifact reads"
 Assert-Contains $implementerPrompt 'Do not add cross-module dependencies, public interfaces, side-effect paths, or state owners that are outside the `Selected Task` contract' "Implementer system prompt should prohibit boundary expansion beyond the task contract"
 Assert-Contains $implementerPrompt 'Do not add new UI patterns, colors, typography rules, responsive behaviors, or interaction states that are outside the `Selected Task` visual contract' "Implementer system prompt should prohibit visual contract expansion beyond the task contract"
+Assert-Contains $implementerPrompt 'Do not follow `AGENTS.md` instructions that ask you to update `docs/worklog/current.md`' "Implementer system prompt should override repo worklog instructions for runtime jobs"
+Assert-Contains $implementerPrompt 'Do not modify `docs/worklog/`; relay-dev runtime jobs record progress through required phase artifacts' "Implementer system prompt should prohibit worklog edits"
 Assert-Contains $reviewerPrompt "## Review Posture" "Reviewer system prompt should define the shared review posture"
 Assert-Contains $reviewerPrompt "## Evidence Rules" "Reviewer system prompt should define shared evidence rules"
 Assert-Contains $reviewerPrompt "## Command Rules" "Reviewer system prompt should define shared command rules"
@@ -2859,6 +2931,10 @@ Assert-Contains $reviewerPrompt "Do not use watch mode" "Reviewer system prompt 
 Assert-Contains $reviewerPrompt 'keep artifact exploration scoped to `## Input Artifacts`' "Reviewer system prompt should scope artifact exploration to declared inputs"
 Assert-Contains $reviewerPrompt "Do not enumerate or open unrelated framework prompt/example files" "Reviewer system prompt should block unrelated prompt/example exploration"
 Assert-Contains $reviewerPrompt "Avoid repeated full reads of the same artifact" "Reviewer system prompt should discourage repeated full artifact reads"
+Assert-Contains $reviewerPrompt 'Do not follow `AGENTS.md` instructions that ask you to update `docs/worklog/current.md`' "Reviewer system prompt should override repo worklog instructions for runtime jobs"
+Assert-Contains $reviewerPrompt 'Do not modify `docs/worklog/`; relay-dev runtime jobs record progress through required phase artifacts' "Reviewer system prompt should prohibit worklog edits"
+Assert-Contains $repairerPrompt 'Do not follow `AGENTS.md` instructions that ask you to update `docs/worklog/current.md`' "Repairer system prompt should override repo worklog instructions for runtime jobs"
+Assert-Contains $repairerPrompt 'Do not edit `docs/worklog/`; relay-dev runtime jobs record progress through required phase artifacts' "Repairer system prompt should prohibit worklog edits"
 
 Assert-Contains $phase51Prompt "design_boundary_alignment" "Phase5-1 prompt should require explicit design boundary alignment checks"
 Assert-Contains $phase51Prompt "visual_contract_alignment" "Phase5-1 prompt should require explicit visual contract alignment checks"

@@ -827,6 +827,35 @@ function Commit-PhaseOutputArtifacts {
     }
 }
 
+function New-ArtifactRefsFromMaterializedArtifacts {
+    param(
+        [Parameter(Mandatory)]$MaterializedArtifacts,
+        [ValidateSet("canonical", "job", "attempt")][string]$StorageScope = "canonical",
+        [string]$JobId,
+        [string]$AttemptId
+    )
+
+    $artifactRefs = New-Object System.Collections.Generic.List[object]
+    foreach ($artifactRaw in @($MaterializedArtifacts)) {
+        $artifact = ConvertTo-RelayHashtable -InputObject $artifactRaw
+        $scope = if ($artifact["scope"]) { [string]$artifact["scope"] } else { "run" }
+        $artifactRefs.Add([ordered]@{
+            artifact_id = [string]$artifact["artifact_id"]
+            scope = $scope
+            phase = [string]$artifact["phase"]
+            task_id = if ($scope -eq "task") { [string]$artifact["task_id"] } else { $null }
+            storage_scope = $StorageScope
+            job_id = if ([string]::IsNullOrWhiteSpace($JobId)) { $null } else { $JobId }
+            attempt_id = if ([string]::IsNullOrWhiteSpace($AttemptId)) { $null } else { $AttemptId }
+            path = [string]$artifact["path"]
+            as_json = if ($artifact.ContainsKey("as_json")) { [bool]$artifact["as_json"] } else { $false }
+            last_write_time_utc = if ($artifact.ContainsKey("last_write_time_utc")) { [string]$artifact["last_write_time_utc"] } else { $null }
+        }) | Out-Null
+    }
+
+    return @($artifactRefs.ToArray())
+}
+
 function Read-Artifact {
     param(
         [Parameter(Mandatory)][string]$ProjectRoot,
@@ -857,5 +886,19 @@ function Resolve-ArtifactRef {
 
     $ref = ConvertTo-RelayHashtable -InputObject $ArtifactRef
     $scope = if ($ref["scope"]) { [string]$ref["scope"] } else { "run" }
-    return (Get-ArtifactPath -ProjectRoot $ProjectRoot -RunId $RunId -Scope $scope -Phase $ref["phase"] -ArtifactId $ref["artifact_id"] -TaskId $ref["task_id"])
+    $storageScope = if ($ref["storage_scope"]) { [string]$ref["storage_scope"] } else { "canonical" }
+    switch ($storageScope) {
+        "canonical" {
+            return (Get-ArtifactPath -ProjectRoot $ProjectRoot -RunId $RunId -Scope $scope -Phase $ref["phase"] -ArtifactId $ref["artifact_id"] -TaskId $ref["task_id"])
+        }
+        "job" {
+            return (Get-JobArtifactPath -ProjectRoot $ProjectRoot -RunId $RunId -JobId ([string]$ref["job_id"]) -Scope $scope -Phase $ref["phase"] -ArtifactId $ref["artifact_id"] -TaskId $ref["task_id"])
+        }
+        "attempt" {
+            return (Get-AttemptArtifactPath -ProjectRoot $ProjectRoot -RunId $RunId -JobId ([string]$ref["job_id"]) -AttemptId ([string]$ref["attempt_id"]) -Scope $scope -Phase $ref["phase"] -ArtifactId $ref["artifact_id"] -TaskId $ref["task_id"])
+        }
+        default {
+            throw "Unsupported artifact ref storage_scope '$storageScope'."
+        }
+    }
 }

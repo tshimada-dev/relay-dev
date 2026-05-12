@@ -7,7 +7,7 @@
 
 cli:
   command: "codex"
-  flags: "--ask-for-approval never exec --skip-git-repo-check --sandbox workspace-write"
+  flags: "--ask-for-approval never --model gpt-5.4 exec --skip-git-repo-check --sandbox workspace-write"
   implementer_command: ""
   implementer_flags: ""
   reviewer_command: ""
@@ -17,6 +17,13 @@ escalation:
   phase1_timeout_sec: 300
   phase2_timeout_sec: 600
   phase3_timeout_sec: 1200
+
+execution:
+  # Keep the tracked default conservative. Use config/settings.local.yaml or
+  # -ConfigFile with an example copy to opt into auto/parallel task execution.
+  mode: single
+  max_parallel_jobs: 1
+  allow_single_parallel_job: false
 
 watcher:
   poll_fallback_sec: 5

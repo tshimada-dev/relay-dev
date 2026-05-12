@@ -35,6 +35,7 @@
 - `complexity`
 
 `task_id` は安定した識別子にすること。`changed_files` と `acceptance_criteria` は空にしないこと。
+各 task には任意で `resource_locks` と `parallel_safety` を含めてよい。`resource_locks` は同時実行時に排他したい資源名の非空文字列配列にすること。例: `["db-schema"]`, `["auth-config"]`。`parallel_safety` は省略可能だが、記載する場合は `serial` / `cautious` / `parallel` のいずれかにすること。
 `boundary_contract` は各 task が守るべき設計境界の task-scoped 正本であり、以下のキーを必ず持つこと。
 
 - `module_boundaries`
@@ -53,6 +54,8 @@
 - task_id が重複しない
 - dependencies が既知の task_id のみを参照する
 - dependency cycle を作らない
+- `resource_locks` を記載する場合は空配列や空文字列を含めず、共有 DB schema、migration、認証設定、共通生成物など実際に競合しうる資源を示す
+- `parallel_safety` を記載する場合は `serial` / `cautious` / `parallel` のみを使い、未判断の task は `cautious`、単独実行すべき task は `serial` にする
 - 1 task が広すぎず、Phase5 で 1 回の実装単位として扱える
 - 各 task の `boundary_contract` が Phase3 の設計境界を task 単位に投影している
 - `boundary_contract` を見れば「この task にない越境」が判断できる
@@ -258,6 +261,9 @@ visual_contract:
   2. curl -X POST ... で動作確認
   3. レスポンスが期待通りか確認
 依存関係: なし
+resource_locks:
+  - db-schema
+parallel_safety: serial
 テスト内容: ユニットテスト（Repository/Service）+ 統合テスト（API E2E）
 複雑度: S（理由: 単一エンティティ、外部依存なし）
 

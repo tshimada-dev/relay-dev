@@ -13,7 +13,7 @@
 
 cli:
   command: "codex"
-  flags: "--ask-for-approval never exec --skip-git-repo-check --sandbox workspace-write"
+  flags: "--ask-for-approval never --model gpt-5.4 exec --skip-git-repo-check --sandbox workspace-write"
   implementer_command: ""  # 空欄 = command を使用
   implementer_flags: ""
   reviewer_command: ""     # 空欄 = command を使用

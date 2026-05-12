@@ -1,7 +1,7 @@
 #requires -Version 7.0
 
 param(
-    [Parameter(Position = 0)][ValidateSet("new", "resume", "step", "show")][string]$Command = "show",
+    [Parameter(Position = 0)][ValidateSet("new", "resume", "step", "parallel-step", "group-step", "show", "run-leased-job", "run-task-group-worker", "run-task-group")][string]$Command = "show",
     [string]$ConfigFile = "config/settings.yaml",
     [string]$RunId,
     [string]$CurrentPhase = "Phase0",
@@ -15,7 +15,11 @@ param(
     [string]$ProviderCommand,
     [string]$ProviderFlags,
     [string]$ApprovalDecisionJson,
-    [string]$ApprovalDecisionFile
+    [string]$ApprovalDecisionFile,
+    [string]$JobPackageFile,
+    [string]$WorkerId,
+    [switch]$AllowSingleParallelJob,
+    [switch]$AllowCautiousParallelJob
 )
 
 $ErrorActionPreference = "Stop"
@@ -38,9 +42,13 @@ Set-Location $script:ProjectRoot
 . (Join-Path $script:ProjectRoot "app/core/phase-execution-transaction.ps1")
 . (Join-Path $script:ProjectRoot "app/core/job-result-policy.ps1")
 . (Join-Path $script:ProjectRoot "app/core/transition-resolver.ps1")
+. (Join-Path $script:ProjectRoot "app/core/parallel-job-packages.ps1")
+. (Join-Path $script:ProjectRoot "app/core/parallel-workspace.ps1")
+. (Join-Path $script:ProjectRoot "app/core/parallel-launcher.ps1")
 . (Join-Path $script:ProjectRoot "app/approval/approval-manager.ps1")
 . (Join-Path $script:ProjectRoot "app/approval/terminal-adapter.ps1")
 . (Join-Path $script:ProjectRoot "app/core/workflow-engine.ps1")
+. (Join-Path $script:ProjectRoot "app/core/parallel-worker.ps1")
 . (Join-Path $script:ProjectRoot "app/execution/providers/generic-cli.ps1")
 . (Join-Path $script:ProjectRoot "app/execution/providers/codex.ps1")
 . (Join-Path $script:ProjectRoot "app/execution/providers/gemini.ps1")
@@ -50,6 +58,7 @@ Set-Location $script:ProjectRoot
 . (Join-Path $script:ProjectRoot "app/execution/provider-adapter.ps1")
 . (Join-Path $script:ProjectRoot "app/execution/execution-runner.ps1")
 . (Join-Path $script:ProjectRoot "app/phases/phase-registry.ps1")
+. (Join-Path $script:ProjectRoot "app/ui/task-lane-summary.ps1")
 
 $config = Read-Config -Path $ConfigFile
 Initialize-Settings -Config $config -Role "system"
@@ -169,6 +178,30 @@ function Repair-RecoverableFailedRunState {
         $failureClass = [string]$lastJobFinishedEvent["failure_class"]
     }
 
+    $groupRecoveryContext = Get-RunStateTaskGroupFailureRecoveryContext -RunState $state
+    if ($groupRecoveryContext) {
+        return @{
+            changed = $false
+            run_state = $state
+            recovery_event = [ordered]@{
+                type = "run.recovery_suppressed"
+                recovered_from_status = "failed"
+                recovery_action = "suppress_parent_retry"
+                recovery_source = $RecoverySource
+                failure_reason = $failureReason
+                failure_class = $failureClass
+                phase = [string]$state["current_phase"]
+                role = [string]$state["current_role"]
+                task_id = [string]$state["current_task_id"]
+                group_id = [string]$groupRecoveryContext["group_id"]
+                worker_id = [string]$groupRecoveryContext["worker_id"]
+                worker_task_id = [string]$groupRecoveryContext["task_id"]
+                final_phase = [string]$groupRecoveryContext["final_phase"]
+                job_id = if ($lastJobFinishedEvent) { [string]$lastJobFinishedEvent["job_id"] } else { "" }
+            }
+        }
+    }
+
     $canRecover = $false
     if ($failureReason -eq "job_failed" -and $failureClass -in @("provider_error", "timeout")) {
         $canRecover = $true
@@ -184,6 +217,12 @@ function Repair-RecoverableFailedRunState {
         $failureReason -eq "invalid_transition" -and
         $lastJobFinishedEvent -and
         [string]$lastJobFinishedEvent["result_status"] -eq "succeeded"
+    ) {
+        $canRecover = $true
+    }
+    elseif (
+        $failureReason -in @("workspace_boundary_rejected", "manual_commit_rejected_cleanup") -or
+        $failureClass -eq "commit_rejected"
     ) {
         $canRecover = $true
     }
@@ -256,6 +295,159 @@ function Resolve-RoleProviderSpec {
         provider = $resolvedProvider
         command = $resolvedCommand
         flags = $resolvedFlags
+    }
+}
+
+function Resolve-StepExecutionMode {
+    $modeVariable = Get-Variable -Name ExecutionMode -Scope Script -ErrorAction SilentlyContinue
+    $mode = if ($modeVariable) { [string]$modeVariable.Value } else { "auto" }
+    $mode = $mode.Trim().ToLowerInvariant()
+    if ($mode -notin @("single", "auto", "parallel")) {
+        return "auto"
+    }
+
+    return $mode
+}
+
+function Resolve-StepAllowSingleParallelJob {
+    param([switch]$ExplicitAllowSingleParallelJob)
+
+    if ($ExplicitAllowSingleParallelJob) {
+        return $true
+    }
+
+    $allowVariable = Get-Variable -Name ExecutionAllowSingleParallelJob -Scope Script -ErrorAction SilentlyContinue
+    if ($allowVariable -and $null -ne $allowVariable.Value) {
+        return [bool]$allowVariable.Value
+    }
+
+    return $true
+}
+
+function Test-ShouldPreferParallelStep {
+    param([Parameter(Mandatory)][string]$ResolvedRunId)
+
+    $mode = Resolve-StepExecutionMode
+    if ($mode -eq "single") {
+        return $false
+    }
+
+    $state = Read-RunState -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId
+    if (-not $state) {
+        return $false
+    }
+    $state = Initialize-RunStateCompatibilityFields -RunState $state
+
+    if ([string]$state["status"] -in @("completed", "blocked", "failed", "waiting_approval")) {
+        return $false
+    }
+    if ($state["pending_approval"]) {
+        return $false
+    }
+    if (-not (Test-TaskScopedPhase -Phase ([string]$state["current_phase"]))) {
+        return $false
+    }
+
+    $taskLane = ConvertTo-RelayHashtable -InputObject $state["task_lane"]
+    if (-not $taskLane -or [string]$taskLane["mode"] -ne "parallel") {
+        return $false
+    }
+    $activeJobs = ConvertTo-RelayHashtable -InputObject $state["active_jobs"]
+    if (-not $activeJobs) {
+        $activeJobs = @{}
+    }
+    foreach ($jobId in @($activeJobs.Keys)) {
+        $job = ConvertTo-RelayHashtable -InputObject $activeJobs[$jobId]
+        if ($job -and [string]$job["lease_owner"] -ne "parallel-step") {
+            return $false
+        }
+    }
+
+    $maxParallelJobs = 1
+    [void][int]::TryParse([string]$taskLane["max_parallel_jobs"], [ref]$maxParallelJobs)
+    return ($maxParallelJobs -gt 1)
+}
+
+function Test-AutoParallelWaitBlocksSingleFallback {
+    param([AllowNull()]$ParallelResult)
+
+    $result = ConvertTo-RelayHashtable -InputObject $ParallelResult
+    if (-not $result -or [string]$result["status"] -ne "wait") {
+        return $false
+    }
+    if ($result.ContainsKey("blocks_single_fallback") -and [bool]$result["blocks_single_fallback"]) {
+        return $true
+    }
+
+    return ([string]$result["reason"] -in @("task group already active"))
+}
+
+function Sync-ConfiguredTaskLaneForStep {
+    param([Parameter(Mandatory)][string]$ResolvedRunId)
+
+    if ((Resolve-StepExecutionMode) -eq "single") {
+        return
+    }
+
+    $runLock = $null
+    try {
+        $runLock = Acquire-RunLock -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -RetryCount $script:LockRetryCount -RetryDelayMs $script:LockRetryDelay -TimeoutSec $script:LockTimeout
+        $state = Read-RunState -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId
+        if (-not $state) {
+            return
+        }
+        $state = Initialize-RunStateCompatibilityFields -RunState $state
+        if (-not (Test-TaskScopedPhase -Phase ([string]$state["current_phase"]))) {
+            return
+        }
+        if (@($state["task_order"]).Count -eq 0) {
+            return
+        }
+
+        $beforeLane = ConvertTo-RelayHashtable -InputObject $state["task_lane"]
+        if (-not $beforeLane) {
+            $beforeLane = @{}
+        }
+        $nextState = Enable-ConfiguredTaskLaneParallelism -RunState $state
+        $afterLane = ConvertTo-RelayHashtable -InputObject $nextState["task_lane"]
+        if (
+            [string]$beforeLane["mode"] -ne [string]$afterLane["mode"] -or
+            [string]$beforeLane["max_parallel_jobs"] -ne [string]$afterLane["max_parallel_jobs"]
+        ) {
+            $nextState["updated_at"] = (Get-Date).ToString("o")
+            Write-RunState -ProjectRoot $script:ProjectRoot -RunState $nextState | Out-Null
+            Append-RunStatusChangedEvent -RunId $ResolvedRunId -RunState $nextState
+            Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event @{
+                type = "task_lane.configured"
+                mode = [string]$afterLane["mode"]
+                max_parallel_jobs = [int]$afterLane["max_parallel_jobs"]
+                source = "step"
+            }
+        }
+    }
+    finally {
+        Release-RunLock -LockHandle $runLock
+    }
+}
+
+function Invoke-SingleEngineStepWithLock {
+    param(
+        [Parameter(Mandatory)][string]$ResolvedRunId,
+        [AllowNull()][string]$PromptText
+    )
+
+    $runLock = $null
+    try {
+        $runLock = Acquire-RunLock -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -RetryCount $script:LockRetryCount -RetryDelayMs $script:LockRetryDelay -TimeoutSec $script:LockTimeout
+
+        if (-not [string]::IsNullOrWhiteSpace($PromptText)) {
+            return (Invoke-ManualStep -ResolvedRunId $ResolvedRunId -PromptText $PromptText)
+        }
+
+        return (Invoke-EngineStep -ResolvedRunId $ResolvedRunId)
+    }
+    finally {
+        Release-RunLock -LockHandle $runLock
     }
 }
 
@@ -1614,17 +1806,52 @@ function Invoke-EngineStep {
     $runState = Sync-RunStateFromCanonicalArtifacts -RunId $ResolvedRunId -RunState $runState
     $staleRepair = Repair-StaleActiveJobState -RunState $runState -ProjectRoot $script:ProjectRoot
     if ([bool]$staleRepair["changed"]) {
-        $recoveredMetadata = ConvertTo-RelayHashtable -InputObject $staleRepair["job_metadata"]
-        $recoveredJobId = [string]$runState["active_job_id"]
+        $recoveredJobs = @($staleRepair["recovered_jobs"])
+        if ($recoveredJobs.Count -eq 0) {
+            $recoveredJobs = @(
+                [ordered]@{
+                    job_id = [string]$runState["active_job_id"]
+                    reason = [string]$staleRepair["reason"]
+                    job_metadata = (ConvertTo-RelayHashtable -InputObject $staleRepair["job_metadata"])
+                }
+            )
+        }
         $runState = ConvertTo-RelayHashtable -InputObject $staleRepair["run_state"]
         $runState = Clear-RunStateActiveAttempt -RunState $runState -Status "recovered" -Result ([string]$staleRepair["reason"])
         Write-RunState -ProjectRoot $script:ProjectRoot -RunState $runState | Out-Null
         Append-RunStatusChangedEvent -RunId $ResolvedRunId -RunState $runState
+        foreach ($recoveredJobRaw in $recoveredJobs) {
+            $recoveredJob = ConvertTo-RelayHashtable -InputObject $recoveredJobRaw
+            Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event @{
+                type = "job.recovered"
+                job_id = [string]$recoveredJob["job_id"]
+                reason = [string]$recoveredJob["reason"]
+                metadata = (ConvertTo-RelayHashtable -InputObject $recoveredJob["job_metadata"])
+            }
+        }
+    }
+
+    $orphanedTaskRepair = Repair-OrphanedInProgressTaskState -RunState $runState
+    if ([bool]$orphanedTaskRepair["changed"]) {
+        $runState = ConvertTo-RelayHashtable -InputObject $orphanedTaskRepair["run_state"]
+        Write-RunState -ProjectRoot $script:ProjectRoot -RunState $runState | Out-Null
+        Append-RunStatusChangedEvent -RunId $ResolvedRunId -RunState $runState
         Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event @{
-            type = "job.recovered"
-            job_id = $recoveredJobId
-            reason = $staleRepair["reason"]
-            metadata = $recoveredMetadata
+            type = "task.recovered"
+            reason = "orphaned_in_progress_task"
+            tasks = @($orphanedTaskRepair["recovered_tasks"])
+        }
+    }
+
+    $phase6RejectRepair = Repair-RejectedPhase6TaskState -RunState $runState -ProjectRoot $script:ProjectRoot
+    if ([bool]$phase6RejectRepair["changed"]) {
+        $runState = ConvertTo-RelayHashtable -InputObject $phase6RejectRepair["run_state"]
+        Write-RunState -ProjectRoot $script:ProjectRoot -RunState $runState | Out-Null
+        Append-RunStatusChangedEvent -RunId $ResolvedRunId -RunState $runState
+        Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event @{
+            type = "task.recovered"
+            reason = "phase6_reject_rollback"
+            tasks = @($phase6RejectRepair["recovered_tasks"])
         }
     }
 
@@ -1666,11 +1893,26 @@ function Invoke-EngineStep {
                 selected_task = $nextAction["selected_task"]
                 archived_context = $dispatchPreparation["archived_context"]
             }
+            $selectedTaskContract = ConvertTo-RelayHashtable -InputObject $nextAction["selected_task"]
+            if ($selectedTaskContract -and $selectedTaskContract.ContainsKey("resource_locks")) {
+                $jobSpec["resource_locks"] = @($selectedTaskContract["resource_locks"])
+            }
+            if ($selectedTaskContract -and -not [string]::IsNullOrWhiteSpace([string]$selectedTaskContract["parallel_safety"])) {
+                $jobSpec["parallel_safety"] = [string]$selectedTaskContract["parallel_safety"]
+            }
 
             $dispatchState = ConvertTo-RelayHashtable -InputObject $runState
             $dispatchState["status"] = "running"
-            $dispatchState["active_job_id"] = $jobSpec["job_id"]
             $dispatchState = Set-RunStateCursor -RunState $dispatchState -Phase $phaseName -TaskId $taskId
+            $leaseResult = ConvertTo-RelayHashtable -InputObject (Add-RunStateActiveJobLease -RunState $dispatchState -JobSpec $jobSpec -LeaseOwner "single-step" -SlotId "slot-01" -WorkspaceId "main")
+            $dispatchState = ConvertTo-RelayHashtable -InputObject $leaseResult["run_state"]
+            $lease = ConvertTo-RelayHashtable -InputObject $leaseResult["lease"]
+            $jobSpec["lease_token"] = [string]$lease["lease_token"]
+            $jobSpec["lease_expires_at"] = [string]$lease["lease_expires_at"]
+            $jobSpec["lease_owner"] = [string]$lease["lease_owner"]
+            $jobSpec["slot_id"] = [string]$lease["slot_id"]
+            $jobSpec["workspace_id"] = [string]$lease["workspace_id"]
+            $jobSpec["state_revision"] = $lease["state_revision"]
             $archiveResult = ConvertTo-RelayHashtable -InputObject $dispatchPreparation["archive_result"]
             $archivePath = if ($archiveResult) { [string]$archiveResult["snapshot_path"] } else { $null }
             $dispatchState = Start-RunStateActiveAttempt -RunState $dispatchState -AttemptId ([string]$jobSpec["attempt_id"]) -Phase $phaseName -Stage "dispatching" -Status "running" -TaskId $taskId -JobId ([string]$jobSpec["job_id"]) -ArchivePath $archivePath
@@ -1680,6 +1922,25 @@ function Invoke-EngineStep {
                 Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event $dispatchPreparation["archive_event"]
             }
             Append-RunStatusChangedEvent -RunId $ResolvedRunId -RunState $dispatchState
+            $leasedEvent = @{
+                type = "job.leased"
+                job_id = $jobSpec["job_id"]
+                phase = $phaseName
+                role = $resolvedRole
+                task_id = $taskId
+                lease_token = $jobSpec["lease_token"]
+                lease_owner = $jobSpec["lease_owner"]
+                slot_id = $jobSpec["slot_id"]
+                workspace_id = $jobSpec["workspace_id"]
+                lease_expires_at = $jobSpec["lease_expires_at"]
+            }
+            if ($jobSpec.ContainsKey("resource_locks")) {
+                $leasedEvent["resource_locks"] = @($jobSpec["resource_locks"])
+            }
+            if ($jobSpec.ContainsKey("parallel_safety")) {
+                $leasedEvent["parallel_safety"] = [string]$jobSpec["parallel_safety"]
+            }
+            Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event $leasedEvent
 
             if (-not [string]::IsNullOrWhiteSpace($taskId)) {
                 Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event @{
@@ -1724,7 +1985,13 @@ function Invoke-EngineStep {
                 phase_started_at_utc = $phaseStartedAtUtc
             }
             try {
-                $transactionResult = ConvertTo-RelayHashtable -InputObject (Invoke-PhaseExecutionTransaction -JobSpec $jobSpec -PromptText $promptText -ProjectRoot $script:ProjectRoot -WorkingDirectory $script:ProjectDir -TimeoutPolicy (Get-StepTimeoutPolicy) -RunId $ResolvedRunId -PhaseName $phaseName -PhaseDefinition $phaseDefinition -ArtifactCompletionProbe ${function:Invoke-PhaseArtifactCompletionProbe} -TaskId $taskId -PhaseStartedAtUtc $phaseStartedAtUtc -OnRepairStart {
+                $transactionResult = ConvertTo-RelayHashtable -InputObject (Invoke-PhaseExecutionTransaction -JobSpec $jobSpec -PromptText $promptText -ProjectRoot $script:ProjectRoot -WorkingDirectory $script:ProjectDir -TimeoutPolicy (Get-StepTimeoutPolicy) -RunId $ResolvedRunId -PhaseName $phaseName -PhaseDefinition $phaseDefinition -ArtifactCompletionProbe ${function:Invoke-PhaseArtifactCompletionProbe} -TaskId $taskId -PhaseStartedAtUtc $phaseStartedAtUtc -PreCommitGuard {
+                        param($CommitContext)
+
+                        $commitJob = ConvertTo-RelayHashtable -InputObject $CommitContext["job_spec"]
+                        $latestState = Read-RunState -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId
+                        return (Test-RunStateActiveJobLease -RunState $latestState -JobId ([string]$commitJob["job_id"]) -LeaseToken ([string]$commitJob["lease_token"]) -Phase ([string]$commitJob["phase"]) -TaskId ([string]$commitJob["task_id"]))
+                    } -OnRepairStart {
                         param($RepairContext)
 
                         $repairState = ConvertTo-RelayHashtable -InputObject $RepairContext
@@ -1748,9 +2015,14 @@ function Invoke-EngineStep {
             $outputSync = ConvertTo-RelayHashtable -InputObject $transactionResult["output_sync_result"]
             $validationResult = ConvertTo-RelayHashtable -InputObject $transactionResult["validation_result"]
             $commitResult = ConvertTo-RelayHashtable -InputObject $transactionResult["commit_result"]
+            $commitGuardResult = ConvertTo-RelayHashtable -InputObject $transactionResult["commit_guard_result"]
             $repairResult = ConvertTo-RelayHashtable -InputObject $transactionResult["repair_result"]
             $executionResult = ConvertTo-RelayHashtable -InputObject $transactionResult["raw_execution_result"]
             $effectiveExecutionResult = ConvertTo-RelayHashtable -InputObject $transactionResult["effective_execution_result"]
+            $effectiveExecutionResult["phase"] = $phaseName
+            $effectiveExecutionResult["role"] = $resolvedRole
+            $effectiveExecutionResult["task_id"] = $taskId
+            $effectiveExecutionResult["lease_token"] = $jobSpec["lease_token"]
             $attemptId = [string]$transactionResult["resolved_attempt_id"]
             $dispatchState = Update-RunStateActiveAttempt -RunState $dispatchState -AttemptId $attemptId -Stage "committing" -Status "running" -TaskId $taskId -JobId ([string]$jobSpec["job_id"]) -Result ([string]$effectiveExecutionResult["result_status"])
             Write-RunState -ProjectRoot $script:ProjectRoot -RunState $dispatchState | Out-Null
@@ -1799,6 +2071,16 @@ function Invoke-EngineStep {
                                 }
                         )
                     }
+                }
+            }
+
+            if ($commitGuardResult -and -not [bool]$commitGuardResult["valid"]) {
+                Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event @{
+                    type = "job.commit_rejected"
+                    job_id = $jobSpec["job_id"]
+                    phase = $phaseName
+                    task_id = $taskId
+                    errors = @($commitGuardResult["errors"])
                 }
             }
 
@@ -1971,7 +2253,277 @@ function Invoke-EngineStep {
     }
 }
 
+function Invoke-TaskGroupEngineStep {
+    param(
+        [Parameter(Mandatory)][string]$ResolvedRunId,
+        [switch]$AllowSingleJob,
+        [switch]$AllowCautiousJob
+    )
+
+    $runLock = $null
+    $packageResult = $null
+    try {
+        $runLock = Acquire-RunLock -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -RetryCount $script:LockRetryCount -RetryDelayMs $script:LockRetryDelay -TimeoutSec $script:LockTimeout
+
+        $runState = Read-RunState -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId
+        if (-not $runState) {
+            throw "Run '$ResolvedRunId' does not exist."
+        }
+        $runState = Sync-RunStateFromCanonicalArtifacts -RunId $ResolvedRunId -RunState $runState
+        $runState = Initialize-RunStateCompatibilityFields -RunState $runState
+
+        $phaseName = [string]$runState["current_phase"]
+        $resolvedRole = Resolve-PhaseRole -Phase $phaseName
+        $providerSpec = Resolve-RoleProviderSpec -ResolvedRole $resolvedRole -ProviderName $Provider -ExplicitCommand $ProviderCommand -ExplicitFlags $ProviderFlags
+
+        $packageResult = ConvertTo-RelayHashtable -InputObject (New-TaskGroupJobPackage `
+                -ProjectRoot $script:ProjectRoot `
+                -RunState $runState `
+                -ProviderSpec $providerSpec `
+                -PackageRoot (Get-RunJobPath -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -JobId ("task-group-" + [guid]::NewGuid().ToString("N").Substring(0, 12))) `
+                -SourceWorkspace $script:ProjectDir `
+                -AllowSingleParallelJob:$AllowSingleJob `
+                -AllowCautiousSafety:$AllowCautiousJob)
+
+        if ([string]$packageResult["status"] -ne "planned") {
+            $reason = [string]$packageResult["reason"]
+            return [ordered]@{
+                mode = "task-group"
+                status = "wait"
+                reason = $reason
+                blocks_single_fallback = ($reason -eq "task group already active")
+                rejected_candidates = @($packageResult["rejected_candidates"])
+                run_state = $runState
+            }
+        }
+
+        $nextRunState = ConvertTo-RelayHashtable -InputObject $packageResult["run_state"]
+        $nextRunState["status"] = "running"
+        $nextRunState["updated_at"] = (Get-Date).ToString("o")
+        Write-RunState -ProjectRoot $script:ProjectRoot -RunState $nextRunState | Out-Null
+        Append-RunStatusChangedEvent -RunId $ResolvedRunId -RunState $nextRunState
+        Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event @{
+            type = "task_group.packaged"
+            group_id = [string]$packageResult["group_id"]
+            package_path = [string]$packageResult["package_path"]
+            worker_count = @($packageResult["package"]["workers"]).Count
+        }
+    }
+    finally {
+        Release-RunLock -LockHandle $runLock
+    }
+
+    $coordinator = ConvertTo-RelayHashtable -InputObject (Invoke-TaskGroupCoordinator -Package ([string]$packageResult["package_path"]) -ProjectRoot $script:ProjectRoot -WorkerParameters @{ ConfigFile = $ConfigFile })
+    $merge = $null
+    $status = [string]$coordinator["status"]
+    if ($status -eq "succeeded") {
+        $merge = ConvertTo-RelayHashtable -InputObject (Complete-TaskGroupMergeCommit -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -GroupId ([string]$packageResult["group_id"]) -MainWorkspace $script:ProjectDir)
+        $status = if ([bool]$merge["ok"]) { "completed" } else { [string]$merge["status"] }
+    }
+
+    return [ordered]@{
+        mode = "task-group"
+        status = $status
+        group_id = [string]$packageResult["group_id"]
+        package_path = [string]$packageResult["package_path"]
+        worker_count = @($packageResult["package"]["workers"]).Count
+        coordinator = $coordinator
+        merge = $merge
+    }
+}
+
+function Invoke-ParallelEngineStep {
+    param(
+        [Parameter(Mandatory)][string]$ResolvedRunId,
+        [switch]$AllowSingleJob,
+        [switch]$AllowCautiousJob,
+        [switch]$PreferTaskGroup
+    )
+
+    if ($PreferTaskGroup) {
+        $taskGroupResult = ConvertTo-RelayHashtable -InputObject (Invoke-TaskGroupEngineStep -ResolvedRunId $ResolvedRunId -AllowSingleJob:$AllowSingleJob -AllowCautiousJob:$AllowCautiousJob)
+        if ([string]$taskGroupResult["status"] -ne "wait") {
+            return $taskGroupResult
+        }
+        if ([string]$taskGroupResult["reason"] -eq "task group already active") {
+            return $taskGroupResult
+        }
+    }
+
+    $runLock = $null
+    $packageResult = $null
+    try {
+        $runLock = Acquire-RunLock -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -RetryCount $script:LockRetryCount -RetryDelayMs $script:LockRetryDelay -TimeoutSec $script:LockTimeout
+
+        $runState = Read-RunState -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId
+        if (-not $runState) {
+            throw "Run '$ResolvedRunId' does not exist."
+        }
+        $runState = Sync-RunStateFromCanonicalArtifacts -RunId $ResolvedRunId -RunState $runState
+        $staleRepair = Repair-StaleActiveJobState -RunState $runState -ProjectRoot $script:ProjectRoot
+        if ([bool]$staleRepair["changed"]) {
+            $runState = ConvertTo-RelayHashtable -InputObject $staleRepair["run_state"]
+            Write-RunState -ProjectRoot $script:ProjectRoot -RunState $runState | Out-Null
+            Append-RunStatusChangedEvent -RunId $ResolvedRunId -RunState $runState
+            foreach ($recoveredJobRaw in @($staleRepair["recovered_jobs"])) {
+                $recoveredJob = ConvertTo-RelayHashtable -InputObject $recoveredJobRaw
+                Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event @{
+                    type = "job.recovered"
+                    job_id = [string]$recoveredJob["job_id"]
+                    reason = [string]$recoveredJob["reason"]
+                    metadata = (ConvertTo-RelayHashtable -InputObject $recoveredJob["job_metadata"])
+                }
+            }
+        }
+
+        $orphanedTaskRepair = Repair-OrphanedInProgressTaskState -RunState $runState
+        if ([bool]$orphanedTaskRepair["changed"]) {
+            $runState = ConvertTo-RelayHashtable -InputObject $orphanedTaskRepair["run_state"]
+            Write-RunState -ProjectRoot $script:ProjectRoot -RunState $runState | Out-Null
+            Append-RunStatusChangedEvent -RunId $ResolvedRunId -RunState $runState
+            Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event @{
+                type = "task.recovered"
+                reason = "orphaned_in_progress_task"
+                tasks = @($orphanedTaskRepair["recovered_tasks"])
+            }
+        }
+
+        $phase6RejectRepair = Repair-RejectedPhase6TaskState -RunState $runState -ProjectRoot $script:ProjectRoot
+        if ([bool]$phase6RejectRepair["changed"]) {
+            $runState = ConvertTo-RelayHashtable -InputObject $phase6RejectRepair["run_state"]
+            Write-RunState -ProjectRoot $script:ProjectRoot -RunState $runState | Out-Null
+            Append-RunStatusChangedEvent -RunId $ResolvedRunId -RunState $runState
+            Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event @{
+                type = "task.recovered"
+                reason = "phase6_reject_rollback"
+                tasks = @($phase6RejectRepair["recovered_tasks"])
+            }
+        }
+
+        $failedRecovery = Repair-RecoverableFailedRunState -RunState $runState -ProjectRoot $script:ProjectRoot -RecoverySource "parallel-step"
+        if ([bool]$failedRecovery["changed"]) {
+            $runState = ConvertTo-RelayHashtable -InputObject $failedRecovery["run_state"]
+            Write-RunState -ProjectRoot $script:ProjectRoot -RunState $runState | Out-Null
+            Append-RunStatusChangedEvent -RunId $ResolvedRunId -RunState $runState
+            Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event $failedRecovery["recovery_event"]
+        }
+
+        $phaseName = [string]$runState["current_phase"]
+        $resolvedRole = Resolve-PhaseRole -Phase $phaseName
+        $providerSpec = Resolve-RoleProviderSpec -ResolvedRole $resolvedRole -ProviderName $Provider -ExplicitCommand $ProviderCommand -ExplicitFlags $ProviderFlags
+        $packageRoot = Get-RunJobsPath -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId
+
+        $packageResult = ConvertTo-RelayHashtable -InputObject (New-ParallelStepJobPackages -ProjectRoot $script:ProjectRoot -RunState $runState -ProviderSpec $providerSpec -PackageRoot $packageRoot -AllowSingleParallelJob:$AllowSingleJob -AllowCautiousSafety:$AllowCautiousJob -PhaseDefinitionFactory {
+                param($PhaseName, $RoleName, $ProviderSpecForPackage, $Candidate, $JobSpec, $State)
+                return (Get-PhaseDefinition -ProjectRoot $script:ProjectRoot -Phase ([string]$PhaseName) -Provider ([string]$ProviderSpecForPackage["provider"]))
+            } -WorkspacePathFactory {
+                param($State, $Candidate, $JobSpec)
+                $workspace = New-IsolatedJobWorkspace -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -JobId ([string]$JobSpec["job_id"]) -SourceWorkspace $script:ProjectDir -Force
+                return [string]$workspace["workspace_path"]
+            } -BaselineFactory {
+                param($WorkspacePath, $Candidate, $JobSpec)
+                return (New-WorkspaceBaselineSnapshot -WorkspaceRoot $WorkspacePath)
+            } -PromptFactory {
+                param($State, $Candidate, $JobSpec, $PhaseDefinition)
+                $action = [ordered]@{
+                    type = "DispatchJob"
+                    phase = [string]$JobSpec["phase"]
+                    role = [string]$JobSpec["role"]
+                    task_id = [string]$JobSpec["task_id"]
+                    selected_task = $JobSpec["selected_task"]
+                }
+                $promptText = New-EnginePromptText -RunState $State -Action $action -JobSpec $JobSpec -PhaseDefinition $PhaseDefinition
+                if (-not [string]::IsNullOrWhiteSpace([string]$JobSpec["workspace_path"])) {
+                    $promptText = $promptText.Replace("Working directory: $script:ProjectDir", "Working directory: $($JobSpec['workspace_path'])")
+                }
+                return $promptText
+            })
+
+        if ([string]$packageResult["status"] -ne "leased") {
+            return [ordered]@{
+                mode = "parallel-step"
+                status = "wait"
+                reason = [string]$packageResult["reason"]
+                workspace_mode = "isolated-copy-experimental"
+                rejected_candidates = @($packageResult["rejected_candidates"])
+                run_state = $runState
+            }
+        }
+
+        $nextRunState = ConvertTo-RelayHashtable -InputObject $packageResult["run_state"]
+        $nextRunState["status"] = "running"
+        $nextRunState["updated_at"] = (Get-Date).ToString("o")
+        Write-RunState -ProjectRoot $script:ProjectRoot -RunState $nextRunState | Out-Null
+        Append-RunStatusChangedEvent -RunId $ResolvedRunId -RunState $nextRunState
+
+        foreach ($packageRaw in @($packageResult["packages"])) {
+            $package = ConvertTo-RelayHashtable -InputObject $packageRaw
+            foreach ($eventRaw in @($package["events"])) {
+                Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event $eventRaw
+            }
+        }
+    }
+    finally {
+        Release-RunLock -LockHandle $runLock
+    }
+
+    $packages = @($packageResult["packages"])
+    $workerResult = ConvertTo-RelayHashtable -InputObject (Invoke-ParallelStepWorkers -Packages $packages -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -WorkerParameters @{ ConfigFile = $ConfigFile })
+    return [ordered]@{
+        mode = "parallel-step"
+        status = "completed"
+        workspace_mode = "isolated-copy-experimental"
+        leased_count = $packages.Count
+        packages = @($packages | ForEach-Object {
+            $package = ConvertTo-RelayHashtable -InputObject $_
+            [ordered]@{
+                job_id = [string]$package["job_id"]
+                task_id = [string]$package["task_id"]
+                phase = [string]$package["phase"]
+                package_path = [string]$package["package_path"]
+            }
+        })
+        workers = $workerResult
+    }
+}
+
 switch ($Command) {
+    "run-task-group" {
+        if ([string]::IsNullOrWhiteSpace($JobPackageFile)) {
+            throw "run-task-group requires -JobPackageFile."
+        }
+
+        $result = ConvertTo-RelayHashtable -InputObject (Invoke-TaskGroupCoordinator -Package $JobPackageFile -ProjectRoot $script:ProjectRoot -WorkerParameters @{ ConfigFile = $ConfigFile })
+        $result | ConvertTo-Json -Depth 30 -Compress
+        if ([string]$result["status"] -in @("failed", "partial_failed")) {
+            exit 20
+        }
+        exit 0
+    }
+    "run-task-group-worker" {
+        if ([string]::IsNullOrWhiteSpace($JobPackageFile)) {
+            throw "run-task-group-worker requires -JobPackageFile."
+        }
+
+        $result = ConvertTo-RelayHashtable -InputObject (Invoke-TaskGroupWorkerPackage -Package $JobPackageFile -WorkerId $WorkerId -ProjectRoot $script:ProjectRoot -TimeoutPolicy (Get-StepTimeoutPolicy) -ArtifactCompletionProbe ${function:Invoke-PhaseArtifactCompletionProbe})
+        $result | ConvertTo-Json -Depth 30
+        if ([string]$result["status"] -eq "failed") {
+            exit 20
+        }
+        exit 0
+    }
+    "run-leased-job" {
+        if ([string]::IsNullOrWhiteSpace($JobPackageFile)) {
+            throw "run-leased-job requires -JobPackageFile."
+        }
+
+        $result = ConvertTo-RelayHashtable -InputObject (Invoke-LeasedJobPackage -Package $JobPackageFile -ProjectRoot $script:ProjectRoot -MainWorkspace $script:ProjectDir -TimeoutPolicy (Get-StepTimeoutPolicy) -ApprovalPhases $script:HumanReviewPhases -ArtifactCompletionProbe ${function:Invoke-PhaseArtifactCompletionProbe})
+        $result | ConvertTo-Json -Depth 20
+        if ($result.ContainsKey("exit_code") -and [int]$result["exit_code"] -ne 0) {
+            exit ([int]$result["exit_code"])
+        }
+        exit 0
+    }
     "new" {
         Initialize-LegacyDirectories
         $resolvedRunId = if ($RunId) { $RunId } else { New-RunId }
@@ -2004,6 +2556,9 @@ switch ($Command) {
                 Append-RunStatusChangedEvent -RunId $resolvedRunId -RunState $resumeState
                 Append-Event -ProjectRoot $script:ProjectRoot -RunId $resolvedRunId -Event $failedRecovery["recovery_event"]
             }
+            elseif ($failedRecovery["recovery_event"]) {
+                Append-Event -ProjectRoot $script:ProjectRoot -RunId $resolvedRunId -Event $failedRecovery["recovery_event"]
+            }
         }
         Write-Output $resolvedRunId
     }
@@ -2013,28 +2568,59 @@ switch ($Command) {
             throw "No active run."
         }
 
-        $runLock = $null
-        try {
-            $runLock = Acquire-RunLock -ProjectRoot $script:ProjectRoot -RunId $resolvedRunId -RetryCount $script:LockRetryCount -RetryDelayMs $script:LockRetryDelay -TimeoutSec $script:LockTimeout
-
-            $result = if (-not [string]::IsNullOrWhiteSpace($PromptFile) -or -not [string]::IsNullOrWhiteSpace($Prompt)) {
-                $promptText = if (-not [string]::IsNullOrWhiteSpace($PromptFile)) {
-                    Get-Content -Path $PromptFile -Raw -Encoding UTF8
-                }
-                else {
-                    $Prompt
-                }
-                Invoke-ManualStep -ResolvedRunId $resolvedRunId -PromptText $promptText
+        $hasManualPrompt = (-not [string]::IsNullOrWhiteSpace($PromptFile) -or -not [string]::IsNullOrWhiteSpace($Prompt))
+        $promptText = ""
+        if ($hasManualPrompt) {
+            $promptText = if (-not [string]::IsNullOrWhiteSpace($PromptFile)) {
+                Get-Content -Path $PromptFile -Raw -Encoding UTF8
             }
             else {
-                Invoke-EngineStep -ResolvedRunId $resolvedRunId
+                $Prompt
             }
+        }
 
-            $result | ConvertTo-Json -Depth 20 -Compress
+        $result = $null
+        if (-not $hasManualPrompt) {
+            Sync-ConfiguredTaskLaneForStep -ResolvedRunId $resolvedRunId
         }
-        finally {
-            Release-RunLock -LockHandle $runLock
+        if (-not $hasManualPrompt -and (Test-ShouldPreferParallelStep -ResolvedRunId $resolvedRunId)) {
+            $parallelResult = ConvertTo-RelayHashtable -InputObject (Invoke-ParallelEngineStep -ResolvedRunId $resolvedRunId -AllowSingleJob:$(Resolve-StepAllowSingleParallelJob -ExplicitAllowSingleParallelJob:$AllowSingleParallelJob) -AllowCautiousJob:$AllowCautiousParallelJob -PreferTaskGroup)
+            if ([string]$parallelResult["status"] -eq "completed") {
+                $result = $parallelResult
+            }
+            elseif (Test-AutoParallelWaitBlocksSingleFallback -ParallelResult $parallelResult) {
+                $result = $parallelResult
+            }
+            else {
+                $result = ConvertTo-RelayHashtable -InputObject (Invoke-SingleEngineStepWithLock -ResolvedRunId $resolvedRunId)
+                if ($result) {
+                    $result["auto_parallel_wait"] = $parallelResult
+                }
+            }
         }
+        else {
+            $result = Invoke-SingleEngineStepWithLock -ResolvedRunId $resolvedRunId -PromptText $promptText
+        }
+
+        $result | ConvertTo-Json -Depth 30 -Compress
+    }
+    "parallel-step" {
+        $resolvedRunId = Resolve-StepRunId -RequestedRunId $RunId
+        if (-not $resolvedRunId) {
+            throw "No active run."
+        }
+
+        $result = Invoke-ParallelEngineStep -ResolvedRunId $resolvedRunId -AllowSingleJob:$(Resolve-StepAllowSingleParallelJob -ExplicitAllowSingleParallelJob:$AllowSingleParallelJob) -AllowCautiousJob:$AllowCautiousParallelJob
+        $result | ConvertTo-Json -Depth 30 -Compress
+    }
+    "group-step" {
+        $resolvedRunId = Resolve-StepRunId -RequestedRunId $RunId
+        if (-not $resolvedRunId) {
+            throw "No active run."
+        }
+
+        $result = Invoke-TaskGroupEngineStep -ResolvedRunId $resolvedRunId -AllowSingleJob:$AllowSingleParallelJob -AllowCautiousJob:$AllowCautiousParallelJob
+        $result | ConvertTo-Json -Depth 30 -Compress
     }
     "show" {
         $resolvedRunId = Resolve-StepRunId -RequestedRunId $RunId
@@ -2043,6 +2629,8 @@ switch ($Command) {
             exit 0
         }
         $state = Read-RunState -ProjectRoot $script:ProjectRoot -RunId $resolvedRunId
+        $events = @(Get-Events -ProjectRoot $script:ProjectRoot -RunId $resolvedRunId)
+        $state["lane_summary"] = New-TaskLaneSummary -RunState $state -Events $events
         Write-Output ($state | ConvertTo-Json -Depth 20 -Compress)
     }
 }

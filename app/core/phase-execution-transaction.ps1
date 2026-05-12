@@ -85,6 +85,120 @@ function Resolve-PhaseExecutionEffectiveResult {
     }
 }
 
+function Sync-PhaseExecutionWorkspaceJobArtifacts {
+    param(
+        [Parameter(Mandatory)][string]$ProjectRoot,
+        [Parameter(Mandatory)][string]$WorkingDirectory,
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][string]$JobId,
+        [string]$PhaseName,
+        [AllowNull()]$PhaseDefinition,
+        [string]$TaskId,
+        [string]$AttemptId,
+        [ValidateSet("canonical", "job", "attempt")][string]$StorageScope = "job"
+    )
+
+    $projectFullPath = [System.IO.Path]::GetFullPath($ProjectRoot).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+    $workingFullPath = [System.IO.Path]::GetFullPath($WorkingDirectory).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+    if ($projectFullPath.Equals($workingFullPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return [ordered]@{ synced = $false; reason = "same_workspace"; copied_count = 0 }
+    }
+
+    $sourceCandidates = @(
+        (Join-Path $workingFullPath "jobs\$JobId\artifacts"),
+        (Join-Path $workingFullPath "runs\$RunId\jobs\$JobId\artifacts"),
+        (Join-Path $workingFullPath "artifacts"),
+        (Join-Path $workingFullPath "relay-dev\jobs\$JobId\artifacts"),
+        (Join-Path $workingFullPath "relay-dev\runs\$RunId\jobs\$JobId\artifacts"),
+        (Join-Path $workingFullPath "relay-dev\artifacts")
+    )
+    $sourceArtifactsRoots = @(
+        $sourceCandidates |
+            Where-Object { Test-Path -LiteralPath $_ -PathType Container } |
+            ForEach-Object { [System.IO.Path]::GetFullPath($_).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar) } |
+            Select-Object -Unique
+    )
+
+    $targetArtifactsRoot = Join-Path $projectFullPath "runs\$RunId\jobs\$JobId\artifacts"
+    $targetFullPath = [System.IO.Path]::GetFullPath($targetArtifactsRoot).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+    $sourceArtifactsRoots = @(
+        $sourceArtifactsRoots | Where-Object { -not $_.Equals($targetFullPath, [System.StringComparison]::OrdinalIgnoreCase) }
+    )
+
+    $copied = New-Object System.Collections.Generic.List[string]
+    if ($sourceArtifactsRoots.Count -gt 0) {
+        if (-not (Test-Path -LiteralPath $targetArtifactsRoot -PathType Container)) {
+            New-Item -ItemType Directory -Path $targetArtifactsRoot -Force | Out-Null
+        }
+
+        foreach ($sourceArtifactsRoot in @($sourceArtifactsRoots)) {
+            Get-ChildItem -LiteralPath $sourceArtifactsRoot -Recurse -File | ForEach-Object {
+                $relative = [System.IO.Path]::GetRelativePath($sourceArtifactsRoot, $_.FullName)
+                $target = Join-Path $targetArtifactsRoot $relative
+                $targetDir = Split-Path -Parent $target
+                if (-not (Test-Path -LiteralPath $targetDir -PathType Container)) {
+                    New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+                }
+                Copy-Item -LiteralPath $_.FullName -Destination $target -Force
+                $copied.Add(($relative -replace '\\', '/')) | Out-Null
+            }
+        }
+    }
+
+    if ($PhaseDefinition -and -not [string]::IsNullOrWhiteSpace($PhaseName)) {
+        $definition = ConvertTo-RelayHashtable -InputObject $PhaseDefinition
+        foreach ($contractItemRaw in @($definition["output_contract"])) {
+            $contractItem = ConvertTo-RelayHashtable -InputObject $contractItemRaw
+            $artifactId = [string]$contractItem["artifact_id"]
+            if ([string]::IsNullOrWhiteSpace($artifactId)) {
+                continue
+            }
+
+            $looseCandidates = @(
+                (Join-Path $workingFullPath $artifactId),
+                (Join-Path $workingFullPath "relay-dev\$artifactId")
+            )
+            $looseSource = @(
+                $looseCandidates |
+                    Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+                    Select-Object -First 1
+            )
+            if ($looseSource.Count -eq 0) {
+                continue
+            }
+
+            $target = Resolve-PhaseContractArtifactPath -ProjectRoot $ProjectRoot -RunId $RunId -PhaseName $PhaseName -ContractItem $contractItem -TaskId $TaskId -JobId $JobId -AttemptId $AttemptId -StorageScope $StorageScope
+            $sourceFullPath = [System.IO.Path]::GetFullPath($looseSource[0])
+            $targetArtifactFullPath = [System.IO.Path]::GetFullPath($target)
+            if ($sourceFullPath.Equals($targetArtifactFullPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+                continue
+            }
+
+            $targetDir = Split-Path -Parent $target
+            if (-not (Test-Path -LiteralPath $targetDir -PathType Container)) {
+                New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+            }
+            Copy-Item -LiteralPath $looseSource[0] -Destination $target -Force
+            $relativeTarget = [System.IO.Path]::GetRelativePath($targetFullPath, $targetArtifactFullPath)
+            $copied.Add(($relativeTarget -replace '\\', '/')) | Out-Null
+        }
+    }
+
+    if ($copied.Count -eq 0) {
+        $reason = if ($sourceArtifactsRoots.Count -eq 0) { "source_missing" } else { "same_artifact_root" }
+        return [ordered]@{ synced = $false; reason = $reason; copied_count = 0 }
+    }
+
+    return [ordered]@{
+        synced = $true
+        reason = "synced"
+        sources = @($sourceArtifactsRoots)
+        target = $targetArtifactsRoot
+        copied_count = $copied.Count
+        copied_files = @($copied.ToArray())
+    }
+}
+
 function Invoke-PhaseExecutionTransaction {
     param(
         [Parameter(Mandatory)]$JobSpec,
@@ -104,7 +218,10 @@ function Invoke-PhaseExecutionTransaction {
         [scriptblock]$OnWarn,
         [scriptblock]$OnRetry,
         [scriptblock]$OnAbort,
-        [scriptblock]$OnRepairStart
+        [scriptblock]$OnRepairStart,
+        [scriptblock]$PreCommitGuard,
+        [ValidateSet("auto", "job", "attempt")][string]$ArtifactStorageScope = "auto",
+        [bool]$CommitValidatedArtifacts = $true
     )
 
     $job = ConvertTo-RelayHashtable -InputObject $JobSpec
@@ -164,6 +281,16 @@ function Invoke-PhaseExecutionTransaction {
     $finalAttemptStartedAt = [string]$executionResult["final_attempt_started_at"]
     $attemptStartedAtUtc = Convert-PhaseExecutionDateTimeToUtc -Value $finalAttemptStartedAt
     $artifactCompletionCutoffUtc = Resolve-PhaseExecutionArtifactCompletionCutoffUtc -PhaseStartedAtUtc $PhaseStartedAtUtc -AttemptStartedAtUtc $attemptStartedAtUtc
+    $resolvedArtifactStorageScope = if ($ArtifactStorageScope -eq "auto") {
+        if (-not [string]::IsNullOrWhiteSpace($attemptId)) { "attempt" } else { "job" }
+    }
+    else {
+        $ArtifactStorageScope
+    }
+    if ($resolvedArtifactStorageScope -eq "attempt" -and [string]::IsNullOrWhiteSpace($attemptId)) {
+        throw "Attempt-scoped artifact storage requires an execution attempt id."
+    }
+    $workspaceArtifactSync = ConvertTo-RelayHashtable -InputObject (Sync-PhaseExecutionWorkspaceJobArtifacts -ProjectRoot $ProjectRoot -WorkingDirectory $WorkingDirectory -RunId $RunId -JobId $jobId -PhaseName $PhaseName -PhaseDefinition $PhaseDefinition -TaskId $TaskId -AttemptId $attemptId -StorageScope $resolvedArtifactStorageScope)
 
     $outputSyncParams = @{
         ProjectRoot = $ProjectRoot
@@ -171,7 +298,7 @@ function Invoke-PhaseExecutionTransaction {
         PhaseName = $PhaseName
         PhaseDefinition = $PhaseDefinition
         JobId = $jobId
-        StorageScope = if (-not [string]::IsNullOrWhiteSpace($attemptId)) { "attempt" } else { "job" }
+        StorageScope = $resolvedArtifactStorageScope
         AttemptStartedAtUtc = $attemptStartedAtUtc
     }
     if (-not [string]::IsNullOrWhiteSpace($TaskId)) {
@@ -226,14 +353,35 @@ function Invoke-PhaseExecutionTransaction {
     }
 
     $commitResult = $null
+    $commitGuardResult = $null
     if ($validatorStatus -and [bool]$validatorStatus["valid"]) {
-        try {
-            $commitResult = ConvertTo-RelayHashtable -InputObject (Complete-PhaseOutputCommit -ProjectRoot $ProjectRoot -RunId $RunId -MaterializedArtifacts @($outputSyncResult["materialized"]))
+        if ($PreCommitGuard) {
+            $commitGuardResult = ConvertTo-RelayHashtable -InputObject (& $PreCommitGuard @{
+                    job_spec = $job
+                    job_id = $jobId
+                    phase = $PhaseName
+                    task_id = $TaskId
+                    attempt_id = $attemptId
+                    output_sync_result = $outputSyncResult
+                    validation_result = $validationResult
+                })
+        }
+
+        if (-not $CommitValidatedArtifacts) {
+            $commitResult = [ordered]@{
+                committed = @()
+                summary = [ordered]@{
+                    committed_count = 0
+                    artifact_ids = @()
+                }
+                skipped = $true
+                reason = "commit_validated_artifacts_disabled"
+            }
             $validationResult["commit"] = $commitResult
         }
-        catch {
+        elseif ($commitGuardResult -and -not [bool]$commitGuardResult["valid"]) {
             $validatorStatus["valid"] = $false
-            $validatorStatus["errors"] = @($validatorStatus["errors"]) + "Failed to commit validated artifacts: $($_.Exception.Message)"
+            $validatorStatus["errors"] = @($validatorStatus["errors"]) + @($commitGuardResult["errors"])
             $validationResult["validation"] = $validatorStatus
             $commitResult = [ordered]@{
                 committed = @()
@@ -241,7 +389,26 @@ function Invoke-PhaseExecutionTransaction {
                     committed_count = 0
                     artifact_ids = @()
                 }
-                error = $_.Exception.Message
+                error = "pre_commit_guard_rejected"
+            }
+        }
+        else {
+            try {
+                $commitResult = ConvertTo-RelayHashtable -InputObject (Complete-PhaseOutputCommit -ProjectRoot $ProjectRoot -RunId $RunId -MaterializedArtifacts @($outputSyncResult["materialized"]))
+                $validationResult["commit"] = $commitResult
+            }
+            catch {
+                $validatorStatus["valid"] = $false
+                $validatorStatus["errors"] = @($validatorStatus["errors"]) + "Failed to commit validated artifacts: $($_.Exception.Message)"
+                $validationResult["validation"] = $validatorStatus
+                $commitResult = [ordered]@{
+                    committed = @()
+                    summary = [ordered]@{
+                        committed_count = 0
+                        artifact_ids = @()
+                    }
+                    error = $_.Exception.Message
+                }
             }
         }
     }
@@ -264,7 +431,11 @@ function Invoke-PhaseExecutionTransaction {
         final_attempt_started_at_utc = if ($attemptStartedAtUtc) { $attemptStartedAtUtc.ToString("o") } else { $null }
         artifact_completion_cutoff_utc = if ($artifactCompletionCutoffUtc) { $artifactCompletionCutoffUtc.ToString("o") } else { $null }
         output_sync_result = $outputSyncResult
+        workspace_artifact_sync = $workspaceArtifactSync
         validation_result = $validationResult
+        artifact_refs = @(New-ArtifactRefsFromMaterializedArtifacts -MaterializedArtifacts @($outputSyncResult["materialized"]) -StorageScope $resolvedArtifactStorageScope -JobId $jobId -AttemptId $attemptId)
+        artifact_storage_scope = $resolvedArtifactStorageScope
+        commit_guard_result = $commitGuardResult
         commit_result = $commitResult
         repair_result = $repairResult
         effective_execution_result = $effectiveExecutionResult

@@ -5,10 +5,17 @@ node_modules/
 logs/
 *.log
 *.log.*
+docs/worklog/current.md
 
 # Temporary files
 queue/.prompt_*.txt
 queue/status.lock
+
+# Local provider/runtime configuration overrides.
+# Use with -ConfigFile when you need machine-specific flags, timeouts, or execution mode.
+config/settings.local.yaml
+config/settings.*.local.yaml
+config/settings-*.local.yaml
 
 # Runtime state and generated projections
 runs/
@@ -16,8 +23,10 @@ dashboard.md
 queue/status.yaml
 outputs/*
 !outputs/.gitkeep
-!outputs/phase0_context.md
-!outputs/phase0_context.json
+
+# Local run input prepared by relay-dev skills/operators.
+# Keep tasks/task.md.example tracked as the template.
+tasks/task.md
 
 # OS files
 Thumbs.db

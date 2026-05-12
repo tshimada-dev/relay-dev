@@ -69,7 +69,8 @@ function Get-FailedRecoveryAttemptKey {
     )
 
     $state = ConvertTo-RelayHashtable -InputObject $RunState
-    return "failed:${RunId}:$([string]$state['current_phase']):$([string]$state['current_role']):$([string]$state['current_task_id']):$([string]$state['updated_at'])"
+    $groupSuffix = Get-RunStateGroupRecoveryAttemptSuffix -RunState $state
+    return "failed:${RunId}:$([string]$state['current_phase']):$([string]$state['current_role']):$([string]$state['current_task_id'])${groupSuffix}:$([string]$state['updated_at'])"
 }
 
 $Config = Read-Config -Path $ConfigFile
@@ -193,6 +194,9 @@ while ($true) {
             }
             elseif ($parsedResult["applied_action"]) {
                 [string]$parsedResult["applied_action"]["type"]
+            }
+            elseif ($parsedResult["mode"]) {
+                [string]$parsedResult["mode"]
             }
             else {
                 [string]$parsedResult["action"]["type"]
