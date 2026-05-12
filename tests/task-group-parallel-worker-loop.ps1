@@ -38,6 +38,24 @@ function Assert-Equal {
     }
 }
 
+function Assert-ThrowsContaining {
+    param(
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock,
+        [Parameter(Mandatory)][string]$ExpectedText,
+        [Parameter(Mandatory)][string]$Message
+    )
+
+    try {
+        & $ScriptBlock
+        Add-Failure "$Message (expected exception containing '$ExpectedText')"
+    }
+    catch {
+        if ($_.Exception.Message -notlike "*$ExpectedText*") {
+            Add-Failure "$Message (expected exception containing '$ExpectedText', actual='$($_.Exception.Message)')"
+        }
+    }
+}
+
 function New-WorkerLoopFixture {
     param(
         [string]$Name
@@ -145,6 +163,58 @@ Assert-True (-not [string]::IsNullOrWhiteSpace([string]$successWorker["last_hear
 Assert-Equal @($successWorker["artifact_refs"]).Count 4 "Worker state should retain artifact refs from each phase."
 Assert-True (-not (Test-Path -LiteralPath $canonicalSuccessPath)) "Worker loop should not create canonical parent artifacts."
 
+$missingWorkspaceFixture = New-WorkerLoopFixture -Name "missing-workspace"
+$missingWorkspaceFixture["package"]["workers"][0].Remove("workspace_path")
+Assert-ThrowsContaining -ExpectedText "workspace_path is required" -Message "Task-group workers should require an isolated workspace path." -ScriptBlock {
+    Invoke-TaskGroupWorkerPackage -Package $missingWorkspaceFixture["package"] -ProjectRoot $missingWorkspaceFixture["root"] -TimeoutPolicy ([ordered]@{}) -TransactionFactory {
+        throw "transaction should not run when worker isolation is invalid"
+    } -PhaseDefinitionFactory {
+        param($PhaseName, $ProviderSpec, $Worker)
+        return [ordered]@{ phase = $PhaseName; role = "implementer"; output_contract = @(); validator = @{ artifact_id = "$PhaseName-result.json" } }
+    } | Out-Null
+}
+$missingWorkspaceState = Read-RunState -ProjectRoot $missingWorkspaceFixture["root"] -RunId $missingWorkspaceFixture["run_id"]
+$missingWorkspaceWorker = ConvertTo-RelayHashtable -InputObject $missingWorkspaceState["task_group_workers"][$missingWorkspaceFixture["worker_id"]]
+$missingWorkspaceErrors = (@($missingWorkspaceWorker["errors"]) -join "`n")
+Assert-Equal $missingWorkspaceWorker["status"] "failed" "Invalid isolation should be recorded on the worker row."
+Assert-True ($missingWorkspaceErrors -like "*workspace_path is required*") "Invalid isolation should persist a worker-local error."
+
+$overlapFixture = New-WorkerLoopFixture -Name "overlap"
+$overlapFixture["package"]["workers"][0]["artifact_root"] = Join-Path ([string]$overlapFixture["package"]["workers"][0]["workspace_path"]) "artifacts"
+Assert-ThrowsContaining -ExpectedText "workspace_path and artifact_root must be separate" -Message "Task-group workers should keep workspace and artifact roots separate." -ScriptBlock {
+    Invoke-TaskGroupWorkerPackage -Package $overlapFixture["package"] -ProjectRoot $overlapFixture["root"] -TimeoutPolicy ([ordered]@{}) -TransactionFactory {
+        throw "transaction should not run when worker isolation is invalid"
+    } -PhaseDefinitionFactory {
+        param($PhaseName, $ProviderSpec, $Worker)
+        return [ordered]@{ phase = $PhaseName; role = "implementer"; output_contract = @(); validator = @{ artifact_id = "$PhaseName-result.json" } }
+    } | Out-Null
+}
+
+$siblingOverlapFixture = New-WorkerLoopFixture -Name "sibling-overlap"
+$firstWorker = ConvertTo-RelayHashtable -InputObject $siblingOverlapFixture["package"]["workers"][0]
+$siblingOverlapFixture["package"]["workers"] = @($siblingOverlapFixture["package"]["workers"]) + @(
+    [ordered]@{
+        worker_id = "worker-sibling-overlap-other"
+        group_id = [string]$siblingOverlapFixture["group_id"]
+        task_id = "T-sibling-overlap-other"
+        phase_sequence = @("Phase5", "Phase5-1", "Phase5-2", "Phase6")
+        selected_task = [ordered]@{ task_id = "T-sibling-overlap-other"; purpose = "sibling isolation test" }
+        workspace_path = [string]$firstWorker["workspace_path"]
+        artifact_root = Join-Path ([string]$siblingOverlapFixture["root"]) "other-artifacts"
+        declared_changed_files = @("src/T-sibling-overlap-other.txt")
+        resource_locks = @("lock-T-sibling-overlap-other")
+        lease_token = "lease-sibling-overlap-other"
+    }
+)
+Assert-ThrowsContaining -ExpectedText "overlaps sibling worker" -Message "Task-group workers should reject overlapping sibling workspaces." -ScriptBlock {
+    Invoke-TaskGroupWorkerPackage -Package $siblingOverlapFixture["package"] -ProjectRoot $siblingOverlapFixture["root"] -WorkerId ([string]$siblingOverlapFixture["worker_id"]) -TimeoutPolicy ([ordered]@{}) -TransactionFactory {
+        throw "transaction should not run when sibling isolation is invalid"
+    } -PhaseDefinitionFactory {
+        param($PhaseName, $ProviderSpec, $Worker)
+        return [ordered]@{ phase = $PhaseName; role = "implementer"; output_contract = @(); validator = @{ artifact_id = "$PhaseName-result.json" } }
+    } | Out-Null
+}
+
 $failedFixture = New-WorkerLoopFixture -Name "failed"
 $failedCalls = New-Object System.Collections.Generic.List[string]
 $failedResult = Invoke-TaskGroupWorkerPackage -Package $failedFixture["package"] -ProjectRoot $failedFixture["root"] -TimeoutPolicy ([ordered]@{}) -TransactionFactory {
@@ -183,7 +253,7 @@ Assert-Equal $failedWorker["status"] "failed" "Parent run-state worker status sh
 Assert-Equal $failedWorker["current_phase"] "Phase5-1" "Failed worker should retain the failed phase."
 Assert-True (-not (Test-Path -LiteralPath $canonicalFailedPath)) "Failed worker should not create canonical parent artifacts."
 
-foreach ($fixture in @($successFixture, $failedFixture)) {
+foreach ($fixture in @($successFixture, $missingWorkspaceFixture, $overlapFixture, $siblingOverlapFixture, $failedFixture)) {
     if (Test-Path -LiteralPath $fixture["root"]) {
         Remove-Item -LiteralPath $fixture["root"] -Recurse -Force
     }

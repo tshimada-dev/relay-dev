@@ -19,6 +19,9 @@ if (-not (Get-Command Apply-JobResult -ErrorAction SilentlyContinue)) {
 if (-not (Get-Command Get-PhaseDefinition -ErrorAction SilentlyContinue)) {
     . (Join-Path (Join-Path $PSScriptRoot "..\phases") "phase-registry.ps1")
 }
+if (-not (Get-Command Assert-TaskGroupWorkerIsolation -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "task-group-worker-isolation.ps1")
+}
 
 function Append-LeasedJobRunStatusChangedEvent {
     param(
@@ -71,6 +74,7 @@ function Import-TaskGroupWorkerPackage {
 
     $packageObject = Import-LeasedJobPackage -Package $Package
     if ([string]$packageObject["package_kind"] -eq "task-group-leased-package") {
+        $isolationPaths = @(Get-TaskGroupWorkerPackageIsolationPaths -Workers @($packageObject["workers"]))
         foreach ($workerRaw in @($packageObject["workers"])) {
             $worker = ConvertTo-RelayHashtable -InputObject $workerRaw
             if ([string]::IsNullOrWhiteSpace($WorkerId) -or [string]$worker["worker_id"] -eq $WorkerId -or [string]$worker["id"] -eq $WorkerId) {
@@ -79,6 +83,7 @@ function Import-TaskGroupWorkerPackage {
                         $worker[$field] = $packageObject[$field]
                     }
                 }
+                $worker["_task_group_worker_isolation_paths"] = @($isolationPaths)
                 return $worker
             }
         }
@@ -185,7 +190,17 @@ function Invoke-TaskGroupWorkerPackage {
     if ($phaseSequence.Count -eq 0) {
         $phaseSequence = @("Phase5", "Phase5-1", "Phase5-2", "Phase6")
     }
-    $workspacePath = if ([string]::IsNullOrWhiteSpace([string]$worker["workspace_path"])) { $ProjectRoot } else { [string]$worker["workspace_path"] }
+    try {
+        Assert-TaskGroupWorkerIsolation -Worker $worker -ProjectRoot $ProjectRoot -WorkerId $workerId
+    }
+    catch {
+        Update-TaskGroupWorkerRunState -ProjectRoot $ProjectRoot -RunId $runId -WorkerId $workerId -LockTimeoutSec $LockTimeoutSec -Patch @{
+            status = "failed"; current_phase = [string]$phaseSequence[0]; group_id = $groupId; task_id = $taskId
+            errors = @($_.Exception.Message); result_summary = "failed"; artifact_refs = @()
+        } | Out-Null
+        throw
+    }
+    $workspacePath = [string]$worker["workspace_path"]
     $provider = ConvertTo-RelayHashtable -InputObject $worker["provider_spec"]
     $artifactRefs = New-Object System.Collections.Generic.List[object]
     $errors = New-Object System.Collections.Generic.List[string]

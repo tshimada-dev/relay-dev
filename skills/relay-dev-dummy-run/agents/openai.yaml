@@ -1,0 +1,4 @@
+interface:
+  display_name: "Relay Dev Dummy Run"
+  short_description: "Generate relay-dev dummy runs"
+  default_prompt: "Use $relay-dev-dummy-run to create a dummy relay-dev run for Phase6 rejection testing."

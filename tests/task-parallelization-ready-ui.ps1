@@ -66,7 +66,7 @@ function New-ParallelUiState {
             max_parallel_jobs = 3
             stop_leasing = $false
         }
-        task_order = @("T-active", "T-ready-a", "T-ready-b")
+        task_order = @("T-active", "T-ready-a", "T-ready-b", "T-dep")
         pending_approval = $null
         task_states = [ordered]@{
             "T-active" = [ordered]@{
@@ -97,6 +97,15 @@ function New-ParallelUiState {
                 parallel_safety = "cautious"
                 depends_on = @()
             }
+            "T-dep" = [ordered]@{
+                status = "blocked"
+                kind = "planned"
+                active_job_id = $null
+                wait_reason = "dependency"
+                phase_cursor = "Phase5"
+                parallel_safety = "parallel"
+                depends_on = @("T-active")
+            }
         }
     }
 }
@@ -110,6 +119,11 @@ Assert-Equal @($summary["lease_candidates"]).Count 2 "Summary should derive leas
 Assert-Equal $summary["lease_candidates"][0]["task_id"] "T-ready-a" "First lease candidate should preserve task order."
 Assert-Equal $summary["lease_candidates"][0]["slot_id"] "slot-02" "First derived candidate should use the next slot."
 Assert-Equal $summary["lease_candidates"][1]["resource_locks"][0] "api" "Lease candidates should include resource locks."
+$cautiousReady = @($summary["ready_queue"] | Where-Object { $_["task_id"] -eq "T-ready-b" })[0]
+Assert-Equal $cautiousReady["launch_block_reason"] "cautious_parallel_safety" "Cautious ready rows should explain explicit opt-in."
+Assert-True ($cautiousReady["operator_hint"].Contains("-AllowCautiousParallelJob")) "Cautious hint should name the opt-in switch."
+$dependencyWait = @($summary["waiting_tasks"] | Where-Object { $_["task_id"] -eq "T-dep" })[0]
+Assert-Equal $dependencyWait["launch_block_reason"] "dependency" "Dependency waits should expose launch blocking detail."
 
 $fullState = New-ParallelUiState
 $fullState["task_lane"]["max_parallel_jobs"] = 1
@@ -118,6 +132,14 @@ Assert-Equal ([int]$fullSummary["capacity_remaining"]) 0 "Full summary should ex
 Assert-Equal ([bool]$fullSummary["capacity_full"]) $true "Full summary should expose capacity_full=true."
 Assert-Equal $fullSummary["stall_reason"] "capacity_full" "Full slots should use capacity_full rather than job_in_progress."
 Assert-Equal @($fullSummary["lease_candidates"]).Count 0 "Full summary should not derive lease candidates."
+$fullReady = @($fullSummary["ready_queue"] | Where-Object { $_["task_id"] -eq "T-ready-a" })[0]
+Assert-Equal $fullReady["launch_block_reason"] "capacity_full" "Ready rows should explain when active jobs consume all slots."
+
+$nonTaskScopedState = New-ParallelUiState
+$nonTaskScopedState["current_phase"] = "Phase3"
+$nonTaskScopedSummary = New-TaskLaneSummary -RunState $nonTaskScopedState
+$nonTaskScopedReady = @($nonTaskScopedSummary["ready_queue"] | Where-Object { $_["task_id"] -eq "T-ready-a" })[0]
+Assert-Equal $nonTaskScopedReady["launch_block_reason"] "non_task_scoped_current_phase" "Ready rows should explain non task-scoped current phases."
 
 $dashboard = New-RunDashboardSummary -RunState (New-ParallelUiState)
 Assert-True ($dashboard.Contains("remaining=2")) "Dashboard should render capacity remaining."

@@ -98,6 +98,31 @@ function Copy-TaskLaneArrayFieldIfPresent {
     }
 }
 
+function Test-TaskLaneTaskScopedPhase {
+    param([AllowNull()][string]$Phase)
+
+    if ([string]::IsNullOrWhiteSpace($Phase)) {
+        return $false
+    }
+    if (Get-Command Test-TaskScopedPhase -ErrorAction SilentlyContinue) {
+        return [bool](Test-TaskScopedPhase -Phase $Phase)
+    }
+
+    return ($Phase -in @("Phase5", "Phase5-1", "Phase5-2", "Phase6"))
+}
+
+function New-TaskLaneLaunchBlockDetail {
+    param(
+        [Parameter(Mandatory)][string]$Reason,
+        [Parameter(Mandatory)][string]$Hint
+    )
+
+    return [ordered]@{
+        launch_block_reason = $Reason
+        operator_hint = $Hint
+    }
+}
+
 function Test-TaskLaneActiveTaskGroupStatus {
     param([AllowNull()][string]$Status)
 
@@ -206,6 +231,140 @@ function Resolve-TaskLaneLeaseCandidates {
     }
 
     return @($items.ToArray())
+}
+
+function Resolve-TaskLaneEffectiveField {
+    param(
+        [Parameter(Mandatory)]$Task,
+        [AllowNull()]$Eligibility,
+        [Parameter(Mandatory)][string]$FieldName
+    )
+
+    $eligibilityRow = ConvertTo-RelayHashtable -InputObject $Eligibility
+    if ($eligibilityRow -and -not [string]::IsNullOrWhiteSpace([string]$eligibilityRow[$FieldName])) {
+        return [string]$eligibilityRow[$FieldName]
+    }
+
+    $taskRow = ConvertTo-RelayHashtable -InputObject $Task
+    return [string]$taskRow[$FieldName]
+}
+
+function Get-TaskLaneLaunchBlockDetail {
+    param(
+        [Parameter(Mandatory)]$Task,
+        [AllowNull()]$Eligibility = $null,
+        [bool]$IsLeaseCandidate = $false,
+        [int]$CapacityRemaining = 0,
+        [AllowNull()][string]$CurrentPhase = "",
+        [Parameter(Mandatory)]$ActiveJobs
+    )
+
+    $taskRow = ConvertTo-RelayHashtable -InputObject $Task
+    if (-not $taskRow) {
+        $taskRow = @{}
+    }
+    $activeJobCount = @($ActiveJobs).Count
+    $status = [string]$taskRow["status"]
+    $waitReason = Resolve-TaskLaneEffectiveField -Task $taskRow -Eligibility $Eligibility -FieldName "wait_reason"
+    $parallelSafety = Resolve-TaskLaneEffectiveField -Task $taskRow -Eligibility $Eligibility -FieldName "parallel_safety"
+
+    if ($waitReason -in @("dependency", "dependencies", "blocked_dependency", "depends_on", "blocked_by_task")) {
+        return New-TaskLaneLaunchBlockDetail -Reason "dependency" -Hint "Waiting for dependency tasks to complete or dependency repair to clear this task."
+    }
+    if (@(ConvertTo-TaskLaneStringArray -Value $taskRow["depends_on"]).Count -gt 0 -and $status -in @("blocked", "waiting")) {
+        return New-TaskLaneLaunchBlockDetail -Reason "dependency" -Hint "Waiting for dependency tasks to complete or dependency repair to clear this task."
+    }
+    if ($waitReason -in @("resource_lock", "serial_safety", "stop_leasing")) {
+        $hint = switch ($waitReason) {
+            "resource_lock" { "Waiting for the active job holding the listed resource lock to finish." }
+            "serial_safety" { "Serial safety requires this task or the active serial task to run alone." }
+            default { "Task leasing is paused for this lane." }
+        }
+        return New-TaskLaneLaunchBlockDetail -Reason $waitReason -Hint $hint
+    }
+    if ($activeJobCount -gt 0 -and [string]::IsNullOrWhiteSpace($waitReason) -and $status -in @("running", "waiting")) {
+        return New-TaskLaneLaunchBlockDetail -Reason "active_job" -Hint "A task is already running; wait for an active job to finish before this row can launch."
+    }
+    if ($status -eq "running" -and [string]::IsNullOrWhiteSpace($waitReason)) {
+        return New-TaskLaneLaunchBlockDetail -Reason "running_without_active_job" -Hint "Task state says running, but no active job is attached; inspect recovery state before launching more work."
+    }
+
+    if ($parallelSafety -eq "cautious") {
+        return New-TaskLaneLaunchBlockDetail -Reason "cautious_parallel_safety" -Hint "Requires the operator to opt in with -AllowCautiousParallelJob before packaging a cautious parallel job."
+    }
+    if ($parallelSafety -eq "serial") {
+        return New-TaskLaneLaunchBlockDetail -Reason "serial_parallel_safety" -Hint "Serial tasks are not launchable as parallel jobs; run them through the normal single-task path."
+    }
+
+    if (-not $IsLeaseCandidate) {
+        if ($CapacityRemaining -le 0) {
+            return New-TaskLaneLaunchBlockDetail -Reason "capacity_full" -Hint "All parallel job slots are currently in use."
+        }
+        if (-not [string]::IsNullOrWhiteSpace($CurrentPhase) -and -not (Test-TaskLaneTaskScopedPhase -Phase $CurrentPhase)) {
+            return New-TaskLaneLaunchBlockDetail -Reason "non_task_scoped_current_phase" -Hint "The run is in a non task-scoped phase; task leases resume in a task-scoped phase."
+        }
+        if ($activeJobCount -gt 0) {
+            return New-TaskLaneLaunchBlockDetail -Reason "active_job" -Hint "Another active job is constraining this task; wait for it to finish or inspect blocking details."
+        }
+    }
+
+    return $null
+}
+
+function Add-TaskLaneLaunchBlockDetail {
+    param(
+        [Parameter(Mandatory)]$Row,
+        [AllowNull()]$Detail
+    )
+
+    $detailRow = ConvertTo-RelayHashtable -InputObject $Detail
+    if (-not $detailRow) {
+        return
+    }
+    foreach ($field in @("launch_block_reason", "operator_hint")) {
+        if ($detailRow.ContainsKey($field) -and -not [string]::IsNullOrWhiteSpace([string]$detailRow[$field])) {
+            $Row[$field] = [string]$detailRow[$field]
+        }
+    }
+}
+
+function New-TaskLaneLeaseCandidateSet {
+    param([AllowNull()]$LeaseCandidates)
+
+    $taskIds = @{}
+    foreach ($candidateRaw in @($LeaseCandidates)) {
+        $candidate = ConvertTo-RelayHashtable -InputObject $candidateRaw
+        if ($candidate -and -not [string]::IsNullOrWhiteSpace([string]$candidate["task_id"])) {
+            $taskIds[[string]$candidate["task_id"]] = $true
+        }
+    }
+
+    return $taskIds
+}
+
+function Add-TaskLaneLaunchBlockDetails {
+    param(
+        [Parameter(Mandatory)]$Rows,
+        [Parameter(Mandatory)]$TaskStates,
+        [Parameter(Mandatory)]$EligibilityByTaskId,
+        [Parameter(Mandatory)]$LeaseCandidateTaskIds,
+        [int]$CapacityRemaining = 0,
+        [AllowNull()][string]$CurrentPhase = "",
+        [Parameter(Mandatory)]$ActiveJobs
+    )
+
+    foreach ($rowRaw in @($Rows)) {
+        $row = if ($rowRaw -is [System.Collections.IDictionary]) { $rowRaw } else { ConvertTo-RelayHashtable -InputObject $rowRaw }
+        if (-not $row -or [string]::IsNullOrWhiteSpace([string]$row["task_id"])) {
+            continue
+        }
+
+        $taskId = [string]$row["task_id"]
+        $task = if ($TaskStates.ContainsKey($taskId)) { ConvertTo-RelayHashtable -InputObject $TaskStates[$taskId] } else { $row }
+        $eligibility = if ($EligibilityByTaskId.ContainsKey($taskId)) { ConvertTo-RelayHashtable -InputObject $EligibilityByTaskId[$taskId] } else { $null }
+        $detail = Get-TaskLaneLaunchBlockDetail -Task $task -Eligibility $eligibility -IsLeaseCandidate:$LeaseCandidateTaskIds.ContainsKey($taskId) -CapacityRemaining $CapacityRemaining -CurrentPhase $CurrentPhase -ActiveJobs @($ActiveJobs)
+        Add-TaskLaneLaunchBlockDetail -Row $row -Detail $detail
+    }
 }
 
 function New-TaskLaneSummary {
@@ -422,7 +581,7 @@ function New-TaskLaneSummary {
         }
 
         $isWaiting = ($status -ne "completed" -and [string]::IsNullOrWhiteSpace($activeJobId))
-        if ($isWaiting -and ($status -in @("ready", "blocked", "waiting") -or -not [string]::IsNullOrWhiteSpace($effectiveWaitReason) -or ($eligibility -and -not $eligibleForDispatch))) {
+        if ($isWaiting -and ($status -in @("ready", "blocked", "waiting", "running") -or -not [string]::IsNullOrWhiteSpace($effectiveWaitReason) -or ($eligibility -and -not $eligibleForDispatch))) {
             $row = [ordered]@{
                 task_id = [string]$taskId
                 status = $status
@@ -477,6 +636,16 @@ function New-TaskLaneSummary {
     $capacityFull = ($capacityRemaining -le 0)
     $leaseCandidates = @(Resolve-TaskLaneLeaseCandidates -RunState $state -ProjectRoot $projectRoot -ReadyQueue @($readyQueueRows.ToArray()) -CapacityRemaining $capacityRemaining)
     $stallReason = Resolve-TaskLaneStallReason -Lane $taskLane -ActiveJobs @($activeJobRows.ToArray()) -ReadyQueue @($readyQueueRows.ToArray()) -WaitingTasks @($waitingTaskRows.ToArray()) -CapacityRemaining $capacityRemaining
+    $launchDetailParams = @{
+        TaskStates = $taskStates
+        EligibilityByTaskId = $eligibilityByTaskId
+        LeaseCandidateTaskIds = (New-TaskLaneLeaseCandidateSet -LeaseCandidates $leaseCandidates)
+        CapacityRemaining = $capacityRemaining
+        CurrentPhase = [string]$state["current_phase"]
+        ActiveJobs = @($activeJobRows.ToArray())
+    }
+    Add-TaskLaneLaunchBlockDetails @launchDetailParams -Rows @($readyQueueRows.ToArray())
+    Add-TaskLaneLaunchBlockDetails @launchDetailParams -Rows @($waitingTaskRows.ToArray())
 
     return [ordered]@{
         total_tasks = @($taskStates.Keys).Count

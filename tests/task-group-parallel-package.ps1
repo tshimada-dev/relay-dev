@@ -53,7 +53,10 @@ function New-TestBoundaryContract {
 }
 
 function New-TestTask {
-    param([Parameter(Mandatory)][string]$TaskId)
+    param(
+        [Parameter(Mandatory)][string]$TaskId,
+        [string]$ParallelSafety = "parallel"
+    )
 
     return [ordered]@{
         task_id = $TaskId
@@ -73,15 +76,20 @@ function New-TestTask {
         tests = @("pwsh -NoProfile -File tests/task-group-parallel-package.ps1")
         complexity = "small"
         resource_locks = @("lock-$TaskId")
-        parallel_safety = "parallel"
+        parallel_safety = $ParallelSafety
     }
 }
 
 function New-PackageFixture {
+    param(
+        [string]$FirstSafety = "parallel",
+        [string]$SecondSafety = "parallel"
+    )
+
     $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("relay-task-group-package-" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
     $runId = "run-task-group-package"
-    $tasksArtifact = [ordered]@{ tasks = @((New-TestTask -TaskId "T-pack-a"), (New-TestTask -TaskId "T-pack-b")) }
+    $tasksArtifact = [ordered]@{ tasks = @((New-TestTask -TaskId "T-pack-a" -ParallelSafety $FirstSafety), (New-TestTask -TaskId "T-pack-b" -ParallelSafety $SecondSafety)) }
 
     Save-Artifact -ProjectRoot $tempRoot -RunId $runId -Scope run -Phase "Phase4" -ArtifactId "phase4_tasks.json" -Content $tasksArtifact -AsJson | Out-Null
     $state = New-RunState -RunId $runId -ProjectRoot $tempRoot -CurrentPhase "Phase5" -CurrentRole "implementer"
@@ -95,6 +103,12 @@ function New-PackageFixture {
     }
 }
 
+$provider = [ordered]@{
+    provider = "fake"
+    command = "pwsh"
+    flags = "-NoProfile"
+}
+
 $dryRunFixture = New-PackageFixture
 $dryRunState = $dryRunFixture["state"]
 $groupsBefore = @($dryRunState["task_groups"].Keys).Count
@@ -106,12 +120,30 @@ Assert-Equal @($dryRunState["task_group_workers"].Keys).Count $workersBefore "Dr
 Assert-Equal @($dryRunPlan["run_state"]["task_groups"].Keys).Count $groupsBefore "Dry-run returned run-state should not add task groups."
 Assert-Equal @($dryRunPlan["run_state"]["task_group_workers"].Keys).Count $workersBefore "Dry-run returned run-state should not add task group workers."
 
+$cautiousCandidate = New-TestTask -TaskId "T-cautious" -ParallelSafety "cautious"
+$serialCandidate = New-TestTask -TaskId "T-serial" -ParallelSafety "serial"
+$defaultCautiousTest = Test-ParallelStepLaunchableCandidate -Candidate $cautiousCandidate
+$allowedCautiousTest = Test-ParallelStepLaunchableCandidate -Candidate $cautiousCandidate -AllowCautiousSafety
+$defaultSerialTest = Test-ParallelStepLaunchableCandidate -Candidate $serialCandidate
+$cautiousSerialTest = Test-ParallelStepLaunchableCandidate -Candidate $serialCandidate -AllowCautiousSafety
+Assert-True (-not [bool]$defaultCautiousTest["launchable"]) "Default parallel launchability should reject cautious candidates."
+Assert-True ([string]$defaultCautiousTest["reason"] -like "*cautious*") "Cautious rejection should identify cautious safety."
+Assert-True ([bool]$allowedCautiousTest["launchable"]) "Cautious opt-in should allow cautious candidates."
+Assert-True (-not [bool]$defaultSerialTest["launchable"]) "Default parallel launchability should reject serial candidates."
+Assert-True ([string]$defaultSerialTest["reason"] -like "*serial*") "Serial rejection should identify serial safety."
+Assert-True (-not [bool]$cautiousSerialTest["launchable"]) "Cautious opt-in should not allow serial candidates."
+
+$cautiousFixture = New-PackageFixture -FirstSafety "cautious" -SecondSafety "parallel"
+$cautiousDefault = New-ParallelStepJobPackages -ProjectRoot ([string]$cautiousFixture["root"]) -RunState $cautiousFixture["state"] -ProviderSpec $provider -AllowSingleParallelJob -PackageRoot (Join-Path ([string]$cautiousFixture["root"]) "jobs-default")
+Assert-Equal $cautiousDefault["status"] "leased" "Default parallel-step package creation should still lease parallel candidates when cautious candidates are present."
+Assert-Equal @($cautiousDefault["packages"]).Count 1 "Default parallel-step package creation should reject cautious candidates."
+Assert-Equal @($cautiousDefault["rejected_candidates"]).Count 1 "Default parallel-step package creation should report rejected cautious candidates."
+$cautiousAllowedFixture = New-PackageFixture -FirstSafety "cautious" -SecondSafety "parallel"
+$cautiousAllowed = New-ParallelStepJobPackages -ProjectRoot ([string]$cautiousAllowedFixture["root"]) -RunState $cautiousAllowedFixture["state"] -ProviderSpec $provider -AllowSingleParallelJob -AllowCautiousSafety -PackageRoot (Join-Path ([string]$cautiousAllowedFixture["root"]) "jobs-cautious")
+Assert-Equal $cautiousAllowed["status"] "leased" "Cautious opt-in should lease cautious and parallel candidates."
+Assert-Equal @($cautiousAllowed["packages"]).Count 2 "Cautious opt-in should include cautious candidates."
+
 $packageFixture = New-PackageFixture
-$provider = [ordered]@{
-    provider = "fake"
-    command = "pwsh"
-    flags = "-NoProfile"
-}
 $packageResult = New-TaskGroupJobPackage -ProjectRoot ([string]$packageFixture["root"]) -RunState $packageFixture["state"] -ProviderSpec $provider
 $packageState = $packageResult["run_state"]
 $groupId = [string]$packageResult["group_id"]

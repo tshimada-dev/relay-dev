@@ -18,7 +18,8 @@ param(
     [string]$ApprovalDecisionFile,
     [string]$JobPackageFile,
     [string]$WorkerId,
-    [switch]$AllowSingleParallelJob
+    [switch]$AllowSingleParallelJob,
+    [switch]$AllowCautiousParallelJob
 )
 
 $ErrorActionPreference = "Stop"
@@ -2241,7 +2242,8 @@ function Invoke-EngineStep {
 function Invoke-ParallelEngineStep {
     param(
         [Parameter(Mandatory)][string]$ResolvedRunId,
-        [switch]$AllowSingleJob
+        [switch]$AllowSingleJob,
+        [switch]$AllowCautiousJob
     )
 
     $runLock = $null
@@ -2307,7 +2309,7 @@ function Invoke-ParallelEngineStep {
         $providerSpec = Resolve-RoleProviderSpec -ResolvedRole $resolvedRole -ProviderName $Provider -ExplicitCommand $ProviderCommand -ExplicitFlags $ProviderFlags
         $packageRoot = Get-RunJobsPath -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId
 
-        $packageResult = ConvertTo-RelayHashtable -InputObject (New-ParallelStepJobPackages -ProjectRoot $script:ProjectRoot -RunState $runState -ProviderSpec $providerSpec -PackageRoot $packageRoot -AllowSingleParallelJob:$AllowSingleJob -PhaseDefinitionFactory {
+        $packageResult = ConvertTo-RelayHashtable -InputObject (New-ParallelStepJobPackages -ProjectRoot $script:ProjectRoot -RunState $runState -ProviderSpec $providerSpec -PackageRoot $packageRoot -AllowSingleParallelJob:$AllowSingleJob -AllowCautiousSafety:$AllowCautiousJob -PhaseDefinitionFactory {
                 param($PhaseName, $RoleName, $ProviderSpecForPackage, $Candidate, $JobSpec, $State)
                 return (Get-PhaseDefinition -ProjectRoot $script:ProjectRoot -Phase ([string]$PhaseName) -Provider ([string]$ProviderSpecForPackage["provider"]))
             } -WorkspacePathFactory {
@@ -2478,7 +2480,7 @@ switch ($Command) {
             Sync-ConfiguredTaskLaneForStep -ResolvedRunId $resolvedRunId
         }
         if (-not $hasManualPrompt -and (Test-ShouldPreferParallelStep -ResolvedRunId $resolvedRunId)) {
-            $parallelResult = ConvertTo-RelayHashtable -InputObject (Invoke-ParallelEngineStep -ResolvedRunId $resolvedRunId -AllowSingleJob:$(Resolve-StepAllowSingleParallelJob -ExplicitAllowSingleParallelJob:$AllowSingleParallelJob))
+            $parallelResult = ConvertTo-RelayHashtable -InputObject (Invoke-ParallelEngineStep -ResolvedRunId $resolvedRunId -AllowSingleJob:$(Resolve-StepAllowSingleParallelJob -ExplicitAllowSingleParallelJob:$AllowSingleParallelJob) -AllowCautiousJob:$AllowCautiousParallelJob)
             if ([string]$parallelResult["status"] -eq "completed") {
                 $result = $parallelResult
             }
@@ -2501,7 +2503,7 @@ switch ($Command) {
             throw "No active run."
         }
 
-        $result = Invoke-ParallelEngineStep -ResolvedRunId $resolvedRunId -AllowSingleJob:$(Resolve-StepAllowSingleParallelJob -ExplicitAllowSingleParallelJob:$AllowSingleParallelJob)
+        $result = Invoke-ParallelEngineStep -ResolvedRunId $resolvedRunId -AllowSingleJob:$(Resolve-StepAllowSingleParallelJob -ExplicitAllowSingleParallelJob:$AllowSingleParallelJob) -AllowCautiousJob:$AllowCautiousParallelJob
         $result | ConvertTo-Json -Depth 30 -Compress
     }
     "group-step" {

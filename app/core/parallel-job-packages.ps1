@@ -72,6 +72,7 @@ function Test-ParallelStepLaunchableCandidate {
     param(
         [Parameter(Mandatory)]$Candidate,
         [switch]$AllowNonParallelSafety,
+        [switch]$AllowCautiousSafety,
         [switch]$AllowEmptyChangedFiles
     )
 
@@ -96,7 +97,17 @@ function Test-ParallelStepLaunchableCandidate {
         $parallelSafety = "cautious"
     }
     if (-not $AllowNonParallelSafety -and $parallelSafety -ne "parallel") {
-        $errors.Add("parallel_safety must be parallel") | Out-Null
+        if ($parallelSafety -eq "cautious") {
+            if (-not $AllowCautiousSafety) {
+                $errors.Add("parallel_safety cautious requires explicit cautious opt-in") | Out-Null
+            }
+        }
+        elseif ($parallelSafety -eq "serial") {
+            $errors.Add("parallel_safety serial requires non-parallel execution") | Out-Null
+        }
+        else {
+            $errors.Add("parallel_safety must be parallel") | Out-Null
+        }
     }
 
     $changedFilesSource = $null
@@ -528,6 +539,7 @@ function New-ParallelStepJobPackages {
         [int]$LeaseDurationMinutes = 120,
         [switch]$AllowSingleParallelJob,
         [switch]$AllowNonParallelSafety,
+        [switch]$AllowCautiousSafety,
         [switch]$AllowEmptyChangedFiles
     )
 
@@ -552,7 +564,7 @@ function New-ParallelStepJobPackages {
     $launchable = New-Object System.Collections.Generic.List[object]
     $rejected = New-Object System.Collections.Generic.List[object]
     foreach ($candidate in $candidates) {
-        $test = Test-ParallelStepLaunchableCandidate -Candidate $candidate -AllowNonParallelSafety:$AllowNonParallelSafety -AllowEmptyChangedFiles:$AllowEmptyChangedFiles
+        $test = Test-ParallelStepLaunchableCandidate -Candidate $candidate -AllowNonParallelSafety:$AllowNonParallelSafety -AllowCautiousSafety:$AllowCautiousSafety -AllowEmptyChangedFiles:$AllowEmptyChangedFiles
         if ([bool]$test["launchable"]) {
             $launchable.Add((ConvertTo-RelayHashtable -InputObject $candidate)) | Out-Null
         }

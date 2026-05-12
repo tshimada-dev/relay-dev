@@ -64,7 +64,8 @@ function New-TestVisualContract {
 function New-TestTask {
     param(
         [Parameter(Mandatory)][string]$TaskId,
-        [Parameter(Mandatory)][string]$ResourceLock
+        [Parameter(Mandatory)][string]$ResourceLock,
+        [string]$ParallelSafety = "parallel"
     )
 
     $changedFile = "parallel-test/$TaskId.txt"
@@ -79,7 +80,7 @@ function New-TestTask {
         tests = @("pwsh -NoProfile -File tests/task-parallelization-headless-execution.ps1")
         complexity = "small"
         resource_locks = @($ResourceLock)
-        parallel_safety = "parallel"
+        parallel_safety = $ParallelSafety
     }
 }
 
@@ -220,6 +221,41 @@ try {
     Assert-True (Test-Path -LiteralPath (Join-Path $productDir "T-b.txt") -PathType Leaf) "T-b product file should be merged back."
     Assert-Equal $finalState.task_states."T-a".last_completed_phase "Phase5" "T-a should complete Phase5."
     Assert-Equal $finalState.task_states."T-b".last_completed_phase "Phase5" "T-b should complete Phase5."
+
+    if (Test-Path -LiteralPath $productDir) {
+        Remove-Item -LiteralPath $productDir -Recurse -Force
+    }
+
+    $cautiousRunId = "$runId-cautious"
+    $cautiousTasksArtifact = [ordered]@{
+        tasks = @(
+            (New-TestTask -TaskId "T-cautious-a" -ResourceLock "parallel-test-cautious-a" -ParallelSafety "cautious"),
+            (New-TestTask -TaskId "T-cautious-b" -ResourceLock "parallel-test-cautious-b" -ParallelSafety "cautious")
+        )
+    }
+    Save-Artifact -ProjectRoot $repoRoot -RunId $cautiousRunId -Scope run -Phase "Phase4" -ArtifactId "phase4_tasks.json" -Content $cautiousTasksArtifact -AsJson | Out-Null
+    $cautiousState = New-RunState -RunId $cautiousRunId -ProjectRoot $repoRoot -CurrentPhase "Phase5" -CurrentRole "implementer"
+    $cautiousState = Register-PlannedTasks -RunState $cautiousState -TasksArtifact $cautiousTasksArtifact
+    $cautiousState["task_lane"]["mode"] = "parallel"
+    $cautiousState["task_lane"]["max_parallel_jobs"] = 2
+    Write-RunState -ProjectRoot $repoRoot -RunState $cautiousState | Out-Null
+
+    $cautiousDefaultOutput = & pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repoRoot "app\cli.ps1") parallel-step -RunId $cautiousRunId -ConfigFile $configPath -Provider generic-cli -ProviderCommand $providerPath 2>&1
+    $cautiousDefaultJsonLine = @($cautiousDefaultOutput | ForEach-Object { [string]$_ } | Where-Object { $_.TrimStart().StartsWith("{") } | Select-Object -Last 1)
+    $cautiousDefaultSummary = if (-not [string]::IsNullOrWhiteSpace([string]$cautiousDefaultJsonLine)) { $cautiousDefaultJsonLine | ConvertFrom-Json } else { $null }
+    if ($cautiousDefaultSummary) {
+        Assert-Equal $cautiousDefaultSummary.status "wait" "parallel-step should reject cautious candidates by default."
+        Assert-True ([string]$cautiousDefaultSummary.rejected_candidates[0].launchability.reason -like "*cautious*") "default cautious rejection should identify cautious safety."
+    }
+
+    $cautiousOptInOutput = & pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repoRoot "app\cli.ps1") parallel-step -RunId $cautiousRunId -ConfigFile $configPath -Provider generic-cli -ProviderCommand $providerPath -AllowCautiousParallelJob 2>&1
+    $cautiousOptInJsonLine = @($cautiousOptInOutput | ForEach-Object { [string]$_ } | Where-Object { $_.TrimStart().StartsWith("{") } | Select-Object -Last 1)
+    Assert-True (-not [string]::IsNullOrWhiteSpace([string]$cautiousOptInJsonLine)) "cautious parallel-step should emit a JSON summary."
+    $cautiousOptInSummary = if (-not [string]::IsNullOrWhiteSpace([string]$cautiousOptInJsonLine)) { $cautiousOptInJsonLine | ConvertFrom-Json } else { $null }
+    if ($cautiousOptInSummary) {
+        Assert-Equal $cautiousOptInSummary.status "completed" "cautious opt-in parallel-step should complete the worker batch."
+        Assert-Equal $cautiousOptInSummary.leased_count 2 "cautious opt-in parallel-step should lease cautious jobs."
+    }
 
     $script:ExecutionMode = "auto"
     $script:ExecutionMaxParallelJobs = 2

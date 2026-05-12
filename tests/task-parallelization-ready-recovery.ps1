@@ -4,6 +4,7 @@ Set-StrictMode -Version Latest
 $repoRoot = Split-Path -Parent $PSScriptRoot
 
 . (Join-Path $repoRoot "app\core\run-state-store.ps1")
+. (Join-Path $repoRoot "app\core\artifact-repository.ps1")
 . (Join-Path $repoRoot "app\core\workflow-engine.ps1")
 
 $failures = New-Object System.Collections.Generic.List[string]
@@ -203,6 +204,58 @@ try {
     Assert-Equal $orphanRepairedState["task_states"]["T-orphan-blocked"]["status"] "not_started" "Dependency-blocked orphan task should return to not_started."
     Assert-Equal $orphanRepairedState["task_states"]["T-orphan-blocked"]["wait_reason"] "dependencies" "Dependency-blocked orphan task should carry a dependency wait reason."
     Assert-Equal @($orphanRepair["recovered_tasks"]).Count 2 "Recovery should report every repaired orphan task."
+
+    $phase6RecoveryRunId = "run-ready-phase6-reject"
+    $phase6RecoveryState = New-RunState -RunId $phase6RecoveryRunId -ProjectRoot $tempRoot -CurrentPhase "Phase6" -CurrentRole "reviewer" -TaskId "T-reject"
+    $phase6RecoveryState["task_order"] = @("T-reject")
+    $phase6RecoveryState["task_states"] = [ordered]@{
+        "T-reject" = [ordered]@{
+            task_id = "T-reject"
+            status = "in_progress"
+            kind = "planned"
+            last_completed_phase = "Phase6"
+            phase_cursor = "Phase6"
+            active_job_id = $null
+            wait_reason = $null
+            depends_on = @()
+        }
+    }
+    Save-Artifact -ProjectRoot $tempRoot -RunId $phase6RecoveryRunId -Scope task -TaskId "T-reject" -Phase "Phase6" -ArtifactId "phase6_result.json" -Content @{
+        task_id = "T-reject"
+        verdict = "reject"
+        rollback_phase = "Phase5"
+    } -AsJson | Out-Null
+    $phase6Recovery = Repair-RejectedPhase6TaskState -RunState $phase6RecoveryState -ProjectRoot $tempRoot
+    $phase6RecoveryRepairedState = ConvertTo-RelayHashtable -InputObject $phase6Recovery["run_state"]
+    Assert-True ([bool]$phase6Recovery["changed"]) "Rejected Phase6 recovery should repair task-scoped rollback phases."
+    Assert-Equal $phase6RecoveryRepairedState["task_states"]["T-reject"]["status"] "in_progress" "Rejected Phase6 recovery should leave the task open for retry."
+    Assert-Equal $phase6RecoveryRepairedState["task_states"]["T-reject"]["phase_cursor"] "Phase5" "Rejected Phase6 recovery should restore a task-scoped rollback cursor."
+    Assert-Equal $phase6RecoveryRepairedState["current_phase"] "Phase5" "Rejected Phase6 recovery should restore the run cursor when nothing else is active."
+
+    $phase6RunLevelRecoveryRunId = "run-ready-phase6-run-level-reject"
+    $phase6RunLevelRecoveryState = New-RunState -RunId $phase6RunLevelRecoveryRunId -ProjectRoot $tempRoot -CurrentPhase "Phase6" -CurrentRole "reviewer" -TaskId "T-reject"
+    $phase6RunLevelRecoveryState["task_order"] = @("T-reject")
+    $phase6RunLevelRecoveryState["task_states"] = [ordered]@{
+        "T-reject" = [ordered]@{
+            task_id = "T-reject"
+            status = "in_progress"
+            kind = "planned"
+            last_completed_phase = "Phase6"
+            phase_cursor = "Phase6"
+            active_job_id = $null
+            wait_reason = $null
+            depends_on = @()
+        }
+    }
+    Save-Artifact -ProjectRoot $tempRoot -RunId $phase6RunLevelRecoveryRunId -Scope task -TaskId "T-reject" -Phase "Phase6" -ArtifactId "phase6_result.json" -Content @{
+        task_id = "T-reject"
+        verdict = "reject"
+        rollback_phase = "Phase4"
+    } -AsJson | Out-Null
+    $phase6RunLevelRecovery = Repair-RejectedPhase6TaskState -RunState $phase6RunLevelRecoveryState -ProjectRoot $tempRoot
+    $phase6RunLevelRecoveryStateAfter = ConvertTo-RelayHashtable -InputObject $phase6RunLevelRecovery["run_state"]
+    Assert-Equal ([bool]$phase6RunLevelRecovery["changed"]) $false "Rejected Phase6 recovery should not auto-repair non-task rollback phases in this slice."
+    Assert-Equal $phase6RunLevelRecoveryStateAfter["task_states"]["T-reject"]["phase_cursor"] "Phase6" "Rejected Phase6 recovery should preserve the stale cursor for non-task rollback design follow-up."
 }
 finally {
     if (Test-Path $tempRoot) {

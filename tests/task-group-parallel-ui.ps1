@@ -156,6 +156,8 @@ Assert-Equal $summary["task_group_workers"][0]["resource_locks"][0] "file:app/a.
 Assert-Equal ([int]$summary["active_task_group_count"]) 1 "Summary should count active task groups."
 Assert-Equal ([int]$summary["running_task_group_count"]) 1 "Summary should count running task groups."
 Assert-Equal ([int]$summary["running_task_group_worker_count"]) 1 "Summary should count running task group workers."
+$idleRunningTask = @($summary["waiting_tasks"] | Where-Object { $_["task_id"] -eq "T-01" })[0]
+Assert-Equal $idleRunningTask["launch_block_reason"] "running_without_active_job" "Running task rows without active jobs should explain the idle state."
 
 $summaryText = New-RunSummaryText -RunState (New-TaskGroupUiState) -Events @()
 Assert-True ($summaryText.Contains("Groups: 1 active, 1 running, 1 workers running.")) "Run summary should render task group status."

@@ -1321,6 +1321,8 @@ function Repair-RejectedPhase6TaskState {
         }
 
         $rollbackPhase = [string]$artifactObject["rollback_phase"]
+        # Only task-scoped Phase6 rejects can be repaired here. Non-task rollback
+        # targets such as Phase4 need a separate run-level recovery design.
         if (-not (Test-TaskScopedPhase -Phase $rollbackPhase)) {
             continue
         }

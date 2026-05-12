@@ -18,7 +18,7 @@
 | [artifacts.md](./artifacts.md) | canonical artifact store、attempt-scoped staging、finalization、validation pipeline、recovery transaction |
 | [design-contracts.md](./design-contracts.md) | 設計境界 (`boundary_contract`) と visual design (`visual_contract`) の伝搬モデル |
 | [repairer.md](./repairer.md) | artifact-only repair lane、`repairer` role、policy / diff guard / non-negotiables |
-| [skills.md](./skills.md) | 同梱 6 skill + worklog skill の役割分担、ハンドオフ規約 |
+| [skills.md](./skills.md) | 同梱 skill の役割分担、ハンドオフ規約、動作確認用 dummy run |
 | [providers.md](./providers.md) | provider CLI adapter、stdin prompt transport、設定 YAML、provider 別の起動差異 |
 | [operations.md](./operations.md) | `app/cli.ps1` / `start-agents` / `agent-loop`、approval、auto-resume、監視・トラブルシュート、CI |
 

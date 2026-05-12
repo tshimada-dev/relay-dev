@@ -471,17 +471,104 @@ Save-Artifact -ProjectRoot $phase6RepairRoot -RunId $phase6RepairRunId -Scope ta
     rollback_phase = "Phase5"
 } -AsJson | Out-Null
 $phase6RepairTask = ConvertTo-RelayHashtable -InputObject $phase6RepairState["task_states"]["T-ready"]
-$phase6RepairTask["status"] = "completed"
+$phase6RepairTask["status"] = "in_progress"
 $phase6RepairTask["last_completed_phase"] = "Phase6"
-$phase6RepairTask["phase_cursor"] = "Phase5"
+$phase6RepairTask["phase_cursor"] = "Phase6"
 $phase6RepairState["task_states"]["T-ready"] = $phase6RepairTask
-$phase6RepairState = Set-RunStateCursor -RunState $phase6RepairState -Phase "Phase5" -TaskId "T-ready"
+$phase6RepairState = Set-RunStateCursor -RunState $phase6RepairState -Phase "Phase6" -TaskId "T-ready"
 $phase6RepairResult = Repair-RejectedPhase6TaskState -RunState $phase6RepairState -ProjectRoot $phase6RepairRoot
 $phase6RepairNextState = ConvertTo-RelayHashtable -InputObject $phase6RepairResult["run_state"]
-Assert-Equal ([bool]$phase6RepairResult["changed"]) $true "Recovery should detect a completed task whose committed Phase6 artifact rejected."
+Assert-Equal ([bool]$phase6RepairResult["changed"]) $true "Recovery should detect a stale in-progress task whose committed Phase6 artifact rejected."
 Assert-Equal $phase6RepairNextState["task_states"]["T-ready"]["status"] "in_progress" "Recovery should reopen a task with rejected Phase6 output."
 Assert-Equal $phase6RepairNextState["task_states"]["T-ready"]["phase_cursor"] "Phase5" "Recovery should restore the rollback phase cursor."
 Assert-Equal $phase6RepairNextState["current_task_id"] "T-ready" "Recovery should restore the task cursor for retry."
+
+$phase6NonTaskRepairFixture = New-SchedulerFixture
+$phase6NonTaskRepairRoot = [string]$phase6NonTaskRepairFixture["root"]
+$phase6NonTaskRepairRunId = [string]$phase6NonTaskRepairFixture["run_id"]
+$phase6NonTaskRepairState = $phase6NonTaskRepairFixture["state"]
+Save-Artifact -ProjectRoot $phase6NonTaskRepairRoot -RunId $phase6NonTaskRepairRunId -Scope task -TaskId "T-ready" -Phase "Phase6" -ArtifactId "phase6_result.json" -Content @{
+    task_id = "T-ready"
+    verdict = "reject"
+    rollback_phase = "Phase4"
+} -AsJson | Out-Null
+$phase6NonTaskRepairTask = ConvertTo-RelayHashtable -InputObject $phase6NonTaskRepairState["task_states"]["T-ready"]
+$phase6NonTaskRepairTask["status"] = "in_progress"
+$phase6NonTaskRepairTask["last_completed_phase"] = "Phase6"
+$phase6NonTaskRepairTask["phase_cursor"] = "Phase6"
+$phase6NonTaskRepairState["task_states"]["T-ready"] = $phase6NonTaskRepairTask
+$phase6NonTaskRepairResult = Repair-RejectedPhase6TaskState -RunState $phase6NonTaskRepairState -ProjectRoot $phase6NonTaskRepairRoot
+$phase6NonTaskRepairNextState = ConvertTo-RelayHashtable -InputObject $phase6NonTaskRepairResult["run_state"]
+Assert-Equal ([bool]$phase6NonTaskRepairResult["changed"]) $false "Recovery should leave non-task rollback phases as a design issue outside task-lane repair."
+Assert-Equal $phase6NonTaskRepairNextState["task_states"]["T-ready"]["phase_cursor"] "Phase6" "Recovery should not move a task lane to a non-task rollback phase."
+
+$phase6SiblingFixture = New-SchedulerFixture
+$phase6SiblingRoot = [string]$phase6SiblingFixture["root"]
+$phase6SiblingRunId = [string]$phase6SiblingFixture["run_id"]
+$phase6SiblingState = $phase6SiblingFixture["state"]
+Save-Artifact -ProjectRoot $phase6SiblingRoot -RunId $phase6SiblingRunId -Scope task -TaskId "T-ready" -Phase "Phase6" -ArtifactId "phase6_result.json" -Content @{
+    task_id = "T-ready"
+    verdict = "reject"
+    rollback_phase = "Phase5"
+} -AsJson | Out-Null
+$phase6SiblingReadyTask = ConvertTo-RelayHashtable -InputObject $phase6SiblingState["task_states"]["T-ready"]
+$phase6SiblingReadyTask["status"] = "in_progress"
+$phase6SiblingReadyTask["last_completed_phase"] = "Phase6"
+$phase6SiblingReadyTask["phase_cursor"] = "Phase6"
+$phase6SiblingState["task_states"]["T-ready"] = $phase6SiblingReadyTask
+$phase6SiblingApiTask = ConvertTo-RelayHashtable -InputObject $phase6SiblingState["task_states"]["T-api"]
+$phase6SiblingApiTask["status"] = "in_progress"
+$phase6SiblingApiTask["phase_cursor"] = "Phase5"
+$phase6SiblingApiTask["active_job_id"] = "job-active-sibling"
+$phase6SiblingState["task_states"]["T-api"] = $phase6SiblingApiTask
+$phase6SiblingState["active_jobs"] = @{
+    "job-active-sibling" = @{
+        job_id = "job-active-sibling"
+        task_id = "T-api"
+        phase = "Phase5"
+        status = "running"
+        lease_token = "token-active-sibling"
+        lease_owner = "scheduler-test"
+        lease_expires_at = (Get-Date).AddMinutes(10).ToString("o")
+        last_heartbeat_at = (Get-Date).ToString("o")
+    }
+}
+$phase6SiblingState["active_job_id"] = "job-active-sibling"
+$phase6SiblingState = Set-RunStateCursor -RunState $phase6SiblingState -Phase "Phase5" -TaskId "T-api"
+$phase6SiblingResult = Repair-RejectedPhase6TaskState -RunState $phase6SiblingState -ProjectRoot $phase6SiblingRoot
+$phase6SiblingNextState = ConvertTo-RelayHashtable -InputObject $phase6SiblingResult["run_state"]
+Assert-Equal ([bool]$phase6SiblingResult["changed"]) $true "Recovery should still repair the rejected task lane while a sibling job is active."
+Assert-Equal $phase6SiblingNextState["task_states"]["T-ready"]["phase_cursor"] "Phase5" "Recovery should repair the rejected task lane cursor."
+Assert-Equal $phase6SiblingNextState["active_job_id"] "job-active-sibling" "Recovery should not override an active sibling job."
+Assert-Equal $phase6SiblingNextState["current_task_id"] "T-api" "Recovery should preserve the active sibling task cursor."
+Assert-Equal $phase6SiblingNextState["current_phase"] "Phase5" "Recovery should preserve the active sibling phase cursor."
+
+$phase6ApprovalFixture = New-SchedulerFixture
+$phase6ApprovalRoot = [string]$phase6ApprovalFixture["root"]
+$phase6ApprovalRunId = [string]$phase6ApprovalFixture["run_id"]
+$phase6ApprovalState = $phase6ApprovalFixture["state"]
+Save-Artifact -ProjectRoot $phase6ApprovalRoot -RunId $phase6ApprovalRunId -Scope task -TaskId "T-ready" -Phase "Phase6" -ArtifactId "phase6_result.json" -Content @{
+    task_id = "T-ready"
+    verdict = "reject"
+    rollback_phase = "Phase5"
+} -AsJson | Out-Null
+$phase6ApprovalTask = ConvertTo-RelayHashtable -InputObject $phase6ApprovalState["task_states"]["T-ready"]
+$phase6ApprovalTask["status"] = "in_progress"
+$phase6ApprovalTask["last_completed_phase"] = "Phase6"
+$phase6ApprovalTask["phase_cursor"] = "Phase6"
+$phase6ApprovalState["task_states"]["T-ready"] = $phase6ApprovalTask
+$phase6ApprovalState["pending_approval"] = @{
+    id = "approval-existing"
+    phase = "Phase5"
+    task_id = "T-api"
+}
+$phase6ApprovalState = Set-RunStateCursor -RunState $phase6ApprovalState -Phase "Phase5" -TaskId "T-api"
+$phase6ApprovalResult = Repair-RejectedPhase6TaskState -RunState $phase6ApprovalState -ProjectRoot $phase6ApprovalRoot
+$phase6ApprovalNextState = ConvertTo-RelayHashtable -InputObject $phase6ApprovalResult["run_state"]
+Assert-Equal ([bool]$phase6ApprovalResult["changed"]) $true "Recovery should still repair the rejected task lane while an approval is pending."
+Assert-Equal $phase6ApprovalNextState["task_states"]["T-ready"]["phase_cursor"] "Phase5" "Recovery should repair the rejected task lane with pending approval present."
+Assert-Equal $phase6ApprovalNextState["pending_approval"]["id"] "approval-existing" "Recovery should not override a pending approval."
+Assert-Equal $phase6ApprovalNextState["current_task_id"] "T-api" "Recovery should preserve the pending approval task cursor."
 
 # CPS-03 UI summary/rendering assertions. Keep this separate from scheduler policy tests.
 $uiRunState = [ordered]@{
