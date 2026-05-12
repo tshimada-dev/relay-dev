@@ -46,11 +46,24 @@ task / seed が未整備なら `relay-dev-seed-author` へ戻す。
 - 1 step だけ進めたい: `.\app\cli.ps1 step`
 - 状態確認だけしたい: `.\app\cli.ps1 show`
 - Windows で通常運用を始めたい: `.\start-agents.ps1`
+- Windows で task group 並列化を有効にして visible 起動したい: `.\start-agents.ps1 -ConfigFile config/settings.local.yaml`
 - Windows で current run を visible terminal から再開したい: `.\start-agents.ps1 -ResumeCurrent`
+- Windows で task group 並列化を有効にして visible 再開したい: `.\start-agents.ps1 -ResumeCurrent -ConfigFile config/settings.local.yaml`
 - visible worker を直接起動したい: `pwsh -NoLogo -NoProfile -File .\agent-loop.ps1 -Role orchestrator -ConfigFile config/settings.yaml -InteractiveApproval`
 - visible monitor だけ開きたい: `pwsh -NoLogo -NoProfile -File .\watch-run.ps1 -ConfigFile config/settings.yaml`
 
 詳細な判断は `references/run-decision-table.md` を使う。
+
+並列モードで起動する場合は、tracked な `config/settings.yaml` を書き換えず、Git 管理外の local config を使う。最小例:
+
+```yaml
+execution:
+  mode: auto
+  max_parallel_jobs: 3
+  allow_single_parallel_job: false
+```
+
+この override を `config/settings.local.yaml` のような名前で用意し、`-ConfigFile` で明示する。
 
 ## Handle Recoverable Failed Runs
 

@@ -25,6 +25,15 @@ escalation:
   phase2_timeout_sec: 600
   phase3_timeout_sec: 1200
 
+execution:
+  # `single` = 常に直列実行。
+  # `auto` / `parallel` = task-scoped lane で task group 並列化を許可。
+  mode: single
+  # 並列化するときは 2 以上にする。
+  max_parallel_jobs: 1
+  # 1 worker だけの task group を作らない既定。
+  allow_single_parallel_job: false
+
 watcher:
   poll_fallback_sec: 5
 
