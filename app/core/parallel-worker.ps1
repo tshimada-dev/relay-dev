@@ -277,6 +277,7 @@ function Invoke-TaskGroupWorkerPackage {
         artifact_refs = @($artifactRefs.ToArray())
         changed_files = @($worker["declared_changed_files"])
         workspace_path = $workspacePath
+        baseline_snapshot = if ($worker["baseline_snapshot"]) { ConvertTo-RelayHashtable -InputObject $worker["baseline_snapshot"] } else { $null }
     }
     Update-TaskGroupWorkerRunState -ProjectRoot $ProjectRoot -RunId $runId -WorkerId $workerId -LockTimeoutSec $LockTimeoutSec -Patch @{
         status = $status; current_phase = $finalPhase; result_summary = $status; errors = @($result["errors"]); artifact_refs = @($result["artifact_refs"])

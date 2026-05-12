@@ -368,6 +368,20 @@ function Test-ShouldPreferParallelStep {
     return ($maxParallelJobs -gt 1)
 }
 
+function Test-AutoParallelWaitBlocksSingleFallback {
+    param([AllowNull()]$ParallelResult)
+
+    $result = ConvertTo-RelayHashtable -InputObject $ParallelResult
+    if (-not $result -or [string]$result["status"] -ne "wait") {
+        return $false
+    }
+    if ($result.ContainsKey("blocks_single_fallback") -and [bool]$result["blocks_single_fallback"]) {
+        return $true
+    }
+
+    return ([string]$result["reason"] -in @("task group already active"))
+}
+
 function Sync-ConfiguredTaskLaneForStep {
     param([Parameter(Mandatory)][string]$ResolvedRunId)
 
@@ -2239,12 +2253,102 @@ function Invoke-EngineStep {
     }
 }
 
-function Invoke-ParallelEngineStep {
+function Invoke-TaskGroupEngineStep {
     param(
         [Parameter(Mandatory)][string]$ResolvedRunId,
         [switch]$AllowSingleJob,
         [switch]$AllowCautiousJob
     )
+
+    $runLock = $null
+    $packageResult = $null
+    try {
+        $runLock = Acquire-RunLock -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -RetryCount $script:LockRetryCount -RetryDelayMs $script:LockRetryDelay -TimeoutSec $script:LockTimeout
+
+        $runState = Read-RunState -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId
+        if (-not $runState) {
+            throw "Run '$ResolvedRunId' does not exist."
+        }
+        $runState = Sync-RunStateFromCanonicalArtifacts -RunId $ResolvedRunId -RunState $runState
+        $runState = Initialize-RunStateCompatibilityFields -RunState $runState
+
+        $phaseName = [string]$runState["current_phase"]
+        $resolvedRole = Resolve-PhaseRole -Phase $phaseName
+        $providerSpec = Resolve-RoleProviderSpec -ResolvedRole $resolvedRole -ProviderName $Provider -ExplicitCommand $ProviderCommand -ExplicitFlags $ProviderFlags
+
+        $packageResult = ConvertTo-RelayHashtable -InputObject (New-TaskGroupJobPackage `
+                -ProjectRoot $script:ProjectRoot `
+                -RunState $runState `
+                -ProviderSpec $providerSpec `
+                -PackageRoot (Get-RunJobPath -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -JobId ("task-group-" + [guid]::NewGuid().ToString("N").Substring(0, 12))) `
+                -SourceWorkspace $script:ProjectDir `
+                -AllowSingleParallelJob:$AllowSingleJob `
+                -AllowCautiousSafety:$AllowCautiousJob)
+
+        if ([string]$packageResult["status"] -ne "planned") {
+            $reason = [string]$packageResult["reason"]
+            return [ordered]@{
+                mode = "task-group"
+                status = "wait"
+                reason = $reason
+                blocks_single_fallback = ($reason -eq "task group already active")
+                rejected_candidates = @($packageResult["rejected_candidates"])
+                run_state = $runState
+            }
+        }
+
+        $nextRunState = ConvertTo-RelayHashtable -InputObject $packageResult["run_state"]
+        $nextRunState["status"] = "running"
+        $nextRunState["updated_at"] = (Get-Date).ToString("o")
+        Write-RunState -ProjectRoot $script:ProjectRoot -RunState $nextRunState | Out-Null
+        Append-RunStatusChangedEvent -RunId $ResolvedRunId -RunState $nextRunState
+        Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event @{
+            type = "task_group.packaged"
+            group_id = [string]$packageResult["group_id"]
+            package_path = [string]$packageResult["package_path"]
+            worker_count = @($packageResult["package"]["workers"]).Count
+        }
+    }
+    finally {
+        Release-RunLock -LockHandle $runLock
+    }
+
+    $coordinator = ConvertTo-RelayHashtable -InputObject (Invoke-TaskGroupCoordinator -Package ([string]$packageResult["package_path"]) -ProjectRoot $script:ProjectRoot -WorkerParameters @{ ConfigFile = $ConfigFile })
+    $merge = $null
+    $status = [string]$coordinator["status"]
+    if ($status -eq "succeeded") {
+        $merge = ConvertTo-RelayHashtable -InputObject (Complete-TaskGroupMergeCommit -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -GroupId ([string]$packageResult["group_id"]) -MainWorkspace $script:ProjectDir)
+        $status = if ([bool]$merge["ok"]) { "completed" } else { [string]$merge["status"] }
+    }
+
+    return [ordered]@{
+        mode = "task-group"
+        status = $status
+        group_id = [string]$packageResult["group_id"]
+        package_path = [string]$packageResult["package_path"]
+        worker_count = @($packageResult["package"]["workers"]).Count
+        coordinator = $coordinator
+        merge = $merge
+    }
+}
+
+function Invoke-ParallelEngineStep {
+    param(
+        [Parameter(Mandatory)][string]$ResolvedRunId,
+        [switch]$AllowSingleJob,
+        [switch]$AllowCautiousJob,
+        [switch]$PreferTaskGroup
+    )
+
+    if ($PreferTaskGroup) {
+        $taskGroupResult = ConvertTo-RelayHashtable -InputObject (Invoke-TaskGroupEngineStep -ResolvedRunId $ResolvedRunId -AllowSingleJob:$AllowSingleJob -AllowCautiousJob:$AllowCautiousJob)
+        if ([string]$taskGroupResult["status"] -ne "wait") {
+            return $taskGroupResult
+        }
+        if ([string]$taskGroupResult["reason"] -eq "task group already active") {
+            return $taskGroupResult
+        }
+    }
 
     $runLock = $null
     $packageResult = $null
@@ -2480,8 +2584,11 @@ switch ($Command) {
             Sync-ConfiguredTaskLaneForStep -ResolvedRunId $resolvedRunId
         }
         if (-not $hasManualPrompt -and (Test-ShouldPreferParallelStep -ResolvedRunId $resolvedRunId)) {
-            $parallelResult = ConvertTo-RelayHashtable -InputObject (Invoke-ParallelEngineStep -ResolvedRunId $resolvedRunId -AllowSingleJob:$(Resolve-StepAllowSingleParallelJob -ExplicitAllowSingleParallelJob:$AllowSingleParallelJob) -AllowCautiousJob:$AllowCautiousParallelJob)
+            $parallelResult = ConvertTo-RelayHashtable -InputObject (Invoke-ParallelEngineStep -ResolvedRunId $resolvedRunId -AllowSingleJob:$(Resolve-StepAllowSingleParallelJob -ExplicitAllowSingleParallelJob:$AllowSingleParallelJob) -AllowCautiousJob:$AllowCautiousParallelJob -PreferTaskGroup)
             if ([string]$parallelResult["status"] -eq "completed") {
+                $result = $parallelResult
+            }
+            elseif (Test-AutoParallelWaitBlocksSingleFallback -ParallelResult $parallelResult) {
                 $result = $parallelResult
             }
             else {
@@ -2512,12 +2619,7 @@ switch ($Command) {
             throw "No active run."
         }
 
-        $runState = Read-RunState -ProjectRoot $script:ProjectRoot -RunId $resolvedRunId
-        if (-not $runState) {
-            throw "Run '$resolvedRunId' does not exist."
-        }
-
-        $result = New-TaskGroupParallelPlan -ProjectRoot $script:ProjectRoot -RunState $runState -AllowSingleParallelJob:$AllowSingleParallelJob
+        $result = Invoke-TaskGroupEngineStep -ResolvedRunId $resolvedRunId -AllowSingleJob:$AllowSingleParallelJob -AllowCautiousJob:$AllowCautiousParallelJob
         $result | ConvertTo-Json -Depth 30 -Compress
     }
     "show" {

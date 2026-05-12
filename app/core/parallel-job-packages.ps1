@@ -4,6 +4,9 @@ if (-not (Get-Command ConvertTo-RelayHashtable -ErrorAction SilentlyContinue)) {
 if (-not (Get-Command Get-BatchLeaseCandidates -ErrorAction SilentlyContinue)) {
     . (Join-Path $PSScriptRoot "workflow-engine.ps1")
 }
+if (-not (Get-Command New-IsolatedJobWorkspace -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "parallel-workspace.ps1")
+}
 
 function Normalize-ParallelStepChangedFiles {
     param(
@@ -263,6 +266,7 @@ function New-TaskGroupParallelPlan {
         [Parameter(Mandatory)][string]$ProjectRoot,
         [Parameter(Mandatory)]$RunState,
         [switch]$AllowSingleParallelJob,
+        [switch]$AllowCautiousSafety,
         [switch]$AllowNonParallelSafety,
         [switch]$AllowEmptyChangedFiles
     )
@@ -283,12 +287,19 @@ function New-TaskGroupParallelPlan {
     if (-not (Test-TaskScopedPhase -Phase ([string]$state["current_phase"]))) {
         return [ordered]@{ status = "wait"; reason = "current_phase is not task-scoped"; group = $null; workers = @(); rejected_candidates = @(); run_state = $state }
     }
+    foreach ($groupId in @($state["task_groups"].Keys)) {
+        $existingGroup = ConvertTo-RelayHashtable -InputObject $state["task_groups"][$groupId]
+        $existingStatus = [string]$existingGroup["status"]
+        if ($existingStatus -in @("planned", "running")) {
+            return [ordered]@{ status = "wait"; reason = "task group already active"; group = $null; workers = @(); rejected_candidates = @(); run_state = $state }
+        }
+    }
 
     $candidates = @(Get-BatchLeaseCandidates -RunState $state -ProjectRoot $ProjectRoot)
     $launchable = New-Object System.Collections.Generic.List[object]
     $rejected = New-Object System.Collections.Generic.List[object]
     foreach ($candidate in $candidates) {
-        $test = Test-ParallelStepLaunchableCandidate -Candidate $candidate -AllowNonParallelSafety:$AllowNonParallelSafety -AllowEmptyChangedFiles:$AllowEmptyChangedFiles
+        $test = Test-ParallelStepLaunchableCandidate -Candidate $candidate -AllowCautiousSafety:$AllowCautiousSafety -AllowNonParallelSafety:$AllowNonParallelSafety -AllowEmptyChangedFiles:$AllowEmptyChangedFiles
         if ([bool]$test["launchable"]) {
             $launchable.Add((ConvertTo-RelayHashtable -InputObject $candidate)) | Out-Null
         }
@@ -360,15 +371,17 @@ function New-TaskGroupJobPackage {
         [Parameter(Mandatory)]$ProviderSpec,
         [string]$PackageRoot,
         [string]$WorkspaceRoot,
+        [string]$SourceWorkspace,
         [string]$WorkspaceMode = "isolated-copy-experimental",
         [string]$CommitPolicy = "all_or_nothing",
         [int]$LeaseDurationMinutes = 120,
         [switch]$AllowSingleParallelJob,
+        [switch]$AllowCautiousSafety,
         [switch]$AllowNonParallelSafety,
         [switch]$AllowEmptyChangedFiles
     )
 
-    $plan = New-TaskGroupParallelPlan -ProjectRoot $ProjectRoot -RunState $RunState -AllowSingleParallelJob:$AllowSingleParallelJob -AllowNonParallelSafety:$AllowNonParallelSafety -AllowEmptyChangedFiles:$AllowEmptyChangedFiles
+    $plan = New-TaskGroupParallelPlan -ProjectRoot $ProjectRoot -RunState $RunState -AllowSingleParallelJob:$AllowSingleParallelJob -AllowCautiousSafety:$AllowCautiousSafety -AllowNonParallelSafety:$AllowNonParallelSafety -AllowEmptyChangedFiles:$AllowEmptyChangedFiles
     if ([string]$plan["status"] -ne "planned") {
         return [ordered]@{
             status = [string]$plan["status"]
@@ -394,6 +407,9 @@ function New-TaskGroupJobPackage {
     if ([string]::IsNullOrWhiteSpace($WorkspaceRoot)) {
         $WorkspaceRoot = Join-Path (Get-RunRootPath -ProjectRoot $ProjectRoot -RunId $runId) "workspaces"
     }
+    if ([string]::IsNullOrWhiteSpace($SourceWorkspace)) {
+        $SourceWorkspace = $ProjectRoot
+    }
     foreach ($path in @($PackageRoot, $WorkspaceRoot)) {
         if (-not (Test-Path $path)) {
             New-Item -ItemType Directory -Path $path -Force | Out-Null
@@ -414,18 +430,20 @@ function New-TaskGroupJobPackage {
             $workerId = [string]$worker["id"]
         }
         $taskId = [string]$worker["task_id"]
-        $workspacePath = Join-Path $WorkspaceRoot $workerId
+        $workspace = New-IsolatedJobWorkspace -ProjectRoot $ProjectRoot -RunId $runId -JobId $workerId -SourceWorkspace $SourceWorkspace -Force
+        $workspacePath = [string]$workspace["workspace_path"]
         $artifactRoot = if (Get-Command Get-JobArtifactsRootPath -ErrorAction SilentlyContinue) {
             Get-JobArtifactsRootPath -ProjectRoot $ProjectRoot -RunId $runId -JobId $workerId
         }
         else {
             Join-Path (Get-RunJobPath -ProjectRoot $ProjectRoot -RunId $runId -JobId $workerId) "artifacts"
         }
-        foreach ($path in @($workspacePath, $artifactRoot)) {
+        foreach ($path in @($artifactRoot)) {
             if (-not (Test-Path $path)) {
                 New-Item -ItemType Directory -Path $path -Force | Out-Null
             }
         }
+        $baseline = New-WorkspaceBaselineSnapshot -WorkspaceRoot $workspacePath -Paths @($worker["declared_changed_files"])
 
         $leaseToken = New-RunStateLeaseToken
         $workerIds.Add($workerId) | Out-Null
@@ -440,6 +458,7 @@ function New-TaskGroupJobPackage {
             artifact_root = $artifactRoot
             declared_changed_files = @($worker["declared_changed_files"])
             resource_locks = @($worker["resource_locks"])
+            baseline_snapshot = $baseline
             lease_token = $leaseToken
         }
         $workerPackages.Add($workerPackage) | Out-Null
@@ -457,10 +476,23 @@ function New-TaskGroupJobPackage {
             artifact_root = $artifactRoot
             declared_changed_files = @($worker["declared_changed_files"])
             resource_locks = @($worker["resource_locks"])
+            baseline_snapshot = $baseline
             lease_token = $leaseToken
             lease_expires_at = $leaseExpiresAt
             created_at = $now
             updated_at = $now
+        }
+
+        if ($state["task_states"] -and $state["task_states"].ContainsKey($taskId)) {
+            $taskState = ConvertTo-RelayHashtable -InputObject $state["task_states"][$taskId]
+            if ([string]$taskState["status"] -notin @("completed", "blocked", "abandoned")) {
+                $taskState["status"] = "in_progress"
+                $taskState["phase_cursor"] = "Phase5"
+                $taskState["active_job_id"] = $null
+                $taskState["wait_reason"] = "task_group_running"
+                $taskState["task_group_id"] = $groupId
+                $state["task_states"][$taskId] = $taskState
+            }
         }
     }
 
@@ -514,15 +546,17 @@ function New-TaskGroupJobPackages {
         [Parameter(Mandatory)]$ProviderSpec,
         [string]$PackageRoot,
         [string]$WorkspaceRoot,
+        [string]$SourceWorkspace,
         [string]$WorkspaceMode = "isolated-copy-experimental",
         [string]$CommitPolicy = "all_or_nothing",
         [int]$LeaseDurationMinutes = 120,
         [switch]$AllowSingleParallelJob,
+        [switch]$AllowCautiousSafety,
         [switch]$AllowNonParallelSafety,
         [switch]$AllowEmptyChangedFiles
     )
 
-    return New-TaskGroupJobPackage -ProjectRoot $ProjectRoot -RunState $RunState -ProviderSpec $ProviderSpec -PackageRoot $PackageRoot -WorkspaceRoot $WorkspaceRoot -WorkspaceMode $WorkspaceMode -CommitPolicy $CommitPolicy -LeaseDurationMinutes $LeaseDurationMinutes -AllowSingleParallelJob:$AllowSingleParallelJob -AllowNonParallelSafety:$AllowNonParallelSafety -AllowEmptyChangedFiles:$AllowEmptyChangedFiles
+    return New-TaskGroupJobPackage -ProjectRoot $ProjectRoot -RunState $RunState -ProviderSpec $ProviderSpec -PackageRoot $PackageRoot -WorkspaceRoot $WorkspaceRoot -SourceWorkspace $SourceWorkspace -WorkspaceMode $WorkspaceMode -CommitPolicy $CommitPolicy -LeaseDurationMinutes $LeaseDurationMinutes -AllowSingleParallelJob:$AllowSingleParallelJob -AllowCautiousSafety:$AllowCautiousSafety -AllowNonParallelSafety:$AllowNonParallelSafety -AllowEmptyChangedFiles:$AllowEmptyChangedFiles
 }
 
 function New-ParallelStepJobPackages {

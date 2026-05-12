@@ -135,10 +135,57 @@ function Write-TestProvider {
     @'
 $ErrorActionPreference = "Stop"
 $prompt = [Console]::In.ReadToEnd()
-$taskId = if ($prompt -match "(?m)^TaskId:\s*(\S+)") { $Matches[1] } else { throw "missing TaskId" }
+$taskId = if ($prompt -match "(?m)^TaskId:\s*(\S+)") {
+    $Matches[1]
+}
+elseif ($prompt -match "for task\s+(\S+)") {
+    $Matches[1].TrimEnd(".")
+}
+else {
+    throw "missing TaskId"
+}
 $changed = "parallel-test/$taskId.txt"
-$mdPath = if ($prompt -match '(?m)phase5_implementation\.md\s*=>\s*(.+?)\s*\(write\)') { $Matches[1].Trim() } else { throw "missing phase5_implementation output path" }
-$jsonPath = if ($prompt -match '(?m)phase5_result\.json\s*=>\s*(.+?)\s*\(write\)') { $Matches[1].Trim() } else { throw "missing phase5_result output path" }
+
+function Get-OutputPath {
+    param([Parameter(Mandatory)][string]$ArtifactId)
+
+    $pattern = "(?m)$([regex]::Escape($ArtifactId))\s*=>\s*(.+?)\s*\(write\)"
+    if ($prompt -match $pattern) {
+        return $Matches[1].Trim()
+    }
+
+    return $null
+}
+
+function Write-TextArtifact {
+    param(
+        [string]$ArtifactId,
+        [string]$Content
+    )
+
+    $path = Get-OutputPath -ArtifactId $ArtifactId
+    if ([string]::IsNullOrWhiteSpace($path)) {
+        return
+    }
+    New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force | Out-Null
+    Set-Content -Path $path -Value $Content -Encoding UTF8
+}
+
+function Write-JsonArtifact {
+    param(
+        [string]$ArtifactId,
+        $Content
+    )
+
+    $path = Get-OutputPath -ArtifactId $ArtifactId
+    if ([string]::IsNullOrWhiteSpace($path)) {
+        return
+    }
+    New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force | Out-Null
+    Set-Content -Path $path -Value (($Content | ConvertTo-Json -Depth 20) + "`n") -Encoding UTF8
+}
+
+$phase5JsonPath = Get-OutputPath -ArtifactId "phase5_result.json"
 
 Start-Sleep -Seconds 2
 
@@ -146,25 +193,86 @@ $productPath = Join-Path (Get-Location).Path ($changed -replace '/', [System.IO.
 New-Item -ItemType Directory -Path (Split-Path -Parent $productPath) -Force | Out-Null
 Set-Content -Path $productPath -Value "product $taskId" -Encoding UTF8
 
-New-Item -ItemType Directory -Path (Split-Path -Parent $mdPath) -Force | Out-Null
-Set-Content -Path $mdPath -Value "### Task Summary`n$taskId smoke implementation`n`n## 要約（200字以内）`nsmoke" -Encoding UTF8
+$pass = "pass"
+$evidence = @($changed)
 
-$result = [ordered]@{
-    task_id = $taskId
-    changed_files = @($changed)
-    commands_run = @("test-provider")
-    implementation_summary = "parallel smoke $taskId"
-    acceptance_criteria_status = @(
-        [ordered]@{
-            criterion = "parallel worker writes its declared file"
-            status = "met"
-            evidence = @($changed)
-        }
-    )
-    known_issues = @()
+if (-not [string]::IsNullOrWhiteSpace($phase5JsonPath)) {
+    Write-TextArtifact -ArtifactId "phase5_implementation.md" -Content "### Task Summary`n$taskId smoke implementation`n`n## 要約（200字以内）`nsmoke"
+    Write-JsonArtifact -ArtifactId "phase5_result.json" -Content ([ordered]@{
+        task_id = $taskId
+        changed_files = @($changed)
+        commands_run = @("test-provider")
+        implementation_summary = "parallel smoke $taskId"
+        acceptance_criteria_status = @(
+            [ordered]@{
+                criterion = "parallel worker writes its declared file"
+                status = "met"
+                evidence = @($changed)
+            }
+        )
+        known_issues = @()
+    })
 }
-New-Item -ItemType Directory -Path (Split-Path -Parent $jsonPath) -Force | Out-Null
-Set-Content -Path $jsonPath -Value (($result | ConvertTo-Json -Depth 20) + "`n") -Encoding UTF8
+elseif (Get-OutputPath -ArtifactId "phase5-1_verdict.json") {
+    Write-TextArtifact -ArtifactId "phase5-1_completion_check.md" -Content "completion check $taskId"
+    $reviewChecks = @("selected_task_alignment", "acceptance_criteria_coverage", "changed_files_audit", "test_evidence_review", "design_boundary_alignment", "visual_contract_alignment") | ForEach-Object {
+        [ordered]@{ check_id = $_; status = $pass; notes = "ok"; evidence = $evidence }
+    }
+    Write-JsonArtifact -ArtifactId "phase5-1_verdict.json" -Content ([ordered]@{
+        task_id = $taskId
+        verdict = "go"
+        rollback_phase = ""
+        must_fix = @()
+        warnings = @()
+        evidence = @($changed)
+        acceptance_criteria_checks = @(
+            [ordered]@{ criterion = "parallel worker writes its declared file"; status = "pass"; notes = "ok"; evidence = $evidence }
+        )
+        review_checks = @($reviewChecks)
+    })
+}
+elseif (Get-OutputPath -ArtifactId "phase5-2_verdict.json") {
+    Write-TextArtifact -ArtifactId "phase5-2_security_check.md" -Content "security check $taskId"
+    $securityChecks = @("input_validation", "authentication_authorization", "secret_handling_and_logging", "dangerous_side_effects", "dependency_surface") | ForEach-Object {
+        [ordered]@{ check_id = $_; status = $pass; notes = "ok"; evidence = $evidence }
+    }
+    Write-JsonArtifact -ArtifactId "phase5-2_verdict.json" -Content ([ordered]@{
+        task_id = $taskId
+        verdict = "go"
+        rollback_phase = ""
+        must_fix = @()
+        warnings = @()
+        evidence = @($changed)
+        security_checks = @($securityChecks)
+        open_requirements = @()
+        resolved_requirement_ids = @()
+    })
+}
+elseif (Get-OutputPath -ArtifactId "phase6_result.json") {
+    Write-TextArtifact -ArtifactId "phase6_testing.md" -Content "testing $taskId"
+    Write-TextArtifact -ArtifactId "test_output.log" -Content "ok $taskId"
+    $verificationChecks = @("lint_static_analysis", "automated_tests", "regression_scope", "error_path_coverage", "coverage_assessment") | ForEach-Object {
+        [ordered]@{ check_id = $_; status = $pass; notes = "ok"; evidence = $evidence }
+    }
+    Write-JsonArtifact -ArtifactId "phase6_result.json" -Content ([ordered]@{
+        task_id = $taskId
+        test_command = "test-provider"
+        lint_command = "test-provider"
+        tests_passed = 1
+        tests_failed = 0
+        coverage_line = 100
+        coverage_branch = 100
+        verdict = "go"
+        rollback_phase = ""
+        conditional_go_reasons = @()
+        verification_checks = @($verificationChecks)
+        open_requirements = @()
+        resolved_requirement_ids = @()
+    })
+}
+else {
+    throw "missing known output path"
+}
 Write-Output "wrote $taskId"
 '@ | Set-Content -Path $Path -Encoding UTF8
 }
@@ -288,10 +396,58 @@ try {
     Assert-True (-not [string]::IsNullOrWhiteSpace([string]$autoJsonLine)) "auto step should emit a JSON summary."
     $autoSummary = if (-not [string]::IsNullOrWhiteSpace([string]$autoJsonLine)) { $autoJsonLine | ConvertFrom-Json } else { $null }
     if ($autoSummary) {
-        Assert-Equal $autoSummary.mode "parallel-step" "step should prefer parallel-step in auto mode for task-scoped parallel lanes."
-        Assert-Equal $autoSummary.status "completed" "auto parallel step should complete the worker batch."
-        Assert-Equal $autoSummary.leased_count 2 "auto parallel step should lease two jobs."
+        Assert-Equal $autoSummary.mode "task-group" "step should prefer task-group execution in auto mode for task-scoped parallel lanes."
+        Assert-Equal $autoSummary.status "completed" "auto task-group step should complete the worker group."
+        Assert-Equal $autoSummary.worker_count 2 "auto task-group step should run two workers."
     }
+
+    if (Test-Path -LiteralPath $productDir) {
+        Remove-Item -LiteralPath $productDir -Recurse -Force
+    }
+
+    $activeGroupRunId = "$runId-active-group"
+    $activeGroupTasksArtifact = [ordered]@{
+        tasks = @(
+            (New-TestTask -TaskId "T-active-a" -ResourceLock "parallel-test-active-a"),
+            (New-TestTask -TaskId "T-active-b" -ResourceLock "parallel-test-active-b")
+        )
+    }
+    Save-Artifact -ProjectRoot $repoRoot -RunId $activeGroupRunId -Scope run -Phase "Phase4" -ArtifactId "phase4_tasks.json" -Content $activeGroupTasksArtifact -AsJson | Out-Null
+    $activeGroupState = New-RunState -RunId $activeGroupRunId -ProjectRoot $repoRoot -CurrentPhase "Phase5" -CurrentRole "implementer"
+    $activeGroupState = Register-PlannedTasks -RunState $activeGroupState -TasksArtifact $activeGroupTasksArtifact
+    $activeGroupState["task_lane"]["mode"] = "parallel"
+    $activeGroupState["task_lane"]["max_parallel_jobs"] = 2
+    $activeGroupState["task_groups"]["task-group-active"] = [ordered]@{
+        id = "task-group-active"
+        group_id = "task-group-active"
+        status = "running"
+        phase = "Phase5..Phase6"
+        phase_range = "Phase5..Phase6"
+        task_ids = @("T-active-a")
+        worker_ids = @("task-worker-active")
+    }
+    $activeGroupState["task_group_workers"]["task-worker-active"] = [ordered]@{
+        id = "task-worker-active"
+        worker_id = "task-worker-active"
+        group_id = "task-group-active"
+        task_id = "T-active-a"
+        status = "running"
+        phase = "Phase5"
+        current_phase = "Phase5"
+    }
+    Write-RunState -ProjectRoot $repoRoot -RunState $activeGroupState | Out-Null
+
+    $activeGroupOutput = & pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repoRoot "app\cli.ps1") step -RunId $activeGroupRunId -ConfigFile $configPath -Provider generic-cli -ProviderCommand $providerPath 2>&1
+    $activeGroupJsonLine = @($activeGroupOutput | ForEach-Object { [string]$_ } | Where-Object { $_.TrimStart().StartsWith("{") } | Select-Object -Last 1)
+    Assert-True (-not [string]::IsNullOrWhiteSpace([string]$activeGroupJsonLine)) "active task-group step should emit a JSON wait summary."
+    $activeGroupSummary = if (-not [string]::IsNullOrWhiteSpace([string]$activeGroupJsonLine)) { $activeGroupJsonLine | ConvertFrom-Json } else { $null }
+    if ($activeGroupSummary) {
+        Assert-Equal $activeGroupSummary.mode "task-group" "active task group should keep step on the task-group path."
+        Assert-Equal $activeGroupSummary.status "wait" "active task group should make step wait instead of falling back to single dispatch."
+        Assert-Equal $activeGroupSummary.reason "task group already active" "active task group wait reason should be explicit."
+    }
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $productDir "T-active-a.txt"))) "active task group wait should not run a fallback provider for T-active-a."
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $productDir "T-active-b.txt"))) "active task group wait should not run a fallback provider for T-active-b."
 }
 finally {
     foreach ($path in @($configPath, $providerPath)) {

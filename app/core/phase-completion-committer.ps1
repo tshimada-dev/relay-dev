@@ -4,6 +4,12 @@ if (-not (Get-Command Commit-PhaseOutputArtifacts -ErrorAction SilentlyContinue)
 if (-not (Get-Command Invoke-TaskGroupProductMerge -ErrorAction SilentlyContinue)) {
     . (Join-Path $PSScriptRoot "parallel-workspace.ps1")
 }
+if (-not (Get-Command Write-RunState -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "run-state-store.ps1")
+}
+if (-not (Get-Command Resolve-NextReadyTaskId -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "workflow-engine.ps1")
+}
 
 function Complete-PhaseOutputCommit {
     param(
@@ -69,6 +75,51 @@ function ConvertTo-TaskGroupMaterializedArtifacts {
     }
 
     return @($materialized.ToArray())
+}
+
+function Complete-TaskGroupTaskStates {
+    param(
+        [Parameter(Mandatory)]$RunState,
+        [Parameter(Mandatory)][string]$GroupId,
+        [Parameter(Mandatory)][object[]]$WorkerResults
+    )
+
+    $state = Initialize-RunStateCompatibilityFields -RunState $RunState
+    $now = (Get-Date).ToString("o")
+    $completedTaskIds = New-Object System.Collections.Generic.List[string]
+
+    foreach ($resultRaw in @($WorkerResults)) {
+        $result = ConvertTo-RelayHashtable -InputObject $resultRaw
+        $taskId = [string]$result["task_id"]
+        if ([string]::IsNullOrWhiteSpace($taskId) -or -not $state["task_states"].ContainsKey($taskId)) {
+            continue
+        }
+
+        $taskState = ConvertTo-RelayHashtable -InputObject $state["task_states"][$taskId]
+        $taskState["status"] = "completed"
+        $taskState["last_completed_phase"] = "Phase6"
+        $taskState["phase_cursor"] = $null
+        $taskState["active_job_id"] = $null
+        $taskState["wait_reason"] = $null
+        $taskState["task_group_id"] = $GroupId
+        $taskState["completed_at"] = $now
+        $state["task_states"][$taskId] = $taskState
+        $completedTaskIds.Add($taskId) | Out-Null
+    }
+
+    $state = Update-TaskReadiness -RunState $state
+    $nextTaskId = Resolve-NextReadyTaskId -RunState $state
+    $nextPhase = if ([string]::IsNullOrWhiteSpace($nextTaskId)) { "Phase7" } else { "Phase5" }
+    $state = Set-RunStateCursor -RunState $state -Phase $nextPhase -TaskId $nextTaskId
+    $state["status"] = "running"
+    $state["updated_at"] = $now
+
+    return [ordered]@{
+        run_state = $state
+        completed_task_ids = @($completedTaskIds.ToArray())
+        next_phase = $nextPhase
+        next_task_id = $nextTaskId
+    }
 }
 
 function Invoke-TaskGroupMergeAndCommit {
@@ -184,6 +235,19 @@ function Invoke-TaskGroupMergeAndCommit {
 
     try {
         $commit = ConvertTo-RelayHashtable -InputObject (Complete-PhaseOutputCommit -ProjectRoot $ProjectRoot -RunId $RunId -MaterializedArtifacts @($materialized))
+        $now = (Get-Date).ToString("o")
+        $completion = ConvertTo-RelayHashtable -InputObject (Complete-TaskGroupTaskStates -RunState $state -GroupId $GroupId -WorkerResults @($eligibleResults.ToArray()))
+        $state = ConvertTo-RelayHashtable -InputObject $completion["run_state"]
+        $groups = ConvertTo-RelayHashtable -InputObject $state["task_groups"]
+        $group = ConvertTo-RelayHashtable -InputObject $groups[$GroupId]
+
+        $group["merge_status"] = "succeeded"
+        $group["merged_at"] = $now
+        $groups[$GroupId] = $group
+        $state["task_groups"] = $groups
+        $state["updated_at"] = $now
+        Write-RunState -ProjectRoot $ProjectRoot -RunState $state | Out-Null
+
         return [ordered]@{
             ok = $true
             status = "succeeded"
@@ -198,6 +262,8 @@ function Invoke-TaskGroupMergeAndCommit {
                 product_copied_count = @($merge["copied_files"]).Count
                 product_deleted_count = @($merge["deleted_files"]).Count
                 artifacts_committed = [int]$commit["summary"]["committed_count"]
+                next_phase = [string]$completion["next_phase"]
+                next_task_id = [string]$completion["next_task_id"]
             }
         }
     }
