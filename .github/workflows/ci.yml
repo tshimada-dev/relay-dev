@@ -45,6 +45,34 @@ jobs:
         shell: pwsh
         run: ./tests/regression.ps1
 
+      - name: Run task parallelization tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tests = @(
+            "tests/task-parallelization-prep.ps1",
+            "tests/task-parallelization-ready-runstate.ps1",
+            "tests/task-parallelization-ready-scheduler.ps1",
+            "tests/task-parallelization-ready-recovery.ps1",
+            "tests/task-parallelization-ready-ui.ps1",
+            "tests/task-parallelization-scheduler.ps1",
+            "tests/task-group-parallel-runstate.ps1",
+            "tests/task-group-parallel-planning.ps1",
+            "tests/task-group-parallel-package.ps1",
+            "tests/task-group-parallel-worker-loop.ps1",
+            "tests/task-group-parallel-coordinator.ps1",
+            "tests/task-group-parallel-merge.ps1",
+            "tests/task-group-parallel-artifacts.ps1",
+            "tests/task-group-parallel-recovery.ps1",
+            "tests/task-group-parallel-ui.ps1",
+            "tests/task-group-parallel-sequencing.ps1",
+            "tests/task-parallelization-headless-execution.ps1"
+          )
+          foreach ($test in $tests) {
+            Write-Host "Running $test"
+            & "./$test"
+          }
+
       - name: Check public examples
         shell: pwsh
         run: ./scripts/check-public-examples.ps1

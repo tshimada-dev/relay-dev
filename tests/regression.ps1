@@ -1583,6 +1583,30 @@ try {
     Assert-Equal $successJobMetadata["status"] "finished" "Execution runner should persist finished job metadata"
     Assert-Equal $successJobMetadata["result_status"] "succeeded" "Finished job metadata should store normalized result status"
 
+    $secretResult = Invoke-ExecutionRunner -JobSpec @{
+        run_id = "run-fake-provider"
+        job_id = "job-secret-redaction"
+        phase = "Phase1"
+        role = "implementer"
+        provider = "fake-provider"
+        fake_stdout = "api_key=supersecret12345"
+        fake_stderr = "Authorization: Bearer token1234567890"
+        fake_exit_code = 0
+    } -PromptText "hello" -ProjectRoot $tempFakeRoot -WorkingDirectory $tempFakeRoot -TimeoutPolicy @{
+        warn_after_sec = 0
+        retry_after_sec = 0
+        abort_after_sec = 0
+        max_retries = 0
+    }
+    $secretStdout = Get-Content -Path $secretResult["stdout_path"] -Raw -Encoding UTF8
+    $secretStderr = Get-Content -Path $secretResult["stderr_path"] -Raw -Encoding UTF8
+    $secretJobMetadata = Read-JobMetadata -ProjectRoot $tempFakeRoot -RunId "run-fake-provider" -JobId "job-secret-redaction"
+    Assert-Contains $secretStdout "api_key=[REDACTED]" "Execution runner should redact API keys before writing stdout logs"
+    Assert-True (-not ($secretStdout -match "supersecret12345")) "Execution runner stdout logs should not persist raw API keys"
+    Assert-Contains $secretStderr "Authorization: Bearer [REDACTED]" "Execution runner should redact bearer tokens before writing stderr logs"
+    Assert-True (-not ($secretStderr -match "token1234567890")) "Execution runner stderr logs should not persist raw bearer tokens"
+    Assert-True (-not ([string]$secretJobMetadata["arguments"] -match "supersecret12345|token1234567890")) "Job metadata arguments should be redacted before persistence"
+
     $utf8Prompt = "勤怠シフト承認"
     $echoPromptResult = Invoke-ExecutionRunner -JobSpec @{
         run_id = "run-fake-provider"

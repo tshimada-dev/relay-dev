@@ -122,6 +122,68 @@ function Complete-TaskGroupTaskStates {
     }
 }
 
+function Get-TaskGroupWorkerResourceLocks {
+    param(
+        [AllowNull()]$WorkerResult,
+        [AllowNull()]$WorkerRow
+    )
+
+    foreach ($source in @($WorkerResult, $WorkerRow)) {
+        $object = ConvertTo-RelayHashtable -InputObject $source
+        if ($object -and $object.ContainsKey("resource_locks") -and @($object["resource_locks"]).Count -gt 0) {
+            return @($object["resource_locks"])
+        }
+    }
+
+    return @()
+}
+
+function Get-TaskGroupBoundaryExcludePaths {
+    return @(
+        "artifacts",
+        "jobs",
+        "runs",
+        "docs/worklog",
+        "tasks/task.md",
+        "relay-dev/artifacts",
+        "relay-dev/jobs",
+        "relay-dev/runs",
+        "relay-dev/docs/worklog",
+        "relay-dev/tasks/task.md",
+        "probe.txt",
+        "write-probe.txt",
+        "__write_test.tmp"
+    )
+}
+
+function Test-TaskGroupWorkerBoundary {
+    param(
+        [Parameter(Mandatory)][string]$WorkerId,
+        [Parameter(Mandatory)][string]$WorkspacePath,
+        [Parameter(Mandatory)]$Baseline,
+        [string[]]$DeclaredChangedFiles = @(),
+        [object[]]$ResourceLocks = @()
+    )
+
+    if (-not (Get-Command Test-WorkspaceBoundaryDelta -ErrorAction SilentlyContinue)) {
+        return [ordered]@{
+            ok = $true
+            skipped = $true
+            reason = "workspace_boundary_delta_unavailable"
+            accepted_changed_files = @($DeclaredChangedFiles)
+        }
+    }
+
+    $boundary = ConvertTo-RelayHashtable -InputObject (Test-WorkspaceBoundaryDelta `
+            -WorkspaceRoot $WorkspacePath `
+            -BaselineSnapshot $Baseline `
+            -DeclaredChangedFiles @($DeclaredChangedFiles) `
+            -ResourceLocks @($ResourceLocks) `
+            -AdditionalExcludePaths @(Get-TaskGroupBoundaryExcludePaths))
+    $boundary["worker_id"] = $WorkerId
+    return $boundary
+}
+
 function Invoke-TaskGroupMergeAndCommit {
     param(
         [Parameter(Mandatory)][string]$ProjectRoot,
@@ -182,11 +244,37 @@ function Invoke-TaskGroupMergeAndCommit {
         $changedFiles = Get-TaskGroupWorkerChangedFiles -WorkerResult $result -WorkerRow $worker
         $baseline = Get-TaskGroupWorkerMergeBaseline -WorkerResult $result -WorkerRow $worker
         $workspacePath = if ($result -and $result["workspace_path"]) { [string]$result["workspace_path"] } elseif ($worker) { [string]$worker["workspace_path"] } else { "" }
+        if ([string]::IsNullOrWhiteSpace($workspacePath) -or -not (Test-Path -LiteralPath $workspacePath -PathType Container)) {
+            $ineligible.Add([ordered]@{ worker_id = $workerId; status = $status; reason = "worker_workspace_missing"; workspace_path = $workspacePath }) | Out-Null
+            continue
+        }
+        if (-not $baseline -or -not $baseline["entries"]) {
+            $ineligible.Add([ordered]@{ worker_id = $workerId; status = $status; reason = "worker_baseline_missing"; workspace_path = $workspacePath }) | Out-Null
+            continue
+        }
+
+        $boundary = ConvertTo-RelayHashtable -InputObject (Test-TaskGroupWorkerBoundary `
+                -WorkerId $workerId `
+                -WorkspacePath $workspacePath `
+                -Baseline $baseline `
+                -DeclaredChangedFiles @($changedFiles) `
+                -ResourceLocks @(Get-TaskGroupWorkerResourceLocks -WorkerResult $result -WorkerRow $worker))
+        if ($boundary -and -not [bool]$boundary["ok"]) {
+            $ineligible.Add([ordered]@{
+                    worker_id = $workerId
+                    status = $status
+                    reason = "workspace_boundary_rejected"
+                    workspace_path = $workspacePath
+                    boundary = $boundary
+                }) | Out-Null
+            continue
+        }
+        $acceptedChangedFiles = if ($boundary -and @($boundary["accepted_changed_files"]).Count -gt 0) { @($boundary["accepted_changed_files"]) } else { @($changedFiles) }
         $mergeSpecs.Add([ordered]@{
             worker_id = $workerId
             workspace_path = $workspacePath
             baseline = $baseline
-            accepted_changed_files = @($changedFiles)
+            accepted_changed_files = @($acceptedChangedFiles)
         }) | Out-Null
     }
 

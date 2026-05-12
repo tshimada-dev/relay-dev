@@ -14,6 +14,60 @@ function Get-ExecutionAttemptId {
     return ("attempt-{0}" -f $Attempt.ToString("0000"))
 }
 
+function Protect-ExecutionSensitiveText {
+    param([AllowNull()][string]$Text)
+
+    if ($null -eq $Text) {
+        return $null
+    }
+
+    $redacted = [string]$Text
+    $redacted = [regex]::Replace($redacted, '(?i)\b(authorization)\s*:\s*bearer\s+[A-Za-z0-9._~+/\-=]+', '$1: Bearer [REDACTED]')
+    $redacted = [regex]::Replace($redacted, '(?i)\bbearer\s+[A-Za-z0-9._~+/\-=]+', 'Bearer [REDACTED]')
+    $redacted = [regex]::Replace($redacted, '(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|secret|password|passwd|client[_-]?secret)\s*([:=])\s*["'']?[^"''\s,;]+', '$1$2[REDACTED]')
+    $redacted = [regex]::Replace($redacted, '\b(?:sk|pk)-[A-Za-z0-9_-]{16,}\b', '[REDACTED_KEY]')
+    $redacted = [regex]::Replace($redacted, '\bgh[pousr]_[A-Za-z0-9_]{20,}\b', '[REDACTED_GITHUB_TOKEN]')
+    return $redacted
+}
+
+function Protect-ExecutionSensitiveObject {
+    param([AllowNull()]$InputObject)
+
+    if ($null -eq $InputObject) {
+        return $null
+    }
+    if ($InputObject -is [string]) {
+        return (Protect-ExecutionSensitiveText -Text $InputObject)
+    }
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        $redacted = [ordered]@{}
+        foreach ($key in @($InputObject.Keys)) {
+            $redacted[$key] = Protect-ExecutionSensitiveObject -InputObject $InputObject[$key]
+        }
+        return $redacted
+    }
+    if ($InputObject -is [System.Collections.IEnumerable]) {
+        $items = New-Object System.Collections.Generic.List[object]
+        foreach ($item in @($InputObject)) {
+            $items.Add((Protect-ExecutionSensitiveObject -InputObject $item)) | Out-Null
+        }
+        return @($items.ToArray())
+    }
+
+    return $InputObject
+}
+
+function Write-ExecutionJobMetadata {
+    param(
+        [Parameter(Mandatory)][string]$ProjectRoot,
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][string]$JobId,
+        [Parameter(Mandatory)]$Metadata
+    )
+
+    return Write-JobMetadata -ProjectRoot $ProjectRoot -RunId $RunId -JobId $JobId -Metadata (Protect-ExecutionSensitiveObject -InputObject $Metadata)
+}
+
 function Resolve-ExecutionPromptTextForAttempt {
     param(
         [Parameter(Mandatory)][string]$PromptText,
@@ -472,9 +526,10 @@ function Drain-ExecutionOutputQueue {
 
         $Target.Add([string]$line) | Out-Null
         $prefix = "[$DisplayPrefix][$StreamName]"
+        $displayLine = Protect-ExecutionSensitiveText -Text ([string]$line)
         switch ($StreamName) {
-            "stderr" { Write-Host "$prefix $line" -ForegroundColor Yellow }
-            default { Write-Host "$prefix $line" -ForegroundColor DarkGray }
+            "stderr" { Write-Host "$prefix $displayLine" -ForegroundColor Yellow }
+            default { Write-Host "$prefix $displayLine" -ForegroundColor DarkGray }
         }
     }
 }
@@ -492,9 +547,10 @@ function Drain-ExecutionEventStream {
         if ($null -ne $line) {
             $Target.Add([string]$line) | Out-Null
             $prefix = "[$DisplayPrefix][$StreamName]"
+            $displayLine = Protect-ExecutionSensitiveText -Text ([string]$line)
             switch ($StreamName) {
-                "stderr" { Write-Host "$prefix $line" -ForegroundColor Yellow }
-                default { Write-Host "$prefix $line" -ForegroundColor DarkGray }
+                "stderr" { Write-Host "$prefix $displayLine" -ForegroundColor Yellow }
+                default { Write-Host "$prefix $displayLine" -ForegroundColor DarkGray }
             }
         }
 
@@ -869,7 +925,7 @@ function Invoke-ExecutionRunner {
             attempt_id = $currentAttemptId
             provider = $invocationSpec["provider"]
         }
-        Write-JobMetadata -ProjectRoot $ProjectRoot -RunId $runId -JobId $jobId -Metadata @{
+        Write-ExecutionJobMetadata -ProjectRoot $ProjectRoot -RunId $runId -JobId $jobId -Metadata @{
             run_id = $runId
             job_id = $jobId
             phase = $job["phase"]
@@ -907,7 +963,7 @@ function Invoke-ExecutionRunner {
             param($StartedInfo)
 
             if ($runId) {
-                Write-JobMetadata -ProjectRoot $ProjectRoot -RunId $runId -JobId $jobId -Metadata @{
+                Write-ExecutionJobMetadata -ProjectRoot $ProjectRoot -RunId $runId -JobId $jobId -Metadata @{
                     run_id = $runId
                     job_id = $jobId
                     phase = $job["phase"]
@@ -932,8 +988,8 @@ function Invoke-ExecutionRunner {
         $finalExitCode = [int]$attemptResult["exit_code"]
 
         $header = "=== attempt $attempt ($(Get-Date -Format "yyyy-MM-dd HH:mm:ss")) ==="
-        Add-Content -Path $stdoutPath -Value ($header + [Environment]::NewLine + $attemptResult["stdout"]) -Encoding UTF8
-        Add-Content -Path $stderrPath -Value ($header + [Environment]::NewLine + $attemptResult["stderr"]) -Encoding UTF8
+        Add-Content -Path $stdoutPath -Value ($header + [Environment]::NewLine + (Protect-ExecutionSensitiveText -Text ([string]$attemptResult["stdout"]))) -Encoding UTF8
+        Add-Content -Path $stderrPath -Value ($header + [Environment]::NewLine + (Protect-ExecutionSensitiveText -Text ([string]$attemptResult["stderr"]))) -Encoding UTF8
 
         if ([bool]$attemptResult["artifact_completed"]) {
             $resultStatus = "succeeded"
@@ -986,7 +1042,7 @@ function Invoke-ExecutionRunner {
             failure_class = $failureClass
             recovered_from_artifacts = $recoveredFromArtifacts
         }
-        Write-JobMetadata -ProjectRoot $ProjectRoot -RunId $runId -JobId $jobId -Metadata @{
+        Write-ExecutionJobMetadata -ProjectRoot $ProjectRoot -RunId $runId -JobId $jobId -Metadata @{
             run_id = $runId
             job_id = $jobId
             phase = $job["phase"]

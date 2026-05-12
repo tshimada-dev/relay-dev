@@ -132,7 +132,7 @@ function Complete-TestTaskGroup {
         $workspaceFile = Join-Path $workspacePath ($changedFile -replace '/', [System.IO.Path]::DirectorySeparatorChar)
         New-Item -ItemType Directory -Path (Split-Path -Parent $workspaceFile) -Force | Out-Null
 
-        $baseline = New-WorkspaceBaselineSnapshot -WorkspaceRoot $ProjectRoot -Paths @($changedFile)
+        $baseline = ConvertTo-RelayHashtable -InputObject $workerPackage["baseline_snapshot"]
         Set-Content -Path $workspaceFile -Value "product from $taskId" -Encoding UTF8
 
         $artifactPath = Get-JobArtifactPath -ProjectRoot $ProjectRoot -RunId $runId -JobId $workerId -Scope task -Phase "Phase6" -ArtifactId "phase6_result.json" -TaskId $taskId

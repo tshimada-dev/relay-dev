@@ -443,7 +443,7 @@ function New-TaskGroupJobPackage {
                 New-Item -ItemType Directory -Path $path -Force | Out-Null
             }
         }
-        $baseline = New-WorkspaceBaselineSnapshot -WorkspaceRoot $workspacePath -Paths @($worker["declared_changed_files"])
+        $baseline = New-WorkspaceBaselineSnapshot -WorkspaceRoot $workspacePath
 
         $leaseToken = New-RunStateLeaseToken
         $workerIds.Add($workerId) | Out-Null

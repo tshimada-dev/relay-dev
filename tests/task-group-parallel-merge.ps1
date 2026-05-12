@@ -44,7 +44,8 @@ function New-GroupMergeFixture {
         [string[]]$WorkerIds = @("worker-a", "worker-b"),
         [string[]]$FailedWorkers = @(),
         [switch]$Conflict,
-        [switch]$MissingArtifact
+        [switch]$MissingArtifact,
+        [switch]$UnexpectedWorkspaceChange
     )
 
     $root = Join-Path ([System.IO.Path]::GetTempPath()) ("relay-task-group-merge-$Name-" + [guid]::NewGuid().ToString("N"))
@@ -69,6 +70,9 @@ function New-GroupMergeFixture {
         $workspace = Join-Path $root "workspace-$workerId"
         New-Item -ItemType Directory -Path (Join-Path $workspace "src") -Force | Out-Null
         Set-Content -Path (Join-Path $workspace ($changedFile -replace '/', [System.IO.Path]::DirectorySeparatorChar)) -Value "product from $workerId" -Encoding UTF8
+        if ($UnexpectedWorkspaceChange -and $workerId -eq "worker-a") {
+            Set-Content -Path (Join-Path $workspace "src\undeclared.txt") -Value "undeclared product" -Encoding UTF8
+        }
 
         $artifactPath = Get-JobArtifactPath -ProjectRoot $root -RunId $runId -JobId $workerId -Scope task -Phase "Phase6" -ArtifactId "phase6_result.json" -TaskId $taskId
         New-Item -ItemType Directory -Path (Split-Path -Parent $artifactPath) -Force | Out-Null
@@ -154,6 +158,16 @@ Assert-Equal ([string]$missingArtifactResult["status"]) "artifact_commit_failed"
 Assert-True (-not (Test-Path -LiteralPath (Join-Path $missingArtifact["root"] "src\T-worker-a.txt"))) "No product file should be copied when artifact materialization fails."
 Assert-True (-not (Test-Path -LiteralPath (Get-ArtifactPath -ProjectRoot $missingArtifact["root"] -RunId $missingArtifact["run_id"] -Scope task -Phase "Phase6" -ArtifactId "phase6_result.json" -TaskId "T-worker-a"))) "No canonical artifact should be committed when artifact materialization fails."
 
+$unexpectedChange = New-GroupMergeFixture -Name "unexpected-change" -UnexpectedWorkspaceChange
+$unexpectedChangeResult = ConvertTo-RelayHashtable -InputObject (Invoke-TaskGroupMergeAndCommit -ProjectRoot $unexpectedChange["root"] -RunId $unexpectedChange["run_id"] -GroupId $unexpectedChange["group_id"])
+Assert-True (-not [bool]$unexpectedChangeResult["ok"]) "Unexpected worker workspace changes should block task group commit."
+Assert-Equal ([string]$unexpectedChangeResult["status"]) "commit_blocked" "Unexpected worker workspace changes should return commit_blocked."
+$unexpectedBoundaryRow = ConvertTo-RelayHashtable -InputObject @($unexpectedChangeResult["ineligible_workers"])[0]
+Assert-Equal ([string]$unexpectedBoundaryRow["reason"]) "workspace_boundary_rejected" "Boundary rejection should be reported as the ineligible worker reason."
+Assert-True (@($unexpectedBoundaryRow["boundary"]["unexpected_changed_files"]) -contains "src/undeclared.txt") "Boundary rejection should include undeclared changed files."
+Assert-True (-not (Test-Path -LiteralPath (Join-Path $unexpectedChange["root"] "src\T-worker-a.txt"))) "No product file should be copied when workspace boundary is rejected."
+Assert-True (-not (Test-Path -LiteralPath (Get-ArtifactPath -ProjectRoot $unexpectedChange["root"] -RunId $unexpectedChange["run_id"] -Scope task -Phase "Phase6" -ArtifactId "phase6_result.json" -TaskId "T-worker-a"))) "No canonical artifact should be committed when workspace boundary is rejected."
+
 $prefixedRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("relay-task-group-merge-prefixed-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path (Join-Path $prefixedRoot "relay-dev\examples\parallel_smoke_system") -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $prefixedRoot "relay-dev\docs\worklog") -Force | Out-Null
@@ -165,7 +179,7 @@ Assert-True ([bool]$prefixedBoundary["ok"]) "Workspace boundary should accept re
 Assert-True (@($prefixedBoundary["accepted_changed_files"]) -contains "relay-dev/examples/parallel_smoke_system/styles.css") "Accepted changed files should keep the mergeable repo-prefixed path."
 Assert-True (-not (@($prefixedBoundary["unexpected_changed_files"]) -contains "relay-dev/docs/worklog/current.md")) "Worker worklog edits should be excludable from boundary enforcement."
 
-foreach ($fixture in @($success, $conflict, $failed, $missingArtifact)) {
+foreach ($fixture in @($success, $conflict, $failed, $missingArtifact, $unexpectedChange)) {
     if (Test-Path -LiteralPath $fixture["root"]) {
         Remove-Item -LiteralPath $fixture["root"] -Recurse -Force
     }
