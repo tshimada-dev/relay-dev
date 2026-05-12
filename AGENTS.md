@@ -5,7 +5,7 @@
 For work that may span compaction, interruption, or multiple turns, keep a short active handoff.
 
 - Path: `docs/worklog/current.md`
-- Purpose: quick recovery for in-progress work, not a polished worklog.
+- Purpose: local quick recovery for in-progress work, not a polished worklog. This file is Git-ignored.
 - Update it after the goal is clear, before risky edits, after failed verification, or when the next step changes.
 - Clear it to `No active work` or summarize completion before the final response when the task is done.
 - On recovery, read order should be: `AGENTS.md`, `docs/worklog/current.md`, `git status`, `git diff`, then only the relevant files.
