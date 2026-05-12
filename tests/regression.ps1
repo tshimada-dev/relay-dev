@@ -1428,6 +1428,21 @@ try {
         Assert-True ([bool]$artifactWrite["validation"]["valid"]) "Remaining phase artifact should validate: $($artifactEntry['name'])"
     }
 
+    $validPhase51NonBlockingChecks = Test-ArtifactContract -ArtifactId "phase5-1_verdict.json" -Artifact @{
+        task_id = "T-01"
+        verdict = "go"
+        rollback_phase = $null
+        must_fix = @()
+        warnings = @("Companion task evidence is not available yet.")
+        evidence = @("checked")
+        acceptance_criteria_checks = @(New-Phase51AcceptanceChecks -Status "pass")
+        review_checks = New-Phase51ReviewChecks -StatusOverrides @{
+            test_evidence_review = "warning"
+            visual_contract_alignment = "not_applicable"
+        }
+    } -Phase "Phase5-1"
+    Assert-True ([bool]$validPhase51NonBlockingChecks["valid"]) "Phase5-1 go verdict should allow non-blocking warning and not_applicable review checks."
+
     $invalidPhase51 = Test-ArtifactContract -ArtifactId "phase5-1_verdict.json" -Artifact @{
         task_id = "T-01"
         verdict = "go"

@@ -19,3 +19,7 @@ After any substantive code, documentation, test, configuration, planning, or rep
 - Append to the existing daily file when present.
 - Mention in the final response whether the worklog was updated.
 - If no worklog was updated, explain why in the final response.
+
+## Delegated Implementation
+
+For broad implementation work where the user explicitly asks for the task-list JSON, reviewer-agent, parent TODO management, worker delegation, and parent final verification flow, use `skills/delegated-implementation/SKILL.md`.

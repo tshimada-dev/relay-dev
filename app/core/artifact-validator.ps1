@@ -737,7 +737,7 @@ function Test-Phase51VerdictArtifact {
         "test_evidence_review",
         "design_boundary_alignment",
         "visual_contract_alignment"
-    ) -AllowedStatuses @("pass", "fail")
+    ) -AllowedStatuses @("pass", "warning", "fail", "not_applicable")
 
     $criterionFailures = 0
     if ($Artifact.ContainsKey("acceptance_criteria_checks")) {

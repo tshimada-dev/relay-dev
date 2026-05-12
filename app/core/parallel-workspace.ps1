@@ -44,6 +44,7 @@ function Test-ParallelWorkspaceExcludedPath {
 
     $defaultExcludes = @(
         ".git",
+        "relay-dev/.git",
         "node_modules",
         ".next",
         "coverage",
@@ -246,7 +247,7 @@ function Test-WorkspaceBoundaryDelta {
     param(
         [Parameter(Mandatory)][string]$WorkspaceRoot,
         [Parameter(Mandatory)]$BaselineSnapshot,
-        [Parameter(Mandatory)][string[]]$DeclaredChangedFiles,
+        [AllowEmptyCollection()][string[]]$DeclaredChangedFiles = @(),
         [object[]]$ResourceLocks = @(),
         [string[]]$AdditionalExcludePaths = @()
     )
@@ -259,6 +260,15 @@ function Test-WorkspaceBoundaryDelta {
         }
         $relative = ConvertTo-ParallelWorkspaceRelativePath -WorkspaceRoot $rootFullPath -Path $file
         $allowed[$relative] = $true
+        if (-not $relative.StartsWith("relay-dev/", [System.StringComparison]::OrdinalIgnoreCase)) {
+            $repoPrefixed = "relay-dev/$relative"
+            if (Test-Path -LiteralPath (Join-Path $rootFullPath "relay-dev") -PathType Container) {
+                $allowed[$repoPrefixed] = $true
+            }
+        }
+        elseif ($relative.StartsWith("relay-dev/", [System.StringComparison]::OrdinalIgnoreCase)) {
+            $allowed[$relative.Substring("relay-dev/".Length)] = $true
+        }
     }
 
     $current = New-WorkspaceBaselineSnapshot -WorkspaceRoot $rootFullPath -AdditionalExcludePaths $AdditionalExcludePaths
@@ -312,7 +322,7 @@ function Invoke-IsolatedWorkspaceMergeBack {
         [Parameter(Mandatory)][string]$MainWorkspace,
         [Parameter(Mandatory)][string]$IsolatedWorkspace,
         [Parameter(Mandatory)]$BaselineSnapshot,
-        [Parameter(Mandatory)][string[]]$AcceptedChangedFiles
+        [AllowEmptyCollection()][string[]]$AcceptedChangedFiles = @()
     )
 
     $mainRoot = [System.IO.Path]::GetFullPath($MainWorkspace)

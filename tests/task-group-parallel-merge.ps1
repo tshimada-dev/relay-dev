@@ -154,10 +154,24 @@ Assert-Equal ([string]$missingArtifactResult["status"]) "artifact_commit_failed"
 Assert-True (-not (Test-Path -LiteralPath (Join-Path $missingArtifact["root"] "src\T-worker-a.txt"))) "No product file should be copied when artifact materialization fails."
 Assert-True (-not (Test-Path -LiteralPath (Get-ArtifactPath -ProjectRoot $missingArtifact["root"] -RunId $missingArtifact["run_id"] -Scope task -Phase "Phase6" -ArtifactId "phase6_result.json" -TaskId "T-worker-a"))) "No canonical artifact should be committed when artifact materialization fails."
 
+$prefixedRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("relay-task-group-merge-prefixed-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path (Join-Path $prefixedRoot "relay-dev\examples\parallel_smoke_system") -Force | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $prefixedRoot "relay-dev\docs\worklog") -Force | Out-Null
+$prefixedBaseline = New-WorkspaceBaselineSnapshot -WorkspaceRoot $prefixedRoot
+Set-Content -Path (Join-Path $prefixedRoot "relay-dev\examples\parallel_smoke_system\styles.css") -Value "body {}" -Encoding UTF8
+Set-Content -Path (Join-Path $prefixedRoot "relay-dev\docs\worklog\current.md") -Value "worker note" -Encoding UTF8
+$prefixedBoundary = ConvertTo-RelayHashtable -InputObject (Test-WorkspaceBoundaryDelta -WorkspaceRoot $prefixedRoot -BaselineSnapshot $prefixedBaseline -DeclaredChangedFiles @("examples/parallel_smoke_system/styles.css") -ResourceLocks @("styles-css") -AdditionalExcludePaths @("relay-dev/docs/worklog"))
+Assert-True ([bool]$prefixedBoundary["ok"]) "Workspace boundary should accept repo-prefixed product paths when declared files are repo-relative."
+Assert-True (@($prefixedBoundary["accepted_changed_files"]) -contains "relay-dev/examples/parallel_smoke_system/styles.css") "Accepted changed files should keep the mergeable repo-prefixed path."
+Assert-True (-not (@($prefixedBoundary["unexpected_changed_files"]) -contains "relay-dev/docs/worklog/current.md")) "Worker worklog edits should be excludable from boundary enforcement."
+
 foreach ($fixture in @($success, $conflict, $failed, $missingArtifact)) {
     if (Test-Path -LiteralPath $fixture["root"]) {
         Remove-Item -LiteralPath $fixture["root"] -Recurse -Force
     }
+}
+if (Test-Path -LiteralPath $prefixedRoot) {
+    Remove-Item -LiteralPath $prefixedRoot -Recurse -Force
 }
 
 if ($failures.Count -gt 0) {

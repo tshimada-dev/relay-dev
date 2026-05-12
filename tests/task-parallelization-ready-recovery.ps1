@@ -146,6 +146,63 @@ try {
     $compatRecovery = Repair-StaleActiveJobState -RunState $compatState -ProjectRoot $tempRoot
     Assert-True ([bool]$compatRecovery["changed"]) "Compatibility active_job_id without a heartbeat should keep old missing-pid recovery behavior."
     Assert-Equal $compatRecovery["reason"] "job_missing_pid" "Compatibility recovery should keep the old job_missing_pid reason."
+
+    $orphanRunId = "run-ready-orphan-task"
+    $orphanState = New-RunState -RunId $orphanRunId -ProjectRoot $tempRoot -CurrentPhase "Phase5-2" -CurrentRole "reviewer" -TaskId "T-current"
+    $orphanState["current_task_id"] = "T-current"
+    $orphanState["task_order"] = @("T-current", "T-orphan-ready", "T-orphan-blocked", "T-dependency")
+    $orphanState["task_states"] = [ordered]@{
+        "T-current" = [ordered]@{
+            task_id = "T-current"
+            status = "in_progress"
+            kind = "planned"
+            last_completed_phase = "Phase5-1"
+            phase_cursor = "Phase5-2"
+            active_job_id = $null
+            wait_reason = $null
+            depends_on = @()
+        }
+        "T-orphan-ready" = [ordered]@{
+            task_id = "T-orphan-ready"
+            status = "in_progress"
+            kind = "planned"
+            last_completed_phase = ""
+            phase_cursor = "Phase5"
+            active_job_id = $null
+            wait_reason = $null
+            depends_on = @()
+        }
+        "T-orphan-blocked" = [ordered]@{
+            task_id = "T-orphan-blocked"
+            status = "in_progress"
+            kind = "planned"
+            last_completed_phase = ""
+            phase_cursor = "Phase5"
+            active_job_id = $null
+            wait_reason = $null
+            depends_on = @("T-dependency")
+        }
+        "T-dependency" = [ordered]@{
+            task_id = "T-dependency"
+            status = "not_started"
+            kind = "planned"
+            last_completed_phase = ""
+            phase_cursor = $null
+            active_job_id = $null
+            wait_reason = $null
+            depends_on = @()
+        }
+    }
+
+    $orphanRepair = Repair-OrphanedInProgressTaskState -RunState $orphanState
+    $orphanRepairedState = ConvertTo-RelayHashtable -InputObject $orphanRepair["run_state"]
+    Assert-True ([bool]$orphanRepair["changed"]) "Orphaned in_progress tasks without active leases should be repaired."
+    Assert-Equal $orphanRepairedState["task_states"]["T-current"]["status"] "in_progress" "Current task waiting for dispatch should remain in_progress."
+    Assert-Equal $orphanRepairedState["task_states"]["T-orphan-ready"]["status"] "ready" "Dependency-free orphan task should become ready again."
+    Assert-Equal $orphanRepairedState["task_states"]["T-orphan-ready"]["phase_cursor"] "Phase5" "Recovered orphan task should preserve its phase cursor."
+    Assert-Equal $orphanRepairedState["task_states"]["T-orphan-blocked"]["status"] "not_started" "Dependency-blocked orphan task should return to not_started."
+    Assert-Equal $orphanRepairedState["task_states"]["T-orphan-blocked"]["wait_reason"] "dependencies" "Dependency-blocked orphan task should carry a dependency wait reason."
+    Assert-Equal @($orphanRepair["recovered_tasks"]).Count 2 "Recovery should report every repaired orphan task."
 }
 finally {
     if (Test-Path $tempRoot) {

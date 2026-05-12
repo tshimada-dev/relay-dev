@@ -183,6 +183,15 @@ Assert-Equal ([bool]$dependencyEligibility["eligible"]) $false "Unmet dependenci
 Assert-Equal $dependencyEligibility["wait_reason"] "dependencies" "Unmet dependencies should report wait_reason dependencies."
 Assert-ArrayContains $dependencyEligibility["blocked_by"] "T-ready" "Dependency waits should identify blocking task ids."
 
+$staleDependencyState = ConvertTo-RelayHashtable -InputObject $state
+$staleDependencyTask = ConvertTo-RelayHashtable -InputObject $staleDependencyState["task_states"]["T-dependent"]
+$staleDependencyTask["depends_on"] = @()
+$staleDependencyTask["status"] = "ready"
+$staleDependencyState["task_states"]["T-dependent"] = $staleDependencyTask
+$contractDependencyEligibility = Test-TaskDispatchEligibility -RunState $staleDependencyState -ProjectRoot $root -TaskId "T-dependent"
+Assert-Equal ([bool]$contractDependencyEligibility["eligible"]) $false "Task contract dependencies should still block dispatch when run-state depends_on is stale."
+Assert-ArrayContains $contractDependencyEligibility["blocked_by"] "T-ready" "Contract dependency waits should identify the blocking task id."
+
 $resourceLease = Add-RunStateActiveJobLease -RunState $state -JobSpec @{
     job_id = "job-db"
     task_id = "T-db"
@@ -271,6 +280,18 @@ $nextAction = Get-NextAction -RunState $sequentialFixture["state"] -ProjectRoot 
 Assert-Equal $nextAction["type"] "DispatchJob" "Get-NextAction should preserve sequential dispatch when no job is active."
 Assert-Equal $nextAction["task_id"] "T-ready" "Get-NextAction should still pick the first ready task."
 
+$completedCursorFixture = New-SchedulerFixture
+$completedCursorState = $completedCursorFixture["state"]
+$completedCursorTask = ConvertTo-RelayHashtable -InputObject $completedCursorState["task_states"]["T-ready"]
+$completedCursorTask["status"] = "completed"
+$completedCursorTask["last_completed_phase"] = "Phase6"
+$completedCursorTask["phase_cursor"] = "Phase6"
+$completedCursorState["task_states"]["T-ready"] = $completedCursorTask
+$completedCursorState = Set-RunStateCursor -RunState $completedCursorState -Phase "Phase5" -TaskId "T-ready"
+$completedCursorAction = Get-NextAction -RunState $completedCursorState -ProjectRoot ([string]$completedCursorFixture["root"])
+Assert-Equal $completedCursorAction["type"] "DispatchJob" "Get-NextAction should recover from a stale completed task cursor."
+Assert-Equal $completedCursorAction["task_id"] "T-dependent" "Get-NextAction should dispatch the next ready task instead of rerunning a completed cursor task."
+
 $allEligibility = @(Get-TaskDispatchEligibility -RunState $sequentialFixture["state"] -ProjectRoot ([string]$sequentialFixture["root"]))
 Assert-Equal $allEligibility.Count 6 "Scheduler helper should derive one eligibility row per task without persisting ready_queue."
 
@@ -281,9 +302,186 @@ $phaseState["task_lane"]["max_parallel_jobs"] = 3
 $phaseCandidates = @(Get-BatchLeaseCandidates -RunState $phaseState -ProjectRoot ([string]$phaseFixture["root"]))
 Assert-True ($phaseCandidates.Count -gt 0) "Ready tasks without a cursor should be launchable in Phase5."
 
-$reviewPhaseState = Set-RunStateCursor -RunState $phaseState -Phase "Phase5-1" -TaskId "T-ready"
+$currentCursorFixture = New-SchedulerFixture
+$currentCursorState = $currentCursorFixture["state"]
+$currentCursorState["task_lane"]["mode"] = "parallel"
+$currentCursorState["task_lane"]["max_parallel_jobs"] = 2
+$currentCursorState = Set-RunStateCursor -RunState $currentCursorState -Phase "Phase5" -TaskId "T-ready"
+$currentCursorCandidates = @(Get-BatchLeaseCandidates -RunState $currentCursorState -ProjectRoot ([string]$currentCursorFixture["root"]))
+$currentCursorTaskIds = @($currentCursorCandidates | ForEach-Object { [string]$_["task_id"] })
+Assert-ArrayContains $currentCursorTaskIds "T-ready" "Current task cursor waiting for dispatch should remain launchable in a parallel Phase5 batch."
+
+$reviewPhaseState = Set-RunStateCursor -RunState $phaseState -Phase "Phase5-1" -TaskId $null
 $reviewPhaseCandidates = @(Get-BatchLeaseCandidates -RunState $reviewPhaseState -ProjectRoot ([string]$phaseFixture["root"]))
-Assert-Equal $reviewPhaseCandidates.Count 0 "Ready tasks without a cursor should not be promoted into a reviewer phase batch."
+$reviewPhaseCandidateIds = @($reviewPhaseCandidates | ForEach-Object { [string]$_["task_id"] })
+$reviewPhaseCandidatePhases = @($reviewPhaseCandidates | ForEach-Object { [string]$_["phase"] })
+Assert-True ($reviewPhaseCandidates.Count -gt 0) "Ready tasks without a cursor should still be launchable as Phase5 while another lane is in a reviewer phase."
+Assert-ArrayContains $reviewPhaseCandidateIds "T-ready" "Mixed-phase batches should include ready tasks as fresh Phase5 work."
+Assert-ArrayContains $reviewPhaseCandidatePhases "Phase5" "Ready tasks launched during a reviewer phase should keep their own Phase5 cursor."
+
+$reviewCursorFixture = New-SchedulerFixture
+$reviewCursorState = $reviewCursorFixture["state"]
+$reviewCursorState["task_lane"]["mode"] = "parallel"
+$reviewCursorState["task_lane"]["max_parallel_jobs"] = 2
+$reviewCursorTask = ConvertTo-RelayHashtable -InputObject $reviewCursorState["task_states"]["T-ready"]
+$reviewCursorTask["status"] = "in_progress"
+$reviewCursorTask["last_completed_phase"] = "Phase5"
+$reviewCursorTask["phase_cursor"] = "Phase5-1"
+$reviewCursorState["task_states"]["T-ready"] = $reviewCursorTask
+$reviewCursorState = Set-RunStateCursor -RunState $reviewCursorState -Phase "Phase5-1" -TaskId $null
+$reviewCursorCandidates = @(Get-BatchLeaseCandidates -RunState $reviewCursorState -ProjectRoot ([string]$reviewCursorFixture["root"]))
+$reviewCursorTaskIds = @($reviewCursorCandidates | ForEach-Object { [string]$_["task_id"] })
+Assert-ArrayContains $reviewCursorTaskIds "T-ready" "Task lanes that already advanced to a reviewer phase should be launchable when the global cursor reaches that phase."
+
+$mixedPhaseFixture = New-SchedulerFixture
+$mixedPhaseState = $mixedPhaseFixture["state"]
+$mixedPhaseState["task_lane"]["mode"] = "parallel"
+$mixedPhaseState["task_lane"]["max_parallel_jobs"] = 3
+$mixedPhaseDoneTask = ConvertTo-RelayHashtable -InputObject $mixedPhaseState["task_states"]["T-ready"]
+$mixedPhaseDoneTask["status"] = "in_progress"
+$mixedPhaseDoneTask["last_completed_phase"] = "Phase5-2"
+$mixedPhaseDoneTask["phase_cursor"] = "Phase6"
+$mixedPhaseState["task_states"]["T-ready"] = $mixedPhaseDoneTask
+$mixedPhaseNewTask = ConvertTo-RelayHashtable -InputObject $mixedPhaseState["task_states"]["T-api"]
+$mixedPhaseNewTask["status"] = "ready"
+$mixedPhaseNewTask["phase_cursor"] = $null
+$mixedPhaseState["task_states"]["T-api"] = $mixedPhaseNewTask
+$mixedPhaseState = Set-RunStateCursor -RunState $mixedPhaseState -Phase "Phase5" -TaskId "T-api"
+$mixedPhaseCandidates = @(Get-BatchLeaseCandidates -RunState $mixedPhaseState -ProjectRoot ([string]$mixedPhaseFixture["root"]))
+$mixedPhaseRows = @{}
+foreach ($candidate in $mixedPhaseCandidates) {
+    $mixedPhaseRows[[string]$candidate["task_id"]] = $candidate
+}
+Assert-True ($mixedPhaseRows.ContainsKey("T-ready")) "A lane waiting on Phase6 should remain launchable while another task is back in Phase5."
+Assert-Equal $mixedPhaseRows["T-ready"]["phase"] "Phase6" "Mixed-phase scheduler should lease the task's own phase cursor."
+Assert-Equal $mixedPhaseRows["T-ready"]["role"] "reviewer" "Mixed-phase scheduler should resolve role from the candidate phase."
+Assert-True ($mixedPhaseRows.ContainsKey("T-api")) "A fresh ready task should still be launchable in the same mixed-phase batch."
+Assert-Equal $mixedPhaseRows["T-api"]["phase"] "Phase5" "Fresh ready tasks should launch at Phase5 in a mixed-phase batch."
+
+$barrierFixture = New-SchedulerFixture
+$barrierState = $barrierFixture["state"]
+$barrierState["task_lane"]["mode"] = "parallel"
+$barrierState["task_lane"]["max_parallel_jobs"] = 2
+$barrierState = Add-RunStateActiveJobLease -RunState $barrierState -JobSpec @{
+    job_id = "job-ready"
+    task_id = "T-ready"
+    phase = "Phase5"
+    role = "implementer"
+    resource_locks = @("ui-shell")
+    parallel_safety = "parallel"
+} | ForEach-Object { $_["run_state"] }
+$barrierState = Add-RunStateActiveJobLease -RunState $barrierState -JobSpec @{
+    job_id = "job-api"
+    task_id = "T-api"
+    phase = "Phase5"
+    role = "implementer"
+    resource_locks = @("api")
+    parallel_safety = "parallel"
+} | ForEach-Object { $_["run_state"] }
+$barrierMutation = Apply-JobResult -RunState $barrierState -JobResult @{
+    job_id = "job-ready"
+    task_id = "T-ready"
+    phase = "Phase5"
+    result_status = "succeeded"
+    exit_code = 0
+} -ValidationResult @{ valid = $true; errors = @(); warnings = @() } -Artifact @{ task_id = "T-ready" } -ProjectRoot ([string]$barrierFixture["root"])
+$barrierNextState = ConvertTo-RelayHashtable -InputObject $barrierMutation["run_state"]
+$barrierAction = ConvertTo-RelayHashtable -InputObject $barrierMutation["action"]
+Assert-Equal $barrierAction["type"] "WaitForParallelSiblings" "A completed Phase5 lane should not advance the global cursor while sibling Phase5 jobs are still active."
+Assert-Equal $barrierNextState["current_phase"] "Phase5" "Parallel phase barrier should keep the global cursor on the current phase."
+Assert-Equal $barrierNextState["task_states"]["T-ready"]["phase_cursor"] "Phase5-1" "Completed worker lane should keep its own next phase cursor."
+Assert-Equal $barrierNextState["task_states"]["T-api"]["active_job_id"] "job-api" "Sibling active job should remain leased after another lane commits."
+
+$mixedBarrierFixture = New-SchedulerFixture
+$mixedBarrierState = $mixedBarrierFixture["state"]
+$mixedBarrierState["task_lane"]["mode"] = "parallel"
+$mixedBarrierState["task_lane"]["max_parallel_jobs"] = 2
+$mixedBarrierPhase6Task = ConvertTo-RelayHashtable -InputObject $mixedBarrierState["task_states"]["T-ready"]
+$mixedBarrierPhase6Task["status"] = "in_progress"
+$mixedBarrierPhase6Task["last_completed_phase"] = "Phase5-2"
+$mixedBarrierPhase6Task["phase_cursor"] = "Phase6"
+$mixedBarrierState["task_states"]["T-ready"] = $mixedBarrierPhase6Task
+$mixedBarrierPhase5Task = ConvertTo-RelayHashtable -InputObject $mixedBarrierState["task_states"]["T-api"]
+$mixedBarrierPhase5Task["status"] = "in_progress"
+$mixedBarrierPhase5Task["phase_cursor"] = "Phase5"
+$mixedBarrierState["task_states"]["T-api"] = $mixedBarrierPhase5Task
+$mixedBarrierState = Set-RunStateCursor -RunState $mixedBarrierState -Phase "Phase5" -TaskId "T-api"
+$mixedBarrierState = Add-RunStateActiveJobLease -RunState $mixedBarrierState -JobSpec @{
+    job_id = "job-phase6"
+    task_id = "T-ready"
+    phase = "Phase6"
+    role = "reviewer"
+    resource_locks = @("ui-shell")
+    parallel_safety = "parallel"
+} | ForEach-Object { $_["run_state"] }
+$mixedBarrierState = Add-RunStateActiveJobLease -RunState $mixedBarrierState -JobSpec @{
+    job_id = "job-phase5"
+    task_id = "T-api"
+    phase = "Phase5"
+    role = "implementer"
+    resource_locks = @("api-client")
+    parallel_safety = "parallel"
+} | ForEach-Object { $_["run_state"] }
+$mixedBarrierMutation = Apply-JobResult -RunState $mixedBarrierState -JobResult @{
+    job_id = "job-phase6"
+    task_id = "T-ready"
+    phase = "Phase6"
+    result_status = "succeeded"
+    exit_code = 0
+} -ValidationResult @{ valid = $true; errors = @(); warnings = @() } -Artifact @{ task_id = "T-ready"; verdict = "go" } -ProjectRoot ([string]$mixedBarrierFixture["root"])
+$mixedBarrierNextState = ConvertTo-RelayHashtable -InputObject $mixedBarrierMutation["run_state"]
+$mixedBarrierAction = ConvertTo-RelayHashtable -InputObject $mixedBarrierMutation["action"]
+Assert-Equal $mixedBarrierAction["type"] "WaitForParallelSiblings" "A completed Phase6 lane should not reserve a next task while another mixed-phase job is active."
+Assert-Equal $mixedBarrierNextState["current_phase"] "Phase5" "Mixed-phase barrier should preserve the active sibling cursor."
+Assert-Equal $mixedBarrierNextState["current_task_id"] "T-api" "Mixed-phase barrier should preserve the active sibling task cursor."
+Assert-Equal $mixedBarrierNextState["task_states"]["T-ready"]["status"] "completed" "The finished Phase6 lane should still complete its own task."
+Assert-Equal $mixedBarrierNextState["task_states"]["T-api"]["active_job_id"] "job-phase5" "The mixed-phase active sibling should remain leased."
+Assert-Equal $mixedBarrierNextState["task_states"]["T-db"]["status"] "ready" "The next ready task should not be marked in_progress before it is leased."
+
+$phase6RejectFixture = New-SchedulerFixture
+$phase6RejectState = $phase6RejectFixture["state"]
+$phase6RejectTask = ConvertTo-RelayHashtable -InputObject $phase6RejectState["task_states"]["T-ready"]
+$phase6RejectTask["status"] = "in_progress"
+$phase6RejectTask["last_completed_phase"] = "Phase5-2"
+$phase6RejectTask["phase_cursor"] = "Phase6"
+$phase6RejectState["task_states"]["T-ready"] = $phase6RejectTask
+$phase6RejectState = Set-RunStateCursor -RunState $phase6RejectState -Phase "Phase6" -TaskId "T-ready"
+$phase6RejectMutation = Apply-JobResult -RunState $phase6RejectState -JobResult @{
+    job_id = "job-phase6-reject"
+    task_id = "T-ready"
+    phase = "Phase6"
+    result_status = "succeeded"
+    exit_code = 0
+} -ValidationResult @{ valid = $true; errors = @(); warnings = @() } -Artifact @{ task_id = "T-ready"; verdict = "reject"; rollback_phase = "Phase5" } -ProjectRoot ([string]$phase6RejectFixture["root"])
+$phase6RejectNextState = ConvertTo-RelayHashtable -InputObject $phase6RejectMutation["run_state"]
+$phase6RejectAction = ConvertTo-RelayHashtable -InputObject $phase6RejectMutation["action"]
+Assert-Equal $phase6RejectAction["type"] "Continue" "A Phase6 reject should be a rollback transition, not a task completion."
+Assert-Equal $phase6RejectAction["next_phase"] "Phase5" "A Phase6 reject should honor rollback_phase."
+Assert-Equal $phase6RejectAction["next_task_id"] "T-ready" "A Phase6 reject should retry the same task."
+Assert-Equal $phase6RejectNextState["task_states"]["T-ready"]["status"] "in_progress" "A rejected Phase6 task should not be marked completed."
+Assert-Equal $phase6RejectNextState["task_states"]["T-ready"]["phase_cursor"] "Phase5" "A rejected Phase6 task should move its lane cursor to the rollback phase."
+
+$phase6RepairFixture = New-SchedulerFixture
+$phase6RepairRoot = [string]$phase6RepairFixture["root"]
+$phase6RepairRunId = [string]$phase6RepairFixture["run_id"]
+$phase6RepairState = $phase6RepairFixture["state"]
+Save-Artifact -ProjectRoot $phase6RepairRoot -RunId $phase6RepairRunId -Scope task -TaskId "T-ready" -Phase "Phase6" -ArtifactId "phase6_result.json" -Content @{
+    task_id = "T-ready"
+    verdict = "reject"
+    rollback_phase = "Phase5"
+} -AsJson | Out-Null
+$phase6RepairTask = ConvertTo-RelayHashtable -InputObject $phase6RepairState["task_states"]["T-ready"]
+$phase6RepairTask["status"] = "completed"
+$phase6RepairTask["last_completed_phase"] = "Phase6"
+$phase6RepairTask["phase_cursor"] = "Phase5"
+$phase6RepairState["task_states"]["T-ready"] = $phase6RepairTask
+$phase6RepairState = Set-RunStateCursor -RunState $phase6RepairState -Phase "Phase5" -TaskId "T-ready"
+$phase6RepairResult = Repair-RejectedPhase6TaskState -RunState $phase6RepairState -ProjectRoot $phase6RepairRoot
+$phase6RepairNextState = ConvertTo-RelayHashtable -InputObject $phase6RepairResult["run_state"]
+Assert-Equal ([bool]$phase6RepairResult["changed"]) $true "Recovery should detect a completed task whose committed Phase6 artifact rejected."
+Assert-Equal $phase6RepairNextState["task_states"]["T-ready"]["status"] "in_progress" "Recovery should reopen a task with rejected Phase6 output."
+Assert-Equal $phase6RepairNextState["task_states"]["T-ready"]["phase_cursor"] "Phase5" "Recovery should restore the rollback phase cursor."
+Assert-Equal $phase6RepairNextState["current_task_id"] "T-ready" "Recovery should restore the task cursor for retry."
 
 # CPS-03 UI summary/rendering assertions. Keep this separate from scheduler policy tests.
 $uiRunState = [ordered]@{

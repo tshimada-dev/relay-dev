@@ -1,0 +1,4 @@
+interface:
+  display_name: "Delegated Implementation"
+  short_description: "Review and delegate large coding tasks"
+  default_prompt: "Use $delegated-implementation to plan this implementation as JSON, review it with a subagent, delegate bounded coding tasks, and run final verification in the parent."

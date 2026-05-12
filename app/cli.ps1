@@ -219,6 +219,12 @@ function Repair-RecoverableFailedRunState {
     ) {
         $canRecover = $true
     }
+    elseif (
+        $failureReason -in @("workspace_boundary_rejected", "manual_commit_rejected_cleanup") -or
+        $failureClass -eq "commit_rejected"
+    ) {
+        $canRecover = $true
+    }
 
     if (-not $canRecover) {
         return @{
@@ -1810,6 +1816,30 @@ function Invoke-EngineStep {
         }
     }
 
+    $orphanedTaskRepair = Repair-OrphanedInProgressTaskState -RunState $runState
+    if ([bool]$orphanedTaskRepair["changed"]) {
+        $runState = ConvertTo-RelayHashtable -InputObject $orphanedTaskRepair["run_state"]
+        Write-RunState -ProjectRoot $script:ProjectRoot -RunState $runState | Out-Null
+        Append-RunStatusChangedEvent -RunId $ResolvedRunId -RunState $runState
+        Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event @{
+            type = "task.recovered"
+            reason = "orphaned_in_progress_task"
+            tasks = @($orphanedTaskRepair["recovered_tasks"])
+        }
+    }
+
+    $phase6RejectRepair = Repair-RejectedPhase6TaskState -RunState $runState -ProjectRoot $script:ProjectRoot
+    if ([bool]$phase6RejectRepair["changed"]) {
+        $runState = ConvertTo-RelayHashtable -InputObject $phase6RejectRepair["run_state"]
+        Write-RunState -ProjectRoot $script:ProjectRoot -RunState $runState | Out-Null
+        Append-RunStatusChangedEvent -RunId $ResolvedRunId -RunState $runState
+        Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event @{
+            type = "task.recovered"
+            reason = "phase6_reject_rollback"
+            tasks = @($phase6RejectRepair["recovered_tasks"])
+        }
+    }
+
     $failedRecovery = Repair-RecoverableFailedRunState -RunState $runState -ProjectRoot $script:ProjectRoot -RecoverySource "step"
     if ([bool]$failedRecovery["changed"]) {
         $runState = ConvertTo-RelayHashtable -InputObject $failedRecovery["run_state"]
@@ -2238,6 +2268,38 @@ function Invoke-ParallelEngineStep {
                     metadata = (ConvertTo-RelayHashtable -InputObject $recoveredJob["job_metadata"])
                 }
             }
+        }
+
+        $orphanedTaskRepair = Repair-OrphanedInProgressTaskState -RunState $runState
+        if ([bool]$orphanedTaskRepair["changed"]) {
+            $runState = ConvertTo-RelayHashtable -InputObject $orphanedTaskRepair["run_state"]
+            Write-RunState -ProjectRoot $script:ProjectRoot -RunState $runState | Out-Null
+            Append-RunStatusChangedEvent -RunId $ResolvedRunId -RunState $runState
+            Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event @{
+                type = "task.recovered"
+                reason = "orphaned_in_progress_task"
+                tasks = @($orphanedTaskRepair["recovered_tasks"])
+            }
+        }
+
+        $phase6RejectRepair = Repair-RejectedPhase6TaskState -RunState $runState -ProjectRoot $script:ProjectRoot
+        if ([bool]$phase6RejectRepair["changed"]) {
+            $runState = ConvertTo-RelayHashtable -InputObject $phase6RejectRepair["run_state"]
+            Write-RunState -ProjectRoot $script:ProjectRoot -RunState $runState | Out-Null
+            Append-RunStatusChangedEvent -RunId $ResolvedRunId -RunState $runState
+            Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event @{
+                type = "task.recovered"
+                reason = "phase6_reject_rollback"
+                tasks = @($phase6RejectRepair["recovered_tasks"])
+            }
+        }
+
+        $failedRecovery = Repair-RecoverableFailedRunState -RunState $runState -ProjectRoot $script:ProjectRoot -RecoverySource "parallel-step"
+        if ([bool]$failedRecovery["changed"]) {
+            $runState = ConvertTo-RelayHashtable -InputObject $failedRecovery["run_state"]
+            Write-RunState -ProjectRoot $script:ProjectRoot -RunState $runState | Out-Null
+            Append-RunStatusChangedEvent -RunId $ResolvedRunId -RunState $runState
+            Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event $failedRecovery["recovery_event"]
         }
 
         $phaseName = [string]$runState["current_phase"]

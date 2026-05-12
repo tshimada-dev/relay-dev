@@ -254,6 +254,28 @@ function Resolve-TaskContract {
     return $null
 }
 
+function Get-TaskContractDependencies {
+    param([AllowNull()]$TaskContract)
+
+    $contract = ConvertTo-RelayHashtable -InputObject $TaskContract
+    if (-not $contract) {
+        return @()
+    }
+
+    $dependencies = New-Object System.Collections.Generic.List[string]
+    foreach ($fieldName in @("dependencies", "depends_on")) {
+        foreach ($dependencyIdRaw in @($contract[$fieldName])) {
+            $dependencyId = [string]$dependencyIdRaw
+            if ([string]::IsNullOrWhiteSpace($dependencyId) -or $dependencyId -in @($dependencies.ToArray())) {
+                continue
+            }
+            $dependencies.Add($dependencyId) | Out-Null
+        }
+    }
+
+    return @($dependencies.ToArray())
+}
+
 function Get-TaskContractResourceLocks {
     param([AllowNull()]$TaskContract)
 
@@ -428,7 +450,15 @@ function Test-TaskDispatchEligibility {
     }
 
     $unmetDependencies = New-Object System.Collections.Generic.List[string]
-    foreach ($dependencyId in @($taskState["depends_on"])) {
+    $dependencyIds = New-Object System.Collections.Generic.List[string]
+    foreach ($dependencyIdRaw in (@($taskState["depends_on"]) + @(Get-TaskContractDependencies -TaskContract $contract))) {
+        $dependencyId = [string]$dependencyIdRaw
+        if ([string]::IsNullOrWhiteSpace($dependencyId) -or $dependencyId -in @($dependencyIds.ToArray())) {
+            continue
+        }
+        $dependencyIds.Add($dependencyId) | Out-Null
+    }
+    foreach ($dependencyId in @($dependencyIds.ToArray())) {
         $dependencyKey = [string]$dependencyId
         if ([string]::IsNullOrWhiteSpace($dependencyKey)) {
             continue
@@ -444,9 +474,17 @@ function Test-TaskDispatchEligibility {
         return $result
     }
 
-    if ([string]$taskState["status"] -ne "ready") {
+    $taskStatus = [string]$taskState["status"]
+    $taskActiveJobId = [string]$taskState["active_job_id"]
+    $taskPhaseCursor = [string]$taskState["phase_cursor"]
+    $isTaskAwaitingDispatchCursor = (
+        $taskStatus -eq "in_progress" -and
+        [string]::IsNullOrWhiteSpace($taskActiveJobId) -and
+        (Test-TaskScopedPhase -Phase $taskPhaseCursor)
+    )
+    if ($taskStatus -ne "ready" -and -not $isTaskAwaitingDispatchCursor) {
         $result["eligible"] = $false
-        $result["wait_reason"] = [string]$taskState["status"]
+        $result["wait_reason"] = $taskStatus
         return $result
     }
 
@@ -543,8 +581,8 @@ function Get-BatchLeaseCandidates {
 
     $state = Update-TaskReadiness -RunState $RunState
     $runId = [string]$state["run_id"]
-    $phase = [string]$state["current_phase"]
-    if (-not (Test-TaskScopedPhase -Phase $phase)) {
+    $currentPhase = [string]$state["current_phase"]
+    if (-not (Test-TaskScopedPhase -Phase $currentPhase)) {
         return @()
     }
 
@@ -563,7 +601,6 @@ function Get-BatchLeaseCandidates {
         return @()
     }
 
-    $role = Resolve-PhaseRole -Phase $phase
     $active = @(Get-ActiveTaskSchedulerConstraints -RunState $state -ProjectRoot $ProjectRoot)
     $activeTaskIds = @($active | ForEach-Object { [string]$_["task_id"] } | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
     $selected = New-Object System.Collections.Generic.List[object]
@@ -595,10 +632,11 @@ function Get-BatchLeaseCandidates {
         }
 
         $taskState = ConvertTo-RelayHashtable -InputObject $state["task_states"][$taskId]
-        $candidatePhase = Resolve-TaskLaneCandidatePhase -TaskState $taskState -CurrentPhase $phase
-        if ($candidatePhase -ne $phase) {
+        $candidatePhase = Resolve-TaskLaneCandidatePhase -TaskState $taskState -CurrentPhase $currentPhase
+        if (-not (Test-TaskScopedPhase -Phase $candidatePhase)) {
             continue
         }
+        $candidateRole = Resolve-PhaseRole -Phase $candidatePhase
 
         $eligibility = Test-TaskDispatchEligibility -RunState $state -ProjectRoot $ProjectRoot -TaskId $taskId
         if (-not [bool]$eligibility["eligible"]) {
@@ -645,8 +683,8 @@ function Get-BatchLeaseCandidates {
         $selectedTaskIds.Add($taskId)
         $selected.Add([ordered]@{
             task_id = $taskId
-            phase = $phase
-            role = $role
+            phase = $candidatePhase
+            role = $candidateRole
             selected_task = $contract
             resource_locks = @($resourceLocks)
             parallel_safety = $parallelSafety
@@ -680,6 +718,28 @@ function Resolve-NextReadyTaskId {
     }
 
     return $null
+}
+
+function Test-RunStateHasActiveJobInPhase {
+    param(
+        [Parameter(Mandatory)]$RunState,
+        [Parameter(Mandatory)][string]$Phase
+    )
+
+    $state = Initialize-RunStateCompatibilityFields -RunState $RunState
+    foreach ($activeJobIdRaw in @(Get-RunStateActiveJobIds -RunState $state)) {
+        $activeJobId = [string]$activeJobIdRaw
+        if ([string]::IsNullOrWhiteSpace($activeJobId) -or -not $state["active_jobs"].ContainsKey($activeJobId)) {
+            continue
+        }
+
+        $activeJob = ConvertTo-RelayHashtable -InputObject $state["active_jobs"][$activeJobId]
+        if ([string]$activeJob["phase"] -eq $Phase) {
+            return $true
+        }
+    }
+
+    return $false
 }
 
 function Merge-OpenRequirements {
@@ -1137,6 +1197,180 @@ function Repair-StaleActiveJobState {
     }
 }
 
+function Repair-OrphanedInProgressTaskState {
+    param([Parameter(Mandatory)]$RunState)
+
+    $state = Initialize-RunStateCompatibilityFields -RunState $RunState
+    $taskOrder = @($state["task_order"])
+    $activeTaskIds = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($activeJobIdRaw in @(Get-RunStateActiveJobIds -RunState $state)) {
+        $activeJobId = [string]$activeJobIdRaw
+        if ([string]::IsNullOrWhiteSpace($activeJobId) -or -not $state["active_jobs"].ContainsKey($activeJobId)) {
+            continue
+        }
+
+        $activeJob = ConvertTo-RelayHashtable -InputObject $state["active_jobs"][$activeJobId]
+        $activeTaskId = [string]$activeJob["task_id"]
+        if (-not [string]::IsNullOrWhiteSpace($activeTaskId)) {
+            [void]$activeTaskIds.Add($activeTaskId)
+        }
+    }
+
+    $currentTaskId = [string]$state["current_task_id"]
+    $currentPhase = [string]$state["current_phase"]
+    $recoveredTasks = New-Object System.Collections.Generic.List[object]
+
+    foreach ($taskIdRaw in $taskOrder) {
+        $taskId = [string]$taskIdRaw
+        if ([string]::IsNullOrWhiteSpace($taskId) -or -not $state["task_states"].ContainsKey($taskId)) {
+            continue
+        }
+
+        $taskState = ConvertTo-RelayHashtable -InputObject $state["task_states"][$taskId]
+        if ([string]$taskState["status"] -ne "in_progress") {
+            continue
+        }
+
+        $taskActiveJobId = [string]$taskState["active_job_id"]
+        if (-not [string]::IsNullOrWhiteSpace($taskActiveJobId)) {
+            continue
+        }
+
+        if ($activeTaskIds.Contains($taskId)) {
+            continue
+        }
+
+        $taskPhaseCursor = [string]$taskState["phase_cursor"]
+        if ((Test-TaskScopedPhase -Phase $currentPhase) -and $taskPhaseCursor -eq $currentPhase) {
+            continue
+        }
+
+        $dependenciesSatisfied = $true
+        foreach ($dependencyIdRaw in @($taskState["depends_on"])) {
+            $dependencyId = [string]$dependencyIdRaw
+            if ([string]::IsNullOrWhiteSpace($dependencyId)) {
+                continue
+            }
+            if (-not $state["task_states"].ContainsKey($dependencyId) -or [string]$state["task_states"][$dependencyId]["status"] -ne "completed") {
+                $dependenciesSatisfied = $false
+                break
+            }
+        }
+
+        $previousStatus = [string]$taskState["status"]
+        $taskState["status"] = if ($dependenciesSatisfied) { "ready" } else { "not_started" }
+        $taskState["wait_reason"] = if ($dependenciesSatisfied) { $null } else { "dependencies" }
+        $state["task_states"][$taskId] = $taskState
+        $recoveredTasks.Add([ordered]@{
+            task_id = $taskId
+            previous_status = $previousStatus
+            status = [string]$taskState["status"]
+            phase_cursor = $taskPhaseCursor
+            reason = "orphaned_in_progress_task"
+        }) | Out-Null
+    }
+
+    if ($recoveredTasks.Count -eq 0) {
+        return @{
+            changed = $false
+            run_state = $state
+            recovered_tasks = @()
+        }
+    }
+
+    $state["updated_at"] = (Get-Date).ToString("o")
+    return @{
+        changed = $true
+        run_state = $state
+        recovered_tasks = @($recoveredTasks.ToArray())
+    }
+}
+
+function Repair-RejectedPhase6TaskState {
+    param(
+        [Parameter(Mandatory)]$RunState,
+        [Parameter(Mandatory)][string]$ProjectRoot
+    )
+
+    $state = Initialize-RunStateCompatibilityFields -RunState $RunState
+    $runId = [string]$state["run_id"]
+    $recoveredTasks = New-Object System.Collections.Generic.List[object]
+
+    foreach ($taskIdRaw in @($state["task_order"])) {
+        $taskId = [string]$taskIdRaw
+        if ([string]::IsNullOrWhiteSpace($taskId) -or -not $state["task_states"].ContainsKey($taskId)) {
+            continue
+        }
+
+        $taskState = ConvertTo-RelayHashtable -InputObject $state["task_states"][$taskId]
+        if ([string]$taskState["last_completed_phase"] -ne "Phase6") {
+            continue
+        }
+
+        $artifact = $null
+        try {
+            $artifact = Read-Artifact -ProjectRoot $ProjectRoot -RunId $runId -Scope task -Phase "Phase6" -ArtifactId "phase6_result.json" -TaskId $taskId
+        }
+        catch {
+            $artifact = $null
+        }
+
+        $artifactObject = ConvertTo-RelayHashtable -InputObject $artifact
+        if (-not $artifactObject -or [string]$artifactObject["verdict"] -ne "reject") {
+            continue
+        }
+
+        $rollbackPhase = [string]$artifactObject["rollback_phase"]
+        if (-not (Test-TaskScopedPhase -Phase $rollbackPhase)) {
+            continue
+        }
+
+        if ([string]$taskState["status"] -eq "in_progress" -and [string]$taskState["phase_cursor"] -eq $rollbackPhase) {
+            continue
+        }
+
+        $previousStatus = [string]$taskState["status"]
+        $previousPhaseCursor = [string]$taskState["phase_cursor"]
+        $taskState["status"] = "in_progress"
+        $taskState["phase_cursor"] = $rollbackPhase
+        $taskState["active_job_id"] = $null
+        $taskState["wait_reason"] = $null
+        $state["task_states"][$taskId] = $taskState
+
+        if (@(Get-RunStateActiveJobIds -RunState $state).Count -eq 0 -and -not $state["pending_approval"]) {
+            $state["status"] = "running"
+            $state["current_phase"] = $rollbackPhase
+            $state["current_role"] = Resolve-PhaseRole -Phase $rollbackPhase
+            $state["current_task_id"] = $taskId
+            $state["active_job_id"] = $null
+        }
+
+        $recoveredTasks.Add([ordered]@{
+            task_id = $taskId
+            previous_status = $previousStatus
+            status = "in_progress"
+            previous_phase_cursor = $previousPhaseCursor
+            phase_cursor = $rollbackPhase
+            reason = "phase6_reject_rollback"
+        }) | Out-Null
+    }
+
+    if ($recoveredTasks.Count -eq 0) {
+        return @{
+            changed = $false
+            run_state = $state
+            recovered_tasks = @()
+        }
+    }
+
+    $state["updated_at"] = (Get-Date).ToString("o")
+    return @{
+        changed = $true
+        run_state = $state
+        recovered_tasks = @($recoveredTasks.ToArray())
+    }
+}
+
 function Get-NextAction {
     param(
         [Parameter(Mandatory)]$RunState,
@@ -1200,8 +1434,37 @@ function Get-NextAction {
     $selectedTask = $null
 
     if (Test-TaskScopedPhase -Phase $phase) {
+        if (-not [string]::IsNullOrWhiteSpace($taskId)) {
+            $cursorTaskState = if ($state["task_states"].ContainsKey($taskId)) { ConvertTo-RelayHashtable -InputObject $state["task_states"][$taskId] } else { $null }
+            $cursorStatus = if ($cursorTaskState) { [string]$cursorTaskState["status"] } else { "" }
+            $cursorActiveJobId = if ($cursorTaskState) { [string]$cursorTaskState["active_job_id"] } else { "" }
+            $cursorPhase = Resolve-TaskLaneCandidatePhase -TaskState $cursorTaskState -CurrentPhase $phase
+            $cursorDispatchable = (
+                $cursorTaskState -and
+                [string]::IsNullOrWhiteSpace($cursorActiveJobId) -and
+                $cursorStatus -ne "completed" -and
+                (
+                    ($cursorStatus -eq "ready" -and $cursorPhase -eq "Phase5") -or
+                    ($cursorStatus -eq "in_progress" -and $cursorPhase -eq $phase)
+                )
+            )
+            if (-not $cursorDispatchable) {
+                $taskId = $null
+            }
+        }
+
         if ([string]::IsNullOrWhiteSpace($taskId)) {
-            $taskId = Resolve-NextReadyTaskId -RunState $state
+            $candidates = @(Get-BatchLeaseCandidates -RunState $state -ProjectRoot $ProjectRoot)
+            $samePhaseCandidate = @($candidates | Where-Object { [string]$_["phase"] -eq $phase } | Select-Object -First 1)
+            $selectedCandidate = if (@($samePhaseCandidate).Count -gt 0) { $samePhaseCandidate[0] } elseif ($candidates.Count -gt 0) { $candidates[0] } else { $null }
+            if ($selectedCandidate) {
+                $taskId = [string]$selectedCandidate["task_id"]
+                $phase = [string]$selectedCandidate["phase"]
+                $role = Resolve-PhaseRole -Phase $phase
+            }
+            else {
+                $taskId = Resolve-NextReadyTaskId -RunState $state
+            }
             if ([string]::IsNullOrWhiteSpace($taskId)) {
                 return [ordered]@{
                     type = "Wait"
@@ -1313,6 +1576,14 @@ function Apply-JobResult {
     $phase = if ($job["phase"]) { [string]$job["phase"] } else { [string]$state["current_phase"] }
     $taskId = if ($job["task_id"]) { [string]$job["task_id"] } else { [string]$state["current_task_id"] }
     $spawnedTasks = @()
+    $verdict = "go"
+    if ($artifactObject -and $artifactObject.ContainsKey("verdict")) {
+        $verdict = [string]$artifactObject["verdict"]
+    }
+    $rollbackPhase = $null
+    if ($artifactObject) {
+        $rollbackPhase = [string]$artifactObject["rollback_phase"]
+    }
 
     $state = Apply-ArtifactOpenRequirementDelta -RunState $state -Artifact $artifactObject -Phase $phase -TaskId $taskId
 
@@ -1321,7 +1592,7 @@ function Apply-JobResult {
         $taskState["last_completed_phase"] = $phase
         $taskState["active_job_id"] = $null
         $taskState["wait_reason"] = $null
-        if ($phase -eq "Phase6") {
+        if ($phase -eq "Phase6" -and $verdict -in @("go", "conditional_go")) {
             $taskState["status"] = "completed"
         }
         else {
@@ -1331,6 +1602,9 @@ function Apply-JobResult {
                 "Phase5" { $nextTaskPhase = "Phase5-1" }
                 "Phase5-1" { $nextTaskPhase = "Phase5-2" }
                 "Phase5-2" { $nextTaskPhase = "Phase6" }
+            }
+            if ($phase -eq "Phase6" -and $verdict -eq "reject" -and (Test-TaskScopedPhase -Phase $rollbackPhase)) {
+                $nextTaskPhase = $rollbackPhase
             }
             if ($nextTaskPhase) {
                 $taskState["phase_cursor"] = $nextTaskPhase
@@ -1348,6 +1622,20 @@ function Apply-JobResult {
         $spawnedTasks = @($artifactObject["follow_up_tasks"])
     }
 
+    if ((Test-TaskScopedPhase -Phase $phase) -and @(Get-RunStateActiveJobIds -RunState $state).Count -gt 0) {
+        $state["status"] = "running"
+        return [ordered]@{
+            run_state = $state
+            action = @{
+                type = "WaitForParallelSiblings"
+                phase = $phase
+                task_id = $taskId
+                active_job_ids = @(Get-RunStateActiveJobIds -RunState $state)
+            }
+            spawned_tasks = $spawnedTasks
+        }
+    }
+
     if ($phase -eq "Phase8") {
         $state["status"] = "completed"
         $state["current_phase"] = "Phase8"
@@ -1360,11 +1648,6 @@ function Apply-JobResult {
             }
             spawned_tasks = $spawnedTasks
         }
-    }
-
-    $verdict = "go"
-    if ($artifactObject -and $artifactObject.ContainsKey("verdict")) {
-        $verdict = [string]$artifactObject["verdict"]
     }
 
     if ($phase -eq "Phase7" -and $verdict -eq "go" -and @($state["open_requirements"]).Count -gt 0) {
@@ -1386,11 +1669,6 @@ function Apply-JobResult {
             }
             spawned_tasks = $spawnedTasks
         }
-    }
-
-    $rollbackPhase = $null
-    if ($artifactObject) {
-        $rollbackPhase = [string]$artifactObject["rollback_phase"]
     }
 
     $transition = Resolve-Transition -ProjectRoot $ProjectRoot -CurrentPhase $phase -Verdict $verdict -RollbackPhase $rollbackPhase

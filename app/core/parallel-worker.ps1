@@ -319,6 +319,10 @@ function Test-LeasedJobCommitFence {
         $errors.Add([string]$error)
     }
 
+    if ([string]$state["status"] -ne "running") {
+        $errors.Add("run status '$($state['status'])' does not allow job commit for job '$jobId'")
+    }
+
     $lease = ConvertTo-RelayHashtable -InputObject $leaseResult["lease"]
     if ($lease) {
         if ([string]$lease["job_id"] -ne $jobId) {
@@ -769,7 +773,31 @@ function Invoke-LeasedJobPackage {
                 $boundaryResult = $null
                 if (Get-Command Test-WorkspaceBoundaryDelta -ErrorAction SilentlyContinue) {
                     $workspacePackage = ConvertTo-RelayHashtable -InputObject $packageObject["workspace"]
-                    $boundaryResult = ConvertTo-RelayHashtable -InputObject (Test-WorkspaceBoundaryDelta -WorkspaceRoot $workingDirectory -BaselineSnapshot $workspacePackage["baseline"] -DeclaredChangedFiles @($workspacePackage["declared_changed_files"]) -ResourceLocks @($packageObject["resource_locks"]))
+                    $boundaryExcludePaths = @(
+                        "artifacts",
+                        "jobs",
+                        "runs",
+                        "docs/worklog",
+                        "tasks/task.md",
+                        "relay-dev/artifacts",
+                        "relay-dev/jobs",
+                        "relay-dev/runs",
+                        "relay-dev/docs/worklog",
+                        "relay-dev/tasks/task.md",
+                        "probe.txt",
+                        "write-probe.txt",
+                        "__write_test.tmp"
+                    )
+                    foreach ($contractRaw in @($phaseDefinition["output_contract"])) {
+                        $contract = ConvertTo-RelayHashtable -InputObject $contractRaw
+                        $artifactId = [string]$contract["artifact_id"]
+                        if ([string]::IsNullOrWhiteSpace($artifactId)) {
+                            continue
+                        }
+                        $boundaryExcludePaths += $artifactId
+                        $boundaryExcludePaths += "relay-dev/$artifactId"
+                    }
+                    $boundaryResult = ConvertTo-RelayHashtable -InputObject (Test-WorkspaceBoundaryDelta -WorkspaceRoot $workingDirectory -BaselineSnapshot $workspacePackage["baseline"] -DeclaredChangedFiles @($workspacePackage["declared_changed_files"]) -ResourceLocks @($packageObject["resource_locks"]) -AdditionalExcludePaths $boundaryExcludePaths)
                     if ($boundaryResult -and -not [bool]$boundaryResult["ok"]) {
                         $boundaryErrors = @(
                             @($boundaryResult["unexpected_changed_files"]) | ForEach-Object { "unexpected workspace change: $_" }
@@ -822,6 +850,21 @@ function Invoke-LeasedJobPackage {
 
         if ($leasedCommitState["rejected"]) {
             $commitRejected = ConvertTo-RelayHashtable -InputObject $leasedCommitState["rejected"]
+            $rejectedState = if ($leasedCommitState["state"]) { ConvertTo-RelayHashtable -InputObject $leasedCommitState["state"] } else { Read-RunState -ProjectRoot $ProjectRoot -RunId $runId }
+            if ($rejectedState) {
+                $rejectedState = Clear-RunStateActiveJobLease -RunState $rejectedState -JobId ([string]$jobSpec["job_id"])
+                if ([string]$rejectedState["status"] -eq "running") {
+                    $rejectedState["status"] = "failed"
+                }
+                $rejectedState["updated_at"] = (Get-Date).ToString("o")
+                Write-RunState -ProjectRoot $ProjectRoot -RunState $rejectedState | Out-Null
+                Append-LeasedJobRunStatusChangedEvent -ProjectRoot $ProjectRoot -RunId $runId -RunState $rejectedState
+                Append-Event -ProjectRoot $ProjectRoot -RunId $runId -Event @{
+                    type = "run.failed"
+                    reason = [string]$commitRejected["reason"]
+                    failure_class = "commit_rejected"
+                }
+            }
             Append-Event -ProjectRoot $ProjectRoot -RunId $runId -Event @{
                 type = "job.commit_rejected"
                 job_id = [string]$jobSpec["job_id"]
