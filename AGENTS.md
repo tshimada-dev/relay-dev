@@ -20,6 +20,8 @@ After any substantive code, documentation, test, configuration, planning, or rep
 - Mention in the final response whether the worklog was updated.
 - If no worklog was updated, explain why in the final response.
 
+This worklog rule is for human-operated repository maintenance and Codex sessions outside relay-dev runtime jobs. relay-dev Implementer, Reviewer, and Repairer provider jobs must follow `app/prompts/system/*.md` instead and must not create or edit `docs/worklog/*` unless the selected task explicitly requires worklog documentation or fixtures.
+
 ## Delegated Implementation
 
 For broad implementation work where the user explicitly asks for the task-list JSON, reviewer-agent, parent TODO management, worker delegation, and parent final verification flow, use `skills/delegated-implementation/SKILL.md`.

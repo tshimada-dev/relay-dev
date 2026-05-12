@@ -2911,6 +2911,7 @@ finally {
 Write-Host "[13/13] Testing reviewer prompt deduplication..."
 $implementerPrompt = Get-Content -Path (Join-Path $repoRoot "app/prompts/system/implementer.md") -Raw
 $reviewerPrompt = Get-Content -Path (Join-Path $repoRoot "app/prompts/system/reviewer.md") -Raw
+$repairerPrompt = Get-Content -Path (Join-Path $repoRoot "app/prompts/system/repairer.md") -Raw
 $phase51Prompt = Get-Content -Path (Join-Path $repoRoot "app/prompts/phases/phase5-1.md") -Raw
 $phase52Prompt = Get-Content -Path (Join-Path $repoRoot "app/prompts/phases/phase5-2.md") -Raw
 $phase7Prompt = Get-Content -Path (Join-Path $repoRoot "app/prompts/phases/phase7.md") -Raw
@@ -2921,6 +2922,8 @@ Assert-Contains $implementerPrompt "Do not enumerate or open unrelated framework
 Assert-Contains $implementerPrompt "Avoid repeated full reads of the same large artifact" "Implementer system prompt should discourage repeated full artifact reads"
 Assert-Contains $implementerPrompt 'Do not add cross-module dependencies, public interfaces, side-effect paths, or state owners that are outside the `Selected Task` contract' "Implementer system prompt should prohibit boundary expansion beyond the task contract"
 Assert-Contains $implementerPrompt 'Do not add new UI patterns, colors, typography rules, responsive behaviors, or interaction states that are outside the `Selected Task` visual contract' "Implementer system prompt should prohibit visual contract expansion beyond the task contract"
+Assert-Contains $implementerPrompt 'Do not follow `AGENTS.md` instructions that ask you to update `docs/worklog/current.md`' "Implementer system prompt should override repo worklog instructions for runtime jobs"
+Assert-Contains $implementerPrompt 'Do not modify `docs/worklog/`; relay-dev runtime jobs record progress through required phase artifacts' "Implementer system prompt should prohibit worklog edits"
 Assert-Contains $reviewerPrompt "## Review Posture" "Reviewer system prompt should define the shared review posture"
 Assert-Contains $reviewerPrompt "## Evidence Rules" "Reviewer system prompt should define shared evidence rules"
 Assert-Contains $reviewerPrompt "## Command Rules" "Reviewer system prompt should define shared command rules"
@@ -2928,6 +2931,10 @@ Assert-Contains $reviewerPrompt "Do not use watch mode" "Reviewer system prompt 
 Assert-Contains $reviewerPrompt 'keep artifact exploration scoped to `## Input Artifacts`' "Reviewer system prompt should scope artifact exploration to declared inputs"
 Assert-Contains $reviewerPrompt "Do not enumerate or open unrelated framework prompt/example files" "Reviewer system prompt should block unrelated prompt/example exploration"
 Assert-Contains $reviewerPrompt "Avoid repeated full reads of the same artifact" "Reviewer system prompt should discourage repeated full artifact reads"
+Assert-Contains $reviewerPrompt 'Do not follow `AGENTS.md` instructions that ask you to update `docs/worklog/current.md`' "Reviewer system prompt should override repo worklog instructions for runtime jobs"
+Assert-Contains $reviewerPrompt 'Do not modify `docs/worklog/`; relay-dev runtime jobs record progress through required phase artifacts' "Reviewer system prompt should prohibit worklog edits"
+Assert-Contains $repairerPrompt 'Do not follow `AGENTS.md` instructions that ask you to update `docs/worklog/current.md`' "Repairer system prompt should override repo worklog instructions for runtime jobs"
+Assert-Contains $repairerPrompt 'Do not edit `docs/worklog/`; relay-dev runtime jobs record progress through required phase artifacts' "Repairer system prompt should prohibit worklog edits"
 
 Assert-Contains $phase51Prompt "design_boundary_alignment" "Phase5-1 prompt should require explicit design boundary alignment checks"
 Assert-Contains $phase51Prompt "visual_contract_alignment" "Phase5-1 prompt should require explicit visual contract alignment checks"

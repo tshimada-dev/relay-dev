@@ -10,14 +10,20 @@ logs/
 queue/.prompt_*.txt
 queue/status.lock
 
+# Local provider/runtime configuration.
+# Copy one of config/settings-*.yaml.example to config/settings.yaml.
+config/settings.yaml
+
 # Runtime state and generated projections
 runs/
 dashboard.md
 queue/status.yaml
 outputs/*
 !outputs/.gitkeep
-!outputs/phase0_context.md
-!outputs/phase0_context.json
+
+# Local run input prepared by relay-dev skills/operators.
+# Keep tasks/task.md.example tracked as the template.
+tasks/task.md
 
 # OS files
 Thumbs.db

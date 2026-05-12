@@ -133,7 +133,7 @@ Phase0 -> Phase1 -> [Phase2 fallback] -> Phase3 -> Phase3-1
 
 | ファイル | 用途 |
 | --- | --- |
-| [config/settings.yaml](./config/settings.yaml) | 現在の実行設定（既定: Codex CLI） |
+| `config/settings.yaml` | ローカル実行設定（Git 管理外。下記 example からコピー） |
 | `config/settings-codex.yaml.example` | Codex 用サンプル |
 | `config/settings-gemini.yaml.example` | Gemini 用サンプル |
 | `config/settings-claude.yaml.example` | Claude Code 用サンプル |
@@ -214,7 +214,7 @@ relay-dev/
 │   ├── execution/             # provider dispatch & job runner
 │   ├── phases/                # phase registry / per-phase modules
 │   └── prompts/               # agent-facing prompts (system & per-phase)
-├── config/                    # settings.yaml + provider examples
+├── config/                    # local settings.yaml + provider examples
 ├── docs/                      # architecture / plans / evaluations / ideas / worklog
 ├── examples/                  # public sanitized examples (manifest required)
 ├── outputs/                   # compatibility projection (auto-generated)

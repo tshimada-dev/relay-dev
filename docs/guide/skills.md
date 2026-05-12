@@ -190,6 +190,8 @@ pwsh -NoLogo -NoProfile -File .\skills\relay-dev-dummy-run\scripts\new-relay-dev
 
 `docs/worklog/YYYY-MM-DD.md` への追記運用を司る skill です。`AGENTS.md` の指示に従い、substantive な変更のあとに必ず invoke します。記録項目は `Summary` / `Changed` / `Verified` / `Remaining` に正規化されます。
 
+この skill は、人間が対話している Codex セッションや repo 保守作業のためのものです。relay-dev が起動する Implementer / Reviewer / Repairer provider job は `app/prompts/system/*.md` の指示を優先し、`docs/worklog/` を作成・更新しません。run 内の進捗や根拠は、各 phase の required artifact に記録します。
+
 ## 推奨フロー
 
 ```text
@@ -201,7 +203,7 @@ pwsh -NoLogo -NoProfile -File .\skills\relay-dev-dummy-run\scripts\new-relay-dev
 6. (run が止まった場合) relay-dev-troubleshooter で原因切り分け
 7. (方針変更時) relay-dev-course-corrector で rollback / pause / pivot / restart を選定
 8. (動作確認用の状態が欲しい場合) relay-dev-dummy-run で disposable run を生成
-9. AI: 重要な変更のあとに worklog skill で日次ログを更新
+9. 人間対話中の AI: repo 保守作業の重要な変更だけ worklog skill で日次ログを更新
 ```
 
 ## skill 間の依存
