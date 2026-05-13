@@ -5,10 +5,8 @@ function Test-ConfigValues {
     param([hashtable]$ConfigHash)
     
     $requiredIntegers = @(
-        "escalation.phase1_timeout_sec",
-        "escalation.phase2_timeout_sec",
-        "escalation.phase3_timeout_sec",
         "execution.max_parallel_jobs",
+        "execution.max_retries",
         "watcher.poll_fallback_sec",
         "lock.retry_count",
         "lock.retry_delay_ms",
@@ -26,16 +24,9 @@ function Test-ConfigValues {
         }
     }
     
-    # Check timeout values are in correct order
-    $phase1 = [int](Get-DefaultValue $ConfigHash["escalation.phase1_timeout_sec"] "120")
-    $phase2 = [int](Get-DefaultValue $ConfigHash["escalation.phase2_timeout_sec"] "240")
-    $phase3 = [int](Get-DefaultValue $ConfigHash["escalation.phase3_timeout_sec"] "480")
-    
-    if ($phase1 -ge $phase2) {
-        $errors += "Config error: escalation.phase1_timeout_sec ($phase1) must be less than phase2_timeout_sec ($phase2)"
-    }
-    if ($phase2 -ge $phase3) {
-        $errors += "Config error: escalation.phase2_timeout_sec ($phase2) must be less than phase3_timeout_sec ($phase3)"
+    $restartAfterRaw = Get-DefaultValue $ConfigHash["execution.restart_after_sec"] $ConfigHash["escalation.phase2_timeout_sec"]
+    if ($restartAfterRaw -and -not ($restartAfterRaw -match '^\d+$')) {
+        $errors += "Config error: execution.restart_after_sec must be an integer (got '$restartAfterRaw')"
     }
 
     $executionMode = (Get-DefaultValue $ConfigHash["execution.mode"] "auto").ToString().Trim().ToLowerInvariant()
@@ -43,9 +34,19 @@ function Test-ConfigValues {
         $errors += "Config error: execution.mode must be single, auto, or parallel (got '$executionMode')"
     }
 
+    $restartAfterSec = [int](Get-DefaultValue $restartAfterRaw "6000")
+    if ($restartAfterSec -lt 0) {
+        $errors += "Config error: execution.restart_after_sec ($restartAfterSec) must be zero or greater"
+    }
+
     $maxParallelJobs = [int](Get-DefaultValue $ConfigHash["execution.max_parallel_jobs"] "2")
     if ($maxParallelJobs -lt 1) {
         $errors += "Config error: execution.max_parallel_jobs ($maxParallelJobs) must be at least 1"
+    }
+
+    $maxRetries = [int](Get-DefaultValue $ConfigHash["execution.max_retries"] "1")
+    if ($maxRetries -lt 0) {
+        $errors += "Config error: execution.max_retries ($maxRetries) must be zero or greater"
     }
 
     $allowSingleParallelJob = (Get-DefaultValue $ConfigHash["execution.allow_single_parallel_job"] "true").ToString().Trim().ToLowerInvariant()
@@ -120,11 +121,8 @@ function Initialize-Settings {
     $script:ExecutionMode = (Get-DefaultValue $Config["execution.mode"] "auto").ToString().Trim().ToLowerInvariant()
     $script:ExecutionMaxParallelJobs = [int](Get-DefaultValue $Config["execution.max_parallel_jobs"] "2")
     $script:ExecutionAllowSingleParallelJob = ((Get-DefaultValue $Config["execution.allow_single_parallel_job"] "true").ToString().Trim().ToLowerInvariant() -eq "true")
-    
-    # Escalation settings
-    $script:EscPhase1Sec = [int](Get-DefaultValue $Config["escalation.phase1_timeout_sec"]      "120")
-    $script:EscPhase2Sec = [int](Get-DefaultValue $Config["escalation.phase2_timeout_sec"]      "240")
-    $script:EscPhase3Sec = [int](Get-DefaultValue $Config["escalation.phase3_timeout_sec"]      "480")
+    $script:ExecutionRestartAfterSec = [int](Get-DefaultValue $Config["execution.restart_after_sec"] (Get-DefaultValue $Config["escalation.phase2_timeout_sec"] "6000"))
+    $script:ExecutionMaxRetries = [int](Get-DefaultValue $Config["execution.max_retries"] "1")
     
     # Lock settings
     $script:LockRetryCount = [int](Get-DefaultValue $Config["lock.retry_count"]                   "30")

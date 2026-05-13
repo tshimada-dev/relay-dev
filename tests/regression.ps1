@@ -701,9 +701,7 @@ $result | ConvertTo-Json -Compress
         prompt_mode = "argv"
         prompt_flag = "-p"
     } -PromptText "line1`nline2" -WorkingDirectory $repoRoot -Attempt 1 -TimeoutPolicy @{
-        warn_after_sec = 0
-        retry_after_sec = 0
-        abort_after_sec = 0
+        restart_after_sec = 0
     }
     $argvPayload = ConvertTo-RelayHashtable -InputObject (($argvAttempt["stdout"] | ConvertFrom-Json))
     Assert-Equal $argvPayload["count"] 3 "Execution runner should preserve argv prompt transport for .ps1 commands without splitting multiline prompts"
@@ -1572,9 +1570,7 @@ try {
         fake_stdout = "fake success"
         fake_exit_code = 0
     } -PromptText "hello" -ProjectRoot $tempFakeRoot -WorkingDirectory $tempFakeRoot -TimeoutPolicy @{
-        warn_after_sec = 0
-        retry_after_sec = 0
-        abort_after_sec = 0
+        restart_after_sec = 0
         max_retries = 0
     }
     Assert-Equal $successResult["result_status"] "succeeded" "Fake provider success should be normalized as succeeded"
@@ -1582,6 +1578,52 @@ try {
     $successJobMetadata = Read-JobMetadata -ProjectRoot $tempFakeRoot -RunId "run-fake-provider" -JobId "job-fake-success"
     Assert-Equal $successJobMetadata["status"] "finished" "Execution runner should persist finished job metadata"
     Assert-Equal $successJobMetadata["result_status"] "succeeded" "Finished job metadata should store normalized result status"
+
+    $retrySuccessScriptPath = Join-Path $tempFakeRoot "retry-success.ps1"
+    $retrySuccessAttemptsPath = Join-Path $tempFakeRoot "retry-success-attempts.txt"
+    @"
+`$attemptsPath = "$retrySuccessAttemptsPath"
+`$attempt = 1
+if (Test-Path -LiteralPath `$attemptsPath) {
+    `$attempt = [int](Get-Content -Path `$attemptsPath -Raw) + 1
+}
+Set-Content -Path `$attemptsPath -Value ([string]`$attempt) -Encoding UTF8
+if (`$attempt -eq 1) {
+    Start-Sleep -Seconds 5
+    exit 3
+}
+Write-Output "retry success"
+exit 0
+"@ | Set-Content -Path $retrySuccessScriptPath -Encoding UTF8
+    $retrySuccessResult = Invoke-ExecutionRunner -JobSpec @{
+        run_id = "run-fake-provider"
+        job_id = "job-retry-timeout-then-success"
+        phase = "Phase1"
+        role = "implementer"
+        provider = "generic-cli"
+        command = "pwsh"
+        flags = "-NoLogo -NoProfile -ExecutionPolicy Bypass -File `"$retrySuccessScriptPath`""
+    } -PromptText "retry success" -ProjectRoot $tempFakeRoot -WorkingDirectory $tempFakeRoot -TimeoutPolicy @{
+        restart_after_sec = 1
+        max_retries = 1
+    }
+    Assert-Equal $retrySuccessResult["result_status"] "succeeded" "Retry after timeout should return succeeded when the second attempt succeeds"
+    Assert-Equal $retrySuccessResult["failure_class"] $null "Retry success should clear timeout failure_class"
+    Assert-Equal $retrySuccessResult["exit_code"] 0 "Retry success should return the successful attempt exit code"
+    Assert-Equal $retrySuccessResult["timed_out"] $false "Retry success should clear timed_out in the returned result"
+    Assert-Equal $retrySuccessResult["was_escalated"] $false "Retry success should not report escalation"
+    $retrySuccessJobMetadata = Read-JobMetadata -ProjectRoot $tempFakeRoot -RunId "run-fake-provider" -JobId "job-retry-timeout-then-success"
+    Assert-Equal $retrySuccessJobMetadata["status"] "finished" "Retry success job metadata should be finished"
+    Assert-Equal $retrySuccessJobMetadata["result_status"] "succeeded" "Retry success job metadata should store succeeded"
+    Assert-Equal $retrySuccessJobMetadata["failure_class"] $null "Retry success job metadata should clear timeout failure_class"
+    Assert-Equal $retrySuccessJobMetadata["exit_code"] 0 "Retry success job metadata should store the successful attempt exit code"
+    Assert-Equal $retrySuccessJobMetadata["timed_out"] $false "Retry success job metadata should clear timed_out"
+    Assert-Equal $retrySuccessJobMetadata["was_escalated"] $false "Retry success job metadata should not report escalation"
+    $retrySuccessFinishedEvent = Get-LastEvent -ProjectRoot $tempFakeRoot -RunId "run-fake-provider" -Type "job.finished"
+    Assert-Equal $retrySuccessFinishedEvent["job_id"] "job-retry-timeout-then-success" "Retry success should persist a matching job.finished event"
+    Assert-Equal $retrySuccessFinishedEvent["result_status"] "succeeded" "Retry success job.finished event should store succeeded"
+    Assert-Equal $retrySuccessFinishedEvent["failure_class"] $null "Retry success job.finished event should clear timeout failure_class"
+    Assert-Equal $retrySuccessFinishedEvent["exit_code"] 0 "Retry success job.finished event should store the successful attempt exit code"
 
     $secretResult = Invoke-ExecutionRunner -JobSpec @{
         run_id = "run-fake-provider"
@@ -1593,9 +1635,7 @@ try {
         fake_stderr = "Authorization: Bearer token1234567890"
         fake_exit_code = 0
     } -PromptText "hello" -ProjectRoot $tempFakeRoot -WorkingDirectory $tempFakeRoot -TimeoutPolicy @{
-        warn_after_sec = 0
-        retry_after_sec = 0
-        abort_after_sec = 0
+        restart_after_sec = 0
         max_retries = 0
     }
     $secretStdout = Get-Content -Path $secretResult["stdout_path"] -Raw -Encoding UTF8
@@ -1616,9 +1656,7 @@ try {
         provider = "fake-provider"
         fake_mode = "echo_prompt"
     } -PromptText $utf8Prompt -ProjectRoot $tempFakeRoot -WorkingDirectory $tempFakeRoot -TimeoutPolicy @{
-        warn_after_sec = 0
-        retry_after_sec = 0
-        abort_after_sec = 0
+        restart_after_sec = 0
         max_retries = 0
     }
     Assert-Equal $echoPromptResult["result_status"] "succeeded" "Fake provider prompt echo should succeed"
@@ -1633,9 +1671,7 @@ try {
         fake_stderr = "fake failure"
         fake_mode = "failure"
     } -PromptText "hello" -ProjectRoot $tempFakeRoot -WorkingDirectory $tempFakeRoot -TimeoutPolicy @{
-        warn_after_sec = 0
-        retry_after_sec = 0
-        abort_after_sec = 0
+        restart_after_sec = 0
         max_retries = 0
     }
     Assert-Equal $failureResult["failure_class"] "provider_error" "Fake provider failure should map to provider_error"
@@ -1649,9 +1685,7 @@ try {
         command = "C:\\definitely-missing\\relay-dev-provider.exe"
         flags = ""
     } -PromptText "hello" -ProjectRoot $tempFakeRoot -WorkingDirectory $tempFakeRoot -TimeoutPolicy @{
-        warn_after_sec = 0
-        retry_after_sec = 0
-        abort_after_sec = 0
+        restart_after_sec = 0
         max_retries = 0
     }
     Assert-Equal $startFailureResult["result_status"] "failed" "Start failures should return a failed execution result instead of throwing"
@@ -1690,9 +1724,7 @@ Start-Sleep -Seconds 30
         command = $artifactRecoveryScriptPath
         flags = "--autopilot --yolo --max-autopilot-continues 30"
     } -PromptText "artifact recovery" -ProjectRoot $tempFakeRoot -WorkingDirectory $tempFakeRoot -TimeoutPolicy @{
-        warn_after_sec = 0
-        retry_after_sec = 0
-        abort_after_sec = 0
+        restart_after_sec = 0
         max_retries = 0
     } -ArtifactCompletionProbe $artifactRecoveryProbe -ArtifactCompletionStabilitySec 3
     $artifactRecoveryElapsedSec = [int]((Get-Date) - $artifactRecoveryStartedAt).TotalSeconds

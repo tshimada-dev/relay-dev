@@ -19,15 +19,14 @@ cli:
   reviewer_command: ""     # 空欄 = command を使用
   reviewer_flags: ""
 
-escalation:
-  phase1_timeout_sec: 300
-  phase2_timeout_sec: 600
-  phase3_timeout_sec: 1200
-
 execution:
   # `single` = 常に直列実行。
   # `auto` / `parallel` = task-scoped lane で task group 並列化を許可。
   mode: single
+  # 1 attempt が長引いたときに provider process を再起動する秒数。
+  restart_after_sec: 6000
+  # timeout restart を何回まで追加で試すか。1 = 初回 + 1 retry。
+  max_retries: 1
   # 並列化するときは 2 以上にする。
   max_parallel_jobs: 1
   # 1 worker だけの task group を作らない既定。

@@ -567,25 +567,12 @@ function Invoke-ExecutionAttempt {
         [Parameter(Mandatory)]$TimeoutPolicy,
         [scriptblock]$ArtifactCompletionProbe,
         [int]$ArtifactCompletionStabilitySec = 5,
-        [scriptblock]$OnStarted,
-        [scriptblock]$OnWarn,
-        [scriptblock]$OnRetry,
-        [scriptblock]$OnAbort
+        [scriptblock]$OnStarted
     )
 
-    $warnAfter = 0
-    if ($TimeoutPolicy["warn_after_sec"]) {
-        $warnAfter = [int]$TimeoutPolicy["warn_after_sec"]
-    }
-
-    $retryAfter = 0
-    if ($TimeoutPolicy["retry_after_sec"]) {
-        $retryAfter = [int]$TimeoutPolicy["retry_after_sec"]
-    }
-
-    $abortAfter = 0
-    if ($TimeoutPolicy["abort_after_sec"]) {
-        $abortAfter = [int]$TimeoutPolicy["abort_after_sec"]
+    $restartAfter = 0
+    if ($TimeoutPolicy["restart_after_sec"]) {
+        $restartAfter = [int]$TimeoutPolicy["restart_after_sec"]
     }
 
     $resolvedInvocation = Resolve-ProcessInvocationSpec -InvocationSpec $InvocationSpec
@@ -638,8 +625,7 @@ function Invoke-ExecutionAttempt {
             started_at = $startedAt.ToString("o")
             finished_at = $finishedAt.ToString("o")
             elapsed_sec = [int](($finishedAt - $startedAt).TotalSeconds)
-            should_retry = $false
-            was_aborted = $false
+            timed_out = $false
             artifact_completed = $false
             artifact_completion = $null
         }
@@ -678,9 +664,7 @@ function Invoke-ExecutionAttempt {
         }
     }
 
-    $warned = $false
-    $shouldRetry = $false
-    $wasAborted = $false
+    $timedOut = $false
     $artifactCompleted = $false
     $artifactCompletion = $null
     $artifactCompletionCandidate = $null
@@ -697,6 +681,9 @@ function Invoke-ExecutionAttempt {
         Start-Sleep -Seconds 1
         Drain-ExecutionEventStream -SourceIdentifier $stdoutEventId -Target $stdoutLines -StreamName "stdout"
         Drain-ExecutionEventStream -SourceIdentifier $stderrEventId -Target $stderrLines -StreamName "stderr"
+        if ($process.HasExited) {
+            break
+        }
         $elapsed = (Get-Date) - $startedAt
         Write-ExecutionProbeTrace -Payload @{
             detected = $false
@@ -764,50 +751,14 @@ function Invoke-ExecutionAttempt {
             }
         }
 
-        if ($warnAfter -gt 0 -and -not $warned -and $elapsed.TotalSeconds -ge $warnAfter) {
-            $warned = $true
-            if ($OnWarn) {
-                & $OnWarn @{
-                    attempt = $Attempt
-                    elapsed_seconds = [int]$elapsed.TotalSeconds
-                    command = $InvocationSpec["command"]
-                }
-            }
-        }
-
-        if ($retryAfter -gt 0 -and $elapsed.TotalSeconds -ge $retryAfter) {
-            if ($OnRetry) {
-                & $OnRetry @{
-                    attempt = $Attempt
-                    elapsed_seconds = [int]$elapsed.TotalSeconds
-                    command = $InvocationSpec["command"]
-                }
-            }
+        if ($restartAfter -gt 0 -and $elapsed.TotalSeconds -ge $restartAfter) {
             try {
                 $processStopRequested = $true
                 Request-ExecutionProcessStop -Process $process
             }
             catch {
             }
-            $shouldRetry = $true
-            break
-        }
-
-        if ($abortAfter -gt 0 -and $elapsed.TotalSeconds -ge $abortAfter) {
-            try {
-                $processStopRequested = $true
-                Request-ExecutionProcessStop -Process $process
-            }
-            catch {
-            }
-            $wasAborted = $true
-            if ($OnAbort) {
-                & $OnAbort @{
-                    attempt = $Attempt
-                    elapsed_seconds = [int]$elapsed.TotalSeconds
-                    command = $InvocationSpec["command"]
-                }
-            }
+            $timedOut = $true
             break
         }
     }
@@ -860,8 +811,7 @@ function Invoke-ExecutionAttempt {
         started_at = $startedAt.ToString("o")
         finished_at = $finishedAt.ToString("o")
         elapsed_sec = [int](($finishedAt - $startedAt).TotalSeconds)
-        should_retry = $shouldRetry
-        was_aborted = $wasAborted
+        timed_out = $timedOut
         artifact_completed = $artifactCompleted
         artifact_completion = $artifactCompletion
     }
@@ -876,9 +826,7 @@ function Invoke-ExecutionRunner {
         [Parameter(Mandatory)]$TimeoutPolicy,
         [scriptblock]$ArtifactCompletionProbe,
         [int]$ArtifactCompletionStabilitySec = 5,
-        [scriptblock]$OnWarn,
-        [scriptblock]$OnRetry,
-        [scriptblock]$OnAbort
+        [scriptblock]$OnStarted
     )
 
     $job = ConvertTo-RelayHashtable -InputObject $JobSpec
@@ -910,10 +858,11 @@ function Invoke-ExecutionRunner {
     $finalAttemptStartedAt = $null
     $finalFinishedAt = $null
     $finalExitCode = 1
-    $wasEscalated = $false
+    $timedOut = $false
     $recoveredFromArtifacts = $false
     $artifactCompletion = $null
     $currentAttemptId = Get-ExecutionAttemptId -Attempt $attempt
+    $forwardOnStarted = $OnStarted
 
     if ($runId) {
         Append-Event -ProjectRoot $ProjectRoot -RunId $runId -Event @{
@@ -978,7 +927,10 @@ function Invoke-ExecutionRunner {
                     started_at = $StartedInfo["started_at"]
                 } | Out-Null
             }
-        } -OnWarn $OnWarn -OnRetry $OnRetry -OnAbort $OnAbort
+            if ($forwardOnStarted) {
+                & $forwardOnStarted $StartedInfo
+            }
+        }
         $attemptResult["attempt_id"] = $attemptId
         if (-not $firstStartedAt) {
             $firstStartedAt = $attemptResult["started_at"]
@@ -1000,19 +952,12 @@ function Invoke-ExecutionRunner {
             break
         }
 
-        if ($attemptResult["was_aborted"]) {
-            $resultStatus = "failed"
-            $failureClass = "timeout"
-            $wasEscalated = $true
-            break
-        }
-
-        if ($attemptResult["should_retry"] -and ($attempt -le $maxRetries)) {
-            $attempt++
-            continue
-        }
-
-        if ($attemptResult["should_retry"]) {
+        if ([bool]$attemptResult["timed_out"]) {
+            if ($attempt -le $maxRetries) {
+                $attempt++
+                continue
+            }
+            $timedOut = $true
             $resultStatus = "failed"
             $failureClass = "timeout"
             break
@@ -1021,10 +966,12 @@ function Invoke-ExecutionRunner {
         if ([int]$attemptResult["exit_code"] -eq 0) {
             $resultStatus = "succeeded"
             $failureClass = $null
+            $timedOut = $false
         }
         else {
             $resultStatus = "failed"
             $failureClass = "provider_error"
+            $timedOut = $false
         }
         break
     }
@@ -1059,7 +1006,8 @@ function Invoke-ExecutionRunner {
             exit_code = $finalExitCode
             result_status = $resultStatus
             failure_class = $failureClass
-            was_escalated = $wasEscalated
+            timed_out = $timedOut
+            was_escalated = $timedOut
             recovered_from_artifacts = $recoveredFromArtifacts
             artifact_completion = $artifactCompletion
         } | Out-Null
@@ -1085,6 +1033,7 @@ function Invoke-ExecutionRunner {
             command = $invocationSpec["command"]
             arguments = $invocationSpec["arguments"]
         }
-        was_escalated = $wasEscalated
+        timed_out = $timedOut
+        was_escalated = $timedOut
     }
 }

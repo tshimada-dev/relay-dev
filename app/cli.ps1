@@ -105,10 +105,8 @@ function Resolve-StepRunId {
 
 function Get-StepTimeoutPolicy {
     return @{
-        warn_after_sec = $script:EscPhase1Sec
-        retry_after_sec = $script:EscPhase2Sec
-        abort_after_sec = $script:EscPhase3Sec
-        max_retries = 1
+        restart_after_sec = $script:ExecutionRestartAfterSec
+        max_retries = $script:ExecutionMaxRetries
     }
 }
 

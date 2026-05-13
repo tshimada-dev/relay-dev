@@ -417,9 +417,7 @@ engine は `verify_in_phase` と `required_artifacts` を用いて、
     "framework_root": "C:/Projects/agent/relay-dev"
   },
   "timeout_policy": {
-    "warn_after_sec": 300,
-    "retry_after_sec": 3600,
-    "abort_after_sec": 5400,
+    "restart_after_sec": 6000,
     "max_retries": 1
   }
 }
@@ -1132,9 +1130,7 @@ validator と `JobSpec` は `outputs/` を直接参照しません。
 
 ```json
 {
-  "warn_after_sec": 300,
-  "retry_after_sec": 3600,
-  "abort_after_sec": 5400,
+  "restart_after_sec": 6000,
   "max_retries": 1
 }
 ```
@@ -1152,8 +1148,8 @@ engine 起動時に `run-state.json` の `active_job_id` が non-null のまま
 
 復元ルール:
 
-- `attempt < max_retries` の場合: `failure_class: provider_error` として `job.finished` を補完し、再ディスパッチする
-- `attempt >= max_retries` の場合: `FailRun` アクションを発行し、手動介入を要求する
+- timeout が発生し retry budget が残っている場合: 同じ phase を再ディスパッチする
+- timeout が発生し retry budget を使い切っている場合: `FailRun` アクションを発行し、手動介入を要求する
 
 補完した event には `recovered: true` フラグを付けて監査ログで識別できるようにします。
 

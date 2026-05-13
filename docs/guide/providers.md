@@ -22,6 +22,10 @@ cli:
   command: "codex"
   flags: "--ask-for-approval never exec --skip-git-repo-check --sandbox workspace-write"
 
+execution:
+  restart_after_sec: 6000
+  max_retries: 1
+
 paths:
   project_dir: "."
   design_file: "DESIGN.md"

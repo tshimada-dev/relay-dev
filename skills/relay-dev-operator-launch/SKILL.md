@@ -59,6 +59,8 @@ task / seed が未整備なら `relay-dev-seed-author` へ戻す。
 ```yaml
 execution:
   mode: auto
+  restart_after_sec: 6000
+  max_retries: 1
   max_parallel_jobs: 3
   allow_single_parallel_job: false
 ```

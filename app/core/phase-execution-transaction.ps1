@@ -215,9 +215,6 @@ function Invoke-PhaseExecutionTransaction {
         [AllowNull()][datetime]$PhaseStartedAtUtc,
         [bool]$ArchiveBeforeDispatch = $false,
         [string]$PreviousJobId,
-        [scriptblock]$OnWarn,
-        [scriptblock]$OnRetry,
-        [scriptblock]$OnAbort,
         [scriptblock]$OnRepairStart,
         [scriptblock]$PreCommitGuard,
         [ValidateSet("auto", "job", "attempt")][string]$ArtifactStorageScope = "auto",
@@ -265,15 +262,6 @@ function Invoke-PhaseExecutionTransaction {
     }
     if ($ArtifactCompletionProbe) {
         $executionParams["ArtifactCompletionProbe"] = $ArtifactCompletionProbe
-    }
-    if ($OnWarn) {
-        $executionParams["OnWarn"] = $OnWarn
-    }
-    if ($OnRetry) {
-        $executionParams["OnRetry"] = $OnRetry
-    }
-    if ($OnAbort) {
-        $executionParams["OnAbort"] = $OnAbort
     }
 
     $executionResult = ConvertTo-RelayHashtable -InputObject (Invoke-ExecutionRunner @executionParams)

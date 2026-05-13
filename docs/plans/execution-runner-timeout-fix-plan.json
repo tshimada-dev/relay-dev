@@ -1,0 +1,93 @@
+{
+  "objective": "Fix execution-runner timeout retry state so a successful retry is reported as succeeded and the timeout model is safe to push to main.",
+  "scope": [
+    "app/execution/execution-runner.ps1",
+    "tests/regression.ps1",
+    "docs/plans/execution-runner-timeout-fix-plan.json",
+    "focused verification for timeout, fake-provider, and headless parallel execution"
+  ],
+  "out_of_scope": [
+    "Changing provider invocation semantics beyond timeout/retry state handling",
+    "Reworking the timeout configuration model already present in the current diff",
+    "Broad refactors outside the execution runner and focused regression coverage"
+  ],
+  "constraints": [
+    "Use delegated-implementation with parent-owned plan, integration, and final verification",
+    "Do not revert unrelated uncommitted changes already present in the tree",
+    "Keep worker write scope bounded and avoid overlapping edits",
+    "Preserve artifact-completion recovery behavior",
+    "Preserve restart_after_sec and max_retries semantics"
+  ],
+  "assumptions": [
+    "The known blocker is caused by timeout state persisting after a later attempt exits successfully",
+    "The polling loop may mark timeout after the process exits during the sleep interval unless HasExited is rechecked",
+    "A focused regression can reproduce a first-attempt timeout followed by a second-attempt success without requiring long-running external providers"
+  ],
+  "tasks": [
+    {
+      "id": "ERT-01",
+      "title": "Cover retry success regression",
+      "intent": "Add a stable regression test for the exact main-blocking case discovered in review.",
+      "write_scope": [
+        "tests/regression.ps1"
+      ],
+      "dependencies": [],
+      "parallel_group": "serial",
+      "worker_role": "worker",
+      "acceptance": [
+        "The test demonstrates the current broken behavior before the runner fix when run by the parent",
+        "The test uses local PowerShell scripts and temporary files only",
+        "The test asserts returned result_status=succeeded, failure_class=null, exit_code=0, timed_out=false, and was_escalated=false for a first-attempt timeout followed by retry success",
+        "The test asserts persisted job metadata status=finished, result_status=succeeded, failure_class=null, exit_code=0, timed_out=false, and was_escalated=false for that final successful job",
+        "The test asserts the matching job.finished event records result_status=succeeded, failure_class=null, and exit_code=0",
+        "The test does not add significant runtime beyond the existing regression suite"
+      ],
+      "tests": [
+        "pwsh -NoLogo -NoProfile -File .\\tests\\regression.ps1"
+      ],
+      "risks": [
+        "Timing-sensitive tests can be flaky if sleep durations are too tight",
+        "The test can accidentally depend on wall-clock timing rather than runner state"
+      ],
+      "status": "completed"
+    },
+    {
+      "id": "ERT-02",
+      "title": "Repair timeout retry state",
+      "intent": "Ensure timeout is attempt-local for control flow while final job metadata reflects the final normalized result.",
+      "write_scope": [
+        "app/execution/execution-runner.ps1"
+      ],
+      "dependencies": [
+        "ERT-01"
+      ],
+      "parallel_group": "serial",
+      "worker_role": "worker",
+      "acceptance": [
+        "A provider that times out on attempt 1 and succeeds on attempt 2 returns result_status=succeeded",
+        "The final returned result for that scenario has failure_class=null, exit_code=0, timed_out=false, and was_escalated=false",
+        "The persisted job metadata for that scenario has status=finished, result_status=succeeded, failure_class=null, exit_code=0, timed_out=false, and was_escalated=false",
+        "The matching job.finished event for that scenario records result_status=succeeded, failure_class=null, and exit_code=0",
+        "A provider that times out on all allowed attempts still fails with failure_class=timeout, timed_out=true, and was_escalated=true",
+        "Artifact-completion recovery remains intact"
+      ],
+      "tests": [
+        "pwsh -NoLogo -NoProfile -File .\\tests\\regression.ps1"
+      ],
+      "risks": [
+        "Clearing timeout state too broadly could hide a final timeout failure",
+        "Changing process wait behavior could reintroduce hangs or lose stdout/stderr",
+        "Metadata and job.finished events can diverge from returned results if only one surface is normalized"
+      ],
+      "status": "completed"
+    }
+  ],
+  "verification": [
+    "pwsh -NoLogo -NoProfile -Command parse check for touched .ps1 files",
+    "git diff --check",
+    "focused timeout retry reproduction",
+    "pwsh -NoLogo -NoProfile -File .\\tests\\regression.ps1",
+    "pwsh -NoLogo -NoProfile -File .\\tests\\task-parallelization-headless-execution.ps1"
+  ],
+  "review_status": "passed"
+}

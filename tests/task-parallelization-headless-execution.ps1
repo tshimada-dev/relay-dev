@@ -5,6 +5,7 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 
 . (Join-Path $repoRoot "app\core\run-state-store.ps1")
 . (Join-Path $repoRoot "app\core\artifact-repository.ps1")
+. (Join-Path $repoRoot "app\core\event-store.ps1")
 . (Join-Path $repoRoot "app\core\workflow-engine.ps1")
 
 $failures = New-Object System.Collections.Generic.List[string]
@@ -95,12 +96,10 @@ cli:
   implementer_flags: ""
   reviewer_command: ""
   reviewer_flags: ""
-escalation:
-  phase1_timeout_sec: 300
-  phase2_timeout_sec: 3600
-  phase3_timeout_sec: 5400
 execution:
   mode: auto
+  restart_after_sec: 3600
+  max_retries: 1
   max_parallel_jobs: 2
   allow_single_parallel_job: true
 watcher:
@@ -363,7 +362,55 @@ try {
     if ($cautiousOptInSummary) {
         Assert-Equal $cautiousOptInSummary.status "completed" "cautious opt-in parallel-step should complete the worker batch."
         Assert-Equal $cautiousOptInSummary.leased_count 2 "cautious opt-in parallel-step should lease cautious jobs."
+        Assert-True ([bool]$cautiousOptInSummary.workers.all_succeeded) "cautious opt-in should still require all workers to succeed."
+        Assert-Equal $cautiousOptInSummary.workers.launched_count 2 "cautious opt-in should launch both cautious workers."
+
+        foreach ($worker in @($cautiousOptInSummary.workers.workers)) {
+            $jobId = [string]$worker.job_id
+            Assert-True (-not [string]::IsNullOrWhiteSpace($jobId)) "cautious opt-in workers should report job ids."
+            if ([string]::IsNullOrWhiteSpace($jobId)) {
+                continue
+            }
+
+            $jobMetadata = Read-JobMetadata -ProjectRoot $repoRoot -RunId $cautiousRunId -JobId $jobId
+            Assert-True ($null -ne $jobMetadata) "cautious opt-in should persist finished job metadata for each worker."
+            if ($jobMetadata) {
+                Assert-Equal $jobMetadata["status"] "finished" "cautious opt-in worker metadata should persist finished status."
+                Assert-Equal $jobMetadata["result_status"] "succeeded" "cautious opt-in worker metadata should persist succeeded result status."
+                Assert-Equal ([bool]$jobMetadata["timed_out"]) $false "cautious opt-in worker metadata should not hide a timeout."
+                Assert-Equal ([bool]$jobMetadata["was_escalated"]) $false "cautious opt-in worker metadata should not hide a forced escalation."
+                Assert-Equal ([bool]$jobMetadata["recovered_from_artifacts"]) $false "cautious opt-in worker metadata should not require artifact recovery in the normal path."
+                Assert-True (-not [string]::IsNullOrWhiteSpace([string]$jobMetadata["started_at"])) "cautious opt-in worker metadata should record started_at."
+                Assert-True (-not [string]::IsNullOrWhiteSpace([string]$jobMetadata["finished_at"])) "cautious opt-in worker metadata should record finished_at."
+            }
+
+            $finishedEvent = Get-LastEvent -ProjectRoot $repoRoot -RunId $cautiousRunId -Type "job.finished"
+            $workerFinishedEvent = @(
+                Get-Events -ProjectRoot $repoRoot -RunId $cautiousRunId |
+                    Where-Object { $_["type"] -eq "job.finished" -and [string]$_["job_id"] -eq $jobId } |
+                    Select-Object -Last 1
+            )[0]
+            Assert-True ($null -ne $workerFinishedEvent) "cautious opt-in should append a job.finished event for each worker."
+            if ($workerFinishedEvent) {
+                Assert-Equal $workerFinishedEvent["result_status"] "succeeded" "cautious opt-in worker finished event should persist succeeded result status."
+                Assert-Equal ([bool]$workerFinishedEvent["recovered_from_artifacts"]) $false "cautious opt-in worker finished event should show no artifact recovery."
+            }
+            Assert-True ($null -ne $finishedEvent) "cautious opt-in should persist at least one job.finished event."
+        }
     }
+
+    $cautiousFinalState = Get-Content -Path (Join-Path $repoRoot "runs\$cautiousRunId\run-state.json") -Raw -Encoding UTF8 | ConvertFrom-Json
+    Assert-Equal @($cautiousFinalState.active_jobs.PSObject.Properties).Count 0 "cautious opt-in should clear all active job leases after completion."
+    Assert-Equal $cautiousFinalState.current_phase "Phase5-1" "cautious opt-in should advance the run into Phase5-1 after Phase5 completions."
+    Assert-Equal $cautiousFinalState.current_role "reviewer" "cautious opt-in should hand the run back to the reviewer for Phase5-1."
+    Assert-Equal $cautiousFinalState.task_states."T-cautious-a".status "in_progress" "cautious opt-in should keep T-cautious-a in progress for the next phase."
+    Assert-Equal $cautiousFinalState.task_states."T-cautious-b".status "in_progress" "cautious opt-in should keep T-cautious-b in progress for the next phase."
+    Assert-Equal $cautiousFinalState.task_states."T-cautious-a".last_completed_phase "Phase5" "cautious opt-in should persist Phase5 completion for T-cautious-a."
+    Assert-Equal $cautiousFinalState.task_states."T-cautious-b".last_completed_phase "Phase5" "cautious opt-in should persist Phase5 completion for T-cautious-b."
+    Assert-Equal $cautiousFinalState.task_states."T-cautious-a".phase_cursor "Phase5-1" "cautious opt-in should advance T-cautious-a to Phase5-1."
+    Assert-Equal $cautiousFinalState.task_states."T-cautious-b".phase_cursor "Phase5-1" "cautious opt-in should advance T-cautious-b to Phase5-1."
+    Assert-Equal $cautiousFinalState.task_states."T-cautious-a".active_job_id $null "cautious opt-in should clear compatibility active_job_id for T-cautious-a."
+    Assert-Equal $cautiousFinalState.task_states."T-cautious-b".active_job_id $null "cautious opt-in should clear compatibility active_job_id for T-cautious-b."
 
     $script:ExecutionMode = "auto"
     $script:ExecutionMaxParallelJobs = 2

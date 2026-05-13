@@ -3,7 +3,7 @@
 # - State transition validation (auto-correction on phase mismatch)
 # - Forbidden command guidance in prompts / operational policy
 # - Test result verification (warns when test_output.log is missing after Phase6)
-# - Config validation (type checking, timeout order validation)
+# - Config validation (type checking, timeout validation)
 
 cli:
   command: "codex"
@@ -13,15 +13,14 @@ cli:
   reviewer_command: ""
   reviewer_flags: ""
 
-escalation:
-  phase1_timeout_sec: 300
-  phase2_timeout_sec: 600
-  phase3_timeout_sec: 1200
-
 execution:
   # Keep the tracked default conservative. Use config/settings.local.yaml or
   # -ConfigFile with an example copy to opt into auto/parallel task execution.
   mode: single
+  # 1 attempt が長引いたときに provider process を再起動する秒数。
+  restart_after_sec: 6000
+  # timeout restart を何回まで追加で試すか。1 = 初回 + 1 retry。
+  max_retries: 1
   max_parallel_jobs: 1
   allow_single_parallel_job: false
 
