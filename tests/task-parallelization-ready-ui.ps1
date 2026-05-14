@@ -124,6 +124,17 @@ Assert-Equal $cautiousReady["launch_block_reason"] "cautious_parallel_safety" "C
 Assert-True ($cautiousReady["operator_hint"].Contains("-AllowCautiousParallelJob")) "Cautious hint should name the opt-in switch."
 $dependencyWait = @($summary["waiting_tasks"] | Where-Object { $_["task_id"] -eq "T-dep" })[0]
 Assert-Equal $dependencyWait["launch_block_reason"] "dependency" "Dependency waits should expose launch blocking detail."
+Assert-Equal $summary["dispatch_state"] "active_jobs_running" "Summary should expose active dispatch state while jobs are leased."
+
+$cautiousIdleState = New-ParallelUiState
+$cautiousIdleState["active_job_id"] = $null
+$cautiousIdleState["active_jobs"] = [ordered]@{}
+$cautiousIdleState["task_states"]["T-active"]["status"] = "completed"
+$cautiousIdleState["task_states"]["T-active"]["active_job_id"] = $null
+$cautiousIdleState["task_states"]["T-ready-a"]["parallel_safety"] = "cautious"
+$cautiousIdleState["task_states"]["T-ready-b"]["parallel_safety"] = "cautious"
+$cautiousIdleSummary = New-TaskLaneSummary -RunState $cautiousIdleState
+Assert-Equal $cautiousIdleSummary["dispatch_state"] "awaiting_cautious_parallel_opt_in" "Ready cautious-only lanes should explain that dispatch is waiting for operator opt-in."
 
 $fullState = New-ParallelUiState
 $fullState["task_lane"]["max_parallel_jobs"] = 1

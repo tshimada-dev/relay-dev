@@ -103,6 +103,28 @@ function New-PackageFixture {
     }
 }
 
+function New-NestedSourcePackageFixture {
+    $parentRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("relay-task-group-package-parent-" + [guid]::NewGuid().ToString("N"))
+    $projectRoot = Join-Path $parentRoot "relay-dev"
+    New-Item -ItemType Directory -Path (Join-Path $projectRoot "app") -Force | Out-Null
+    Set-Content -Path (Join-Path $projectRoot "app\marker.txt") -Value "nested project marker" -Encoding UTF8
+
+    $runId = "run-task-group-package-nested"
+    $tasksArtifact = [ordered]@{ tasks = @((New-TestTask -TaskId "T-nested-a"), (New-TestTask -TaskId "T-nested-b")) }
+    Save-Artifact -ProjectRoot $projectRoot -RunId $runId -Scope run -Phase "Phase4" -ArtifactId "phase4_tasks.json" -Content $tasksArtifact -AsJson | Out-Null
+    $state = New-RunState -RunId $runId -ProjectRoot $projectRoot -CurrentPhase "Phase5" -CurrentRole "implementer"
+    $state = Register-PlannedTasks -RunState $state -TasksArtifact $tasksArtifact
+    $state["task_lane"]["mode"] = "parallel"
+    $state["task_lane"]["max_parallel_jobs"] = 2
+
+    return [ordered]@{
+        parent_root = $parentRoot
+        project_root = $projectRoot
+        run_id = $runId
+        state = $state
+    }
+}
+
 $provider = [ordered]@{
     provider = "fake"
     command = "pwsh"
@@ -167,6 +189,17 @@ Assert-True (Test-Path ([string]$packageResult["package_path"])) "Task group pac
 Assert-Equal $packageResult["package"]["package_kind"] "task-group-leased-package" "Package kind should identify an executable group package."
 Assert-Equal $packageResult["package"]["commit_policy"] "all_or_nothing" "Package should include commit policy."
 Assert-Equal $packageResult["package"]["workspace_mode"] "isolated-copy-experimental" "Package should include workspace mode."
+
+$nestedFixture = New-NestedSourcePackageFixture
+$nestedPackageResult = New-TaskGroupJobPackage -ProjectRoot ([string]$nestedFixture["project_root"]) -RunState $nestedFixture["state"] -ProviderSpec $provider -SourceWorkspace ([string]$nestedFixture["parent_root"])
+$nestedWorkerPackage = $nestedPackageResult["package"]["workers"][0]
+$nestedWorkspacePath = [string]$nestedWorkerPackage["workspace_path"]
+$nestedWorkerId = [string]$nestedWorkerPackage["worker_id"]
+$nestedCopyRoot = Join-Path (Join-Path (Get-RunRootPath -ProjectRoot ([string]$nestedFixture["project_root"]) -RunId ([string]$nestedFixture["run_id"])) "workspaces") $nestedWorkerId
+$nestedMarkerPath = Join-Path $nestedWorkspacePath "app\marker.txt"
+Assert-True ($nestedWorkspacePath.StartsWith($nestedCopyRoot, [System.StringComparison]::OrdinalIgnoreCase)) "Nested source workspace path should stay inside the isolated copy root."
+Assert-True ($nestedWorkspacePath.EndsWith("relay-dev", [System.StringComparison]::OrdinalIgnoreCase)) "Nested source workspace path should point at the copied project subdirectory."
+Assert-True (Test-Path -LiteralPath $nestedMarkerPath -PathType Leaf) "Nested source workspace path should expose project files at the worker working directory."
 
 if ($failures.Count -gt 0) {
     Write-Host "task-group-parallel-package failures:" -ForegroundColor Red

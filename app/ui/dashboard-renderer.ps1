@@ -22,6 +22,7 @@ function New-RunDashboardSummary {
 - Role: $($state["current_role"])
 - Updated: $($state["updated_at"])
 - Task Lane: $($lane["mode"]) slots $($lane["used_slots"])/$($lane["max_parallel_jobs"]) remaining=$($lane["capacity_remaining"]) stop_leasing=$($lane["stop_leasing"])
+- Dispatch State: $($lane["dispatch_state"])
 - Lane Stall: $(if ($lane["stall_reason"]) { $lane["stall_reason"] } else { "-" })
 - Tasks: total=$($lane["total_tasks"]) ready=$($lane["ready_count"]) running=$($lane["running_count"]) blocked=$($lane["blocked_count"]) completed=$($lane["completed_count"]) repair=$($lane["repair_count"])
 - Active Jobs: $(@($lane["active_jobs"]).Count)

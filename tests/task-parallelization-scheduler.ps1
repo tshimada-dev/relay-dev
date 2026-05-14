@@ -183,6 +183,17 @@ Assert-Equal ([bool]$dependencyEligibility["eligible"]) $false "Unmet dependenci
 Assert-Equal $dependencyEligibility["wait_reason"] "dependencies" "Unmet dependencies should report wait_reason dependencies."
 Assert-ArrayContains $dependencyEligibility["blocked_by"] "T-ready" "Dependency waits should identify blocking task ids."
 
+$resyncedArtifact = [ordered]@{
+    tasks = @(
+        (New-TestTask -TaskId "T-ready" -ResourceLocks @("ui-shell") -ParallelSafety "parallel"),
+        (New-TestTask -TaskId "T-dependent" -Dependencies @() -ParallelSafety "parallel")
+    )
+}
+$resyncedState = Register-PlannedTasks -RunState $state -TasksArtifact $resyncedArtifact
+$resyncedTask = ConvertTo-RelayHashtable -InputObject $resyncedState["task_states"]["T-dependent"]
+Assert-Equal @($resyncedTask["depends_on"]).Count 0 "Planned task dependencies should resync from the current Phase4 task artifact."
+Assert-Equal $resyncedTask["status"] "ready" "A task unblocked by Phase4 dependency resync should become ready."
+
 $staleDependencyState = ConvertTo-RelayHashtable -InputObject $state
 $staleDependencyTask = ConvertTo-RelayHashtable -InputObject $staleDependencyState["task_states"]["T-dependent"]
 $staleDependencyTask["depends_on"] = @()

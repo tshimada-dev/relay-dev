@@ -31,6 +31,36 @@ function Get-ParallelWorkspacePathHash {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
+function Resolve-IsolatedProjectWorkspacePath {
+    param(
+        [Parameter(Mandatory)][string]$ProjectRoot,
+        [Parameter(Mandatory)][string]$SourceWorkspace,
+        [Parameter(Mandatory)][string]$WorkspaceRoot
+    )
+
+    $projectFullPath = [System.IO.Path]::GetFullPath($ProjectRoot)
+    $sourceFullPath = [System.IO.Path]::GetFullPath($SourceWorkspace)
+    $workspaceFullPath = [System.IO.Path]::GetFullPath($WorkspaceRoot)
+    if ($projectFullPath.Equals($sourceFullPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $workspaceFullPath
+    }
+
+    $sourceWithSeparator = $sourceFullPath.TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $projectFullPath.StartsWith($sourceWithSeparator, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $workspaceFullPath
+    }
+
+    $relativeProjectRoot = [System.IO.Path]::GetRelativePath($sourceFullPath, $projectFullPath)
+    if ([string]::IsNullOrWhiteSpace($relativeProjectRoot) -or
+        $relativeProjectRoot -eq "." -or
+        [System.IO.Path]::IsPathRooted($relativeProjectRoot) -or
+        $relativeProjectRoot -match '(^|[\\/])\.\.([\\/]|$)') {
+        return $workspaceFullPath
+    }
+
+    return [System.IO.Path]::GetFullPath((Join-Path $workspaceFullPath $relativeProjectRoot))
+}
+
 function Test-ParallelWorkspaceExcludedPath {
     param(
         [Parameter(Mandatory)][string]$RelativePath,
@@ -130,12 +160,18 @@ function New-IsolatedJobWorkspace {
         Copy-Item -LiteralPath $_.FullName -Destination $target -Force
     }
 
+    $projectWorkspaceFullPath = Resolve-IsolatedProjectWorkspacePath -ProjectRoot $ProjectRoot -SourceWorkspace $sourceFullPath -WorkspaceRoot $destinationFullPath
+    if (-not (Test-Path -LiteralPath $projectWorkspaceFullPath -PathType Container)) {
+        throw "Isolated project workspace '$projectWorkspaceFullPath' was not created."
+    }
+
     return [ordered]@{
         workspace_mode = "isolated-copy-experimental"
         run_id = $RunId
         job_id = $JobId
         source_workspace = $sourceFullPath
-        workspace_path = $destinationFullPath
+        workspace_root = $destinationFullPath
+        workspace_path = $projectWorkspaceFullPath
         excluded_paths = @($AdditionalExcludePaths)
         created_at = (Get-Date).ToUniversalTime().ToString("o")
     }

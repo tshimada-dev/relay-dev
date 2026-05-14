@@ -122,6 +122,36 @@ try {
 
     $now = Get-Date
     $staleState = New-RunState -RunId "run-stale" -ProjectRoot $tempRoot -CurrentPhase "Phase5" -CurrentRole "implementer"
+    $staleState["task_order"] = @("T-stale", "T-done", "T-dependent")
+    $staleState["task_states"]["T-stale"] = [ordered]@{
+        task_id = "T-stale"
+        status = "in_progress"
+        wait_reason = "task_group_running"
+        active_job_id = $null
+        task_group_id = "group-stale"
+        depends_on = @()
+        phase_cursor = "Phase5"
+        kind = "planned"
+    }
+    $staleState["task_states"]["T-done"] = [ordered]@{
+        task_id = "T-done"
+        status = "in_progress"
+        wait_reason = "task_group_running"
+        active_job_id = $null
+        task_group_id = "group-stale"
+        depends_on = @()
+        phase_cursor = "Phase5"
+        kind = "planned"
+    }
+    $staleState["task_states"]["T-dependent"] = [ordered]@{
+        task_id = "T-dependent"
+        status = "not_started"
+        wait_reason = "dependencies"
+        active_job_id = $null
+        depends_on = @("T-stale")
+        phase_cursor = $null
+        kind = "planned"
+    }
     $staleState["task_groups"]["group-stale"] = New-RunStateTaskGroup -GroupId "group-stale" -Status "running" -TaskIds @("T-stale", "T-done") -WorkerIds @("worker-stale", "worker-done")
     $staleState["task_group_workers"]["worker-stale"] = New-RunStateTaskGroupWorker -WorkerId "worker-stale" -GroupId "group-stale" -TaskId "T-stale" -Status "running" -Phase "Phase5-1" -UpdatedAt $now.AddMinutes(-30).ToString("o")
     $staleState["task_group_workers"]["worker-stale"]["last_heartbeat_at"] = $now.AddMinutes(-30).ToString("o")
@@ -141,6 +171,9 @@ try {
     Assert-Equal $staleRepairedState["task_group_workers"]["worker-done"]["status"] "succeeded" "Stale worker recovery should preserve succeeded sibling status."
     Assert-Equal $staleRepairedState["task_group_workers"]["worker-done"]["worker_result"]["status"] "succeeded" "Stale worker recovery should preserve succeeded sibling worker_result."
     Assert-Equal $staleRepairedState["task_groups"]["group-stale"]["status"] "partial_failed" "Stale worker recovery should mark mixed group partial_failed."
+    Assert-Equal $staleRepairedState["task_states"]["T-stale"]["status"] "ready" "Stale group recovery should return affected task state to the ready queue."
+    Assert-Equal $staleRepairedState["task_states"]["T-done"]["status"] "ready" "Stale group recovery should return sibling task state to the ready queue for all-or-nothing retry."
+    Assert-Equal $staleRepairedState["task_states"]["T-dependent"]["status"] "not_started" "Stale group recovery should not unblock dependent tasks."
 
     $suffix = Get-RunStateGroupRecoveryAttemptSuffix -RunState $state
     Assert-True ($suffix.Contains("group=group-001")) "Agent-loop recovery key suffix should include group attribution."

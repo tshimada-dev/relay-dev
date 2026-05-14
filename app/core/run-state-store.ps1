@@ -689,6 +689,7 @@ function Repair-StaleTaskGroupWorkerState {
     $cutoff = $Now.AddMinutes(-1 * $StaleAfterMinutes)
     $workers = ConvertTo-RelayHashtable -InputObject $state["task_group_workers"]
     $groups = ConvertTo-RelayHashtable -InputObject $state["task_groups"]
+    $taskStates = ConvertTo-RelayHashtable -InputObject $state["task_states"]
 
     foreach ($workerId in @($workers.Keys)) {
         $worker = ConvertTo-RelayHashtable -InputObject $workers[$workerId]
@@ -742,11 +743,57 @@ function Repair-StaleTaskGroupWorkerState {
                 $group["failure_summary"] = "stale_task_group_worker"
             }
             $groups[$groupId] = $group
+
+        }
+    }
+
+    foreach ($groupIdRaw in @($groups.Keys)) {
+        $groupId = [string]$groupIdRaw
+        $group = ConvertTo-RelayHashtable -InputObject $groups[$groupId]
+        if ([string]$group["status"] -notin @("stale", "partial_failed", "failed")) {
+            continue
+        }
+
+        foreach ($taskIdRaw in @($group["task_ids"])) {
+            $taskId = [string]$taskIdRaw
+            if ([string]::IsNullOrWhiteSpace($taskId) -or -not $taskStates.ContainsKey($taskId)) {
+                continue
+            }
+
+            $taskState = ConvertTo-RelayHashtable -InputObject $taskStates[$taskId]
+            if ([string]$taskState["status"] -ne "in_progress") {
+                continue
+            }
+
+            $taskGroupId = [string]$taskState["task_group_id"]
+            if (-not [string]::IsNullOrWhiteSpace($taskGroupId) -and $taskGroupId -ne $groupId) {
+                continue
+            }
+
+            $dependenciesSatisfied = $true
+            foreach ($dependencyIdRaw in @($taskState["depends_on"])) {
+                $dependencyId = [string]$dependencyIdRaw
+                if ([string]::IsNullOrWhiteSpace($dependencyId)) {
+                    continue
+                }
+                if (-not $taskStates.ContainsKey($dependencyId) -or [string]$taskStates[$dependencyId]["status"] -ne "completed") {
+                    $dependenciesSatisfied = $false
+                    break
+                }
+            }
+
+            $taskState["status"] = if ($dependenciesSatisfied) { "ready" } else { "not_started" }
+            $taskState["wait_reason"] = if ($dependenciesSatisfied) { $null } else { "dependencies" }
+            $taskState["active_job_id"] = $null
+            $taskState["task_group_id"] = $null
+            $taskStates[$taskId] = $taskState
+            $changed = $true
         }
     }
 
     $state["task_group_workers"] = $workers
     $state["task_groups"] = $groups
+    $state["task_states"] = $taskStates
     if ($changed) {
         $state["updated_at"] = $Now.ToString("o")
     }

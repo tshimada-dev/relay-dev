@@ -149,7 +149,27 @@ function Register-PlannedTasks {
                 artifact_id = "phase4_tasks.json"
                 item_id = $taskId
             }
+            continue
         }
+
+        $existingTaskState = ConvertTo-RelayHashtable -InputObject $state["task_states"][$taskId]
+        if ([string]$existingTaskState["kind"] -ne "planned") {
+            continue
+        }
+
+        $existingStatus = [string]$existingTaskState["status"]
+        if ($existingStatus -in @("completed", "in_progress", "abandoned")) {
+            continue
+        }
+
+        $existingTaskState["depends_on"] = @($taskObject["dependencies"])
+        $existingTaskState["origin_phase"] = "Phase4"
+        $existingTaskState["task_contract_ref"] = @{
+            phase = "Phase4"
+            artifact_id = "phase4_tasks.json"
+            item_id = $taskId
+        }
+        $state["task_states"][$taskId] = $existingTaskState
     }
 
     return (Update-TaskReadiness -RunState $state)

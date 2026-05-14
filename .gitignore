@@ -19,6 +19,7 @@ config/settings-*.local.yaml
 
 # Runtime state and generated projections
 runs/
+jobs/
 dashboard.md
 queue/status.yaml
 outputs/*

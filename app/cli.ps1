@@ -2270,6 +2270,18 @@ function Invoke-TaskGroupEngineStep {
         $runState = Sync-RunStateFromCanonicalArtifacts -RunId $ResolvedRunId -RunState $runState
         $runState = Initialize-RunStateCompatibilityFields -RunState $runState
 
+        $taskGroupStaleRepair = Repair-StaleTaskGroupWorkerState -RunState $runState
+        if ([bool]$taskGroupStaleRepair["changed"]) {
+            $runState = ConvertTo-RelayHashtable -InputObject $taskGroupStaleRepair["run_state"]
+            Write-RunState -ProjectRoot $script:ProjectRoot -RunState $runState | Out-Null
+            Append-RunStatusChangedEvent -RunId $ResolvedRunId -RunState $runState
+            Append-Event -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -Event @{
+                type = "task_group.recovered"
+                reason = "stale_task_group_worker"
+                workers = @($taskGroupStaleRepair["recovered_workers"])
+            }
+        }
+
         $phaseName = [string]$runState["current_phase"]
         $resolvedRole = Resolve-PhaseRole -Phase $phaseName
         $providerSpec = Resolve-RoleProviderSpec -ResolvedRole $resolvedRole -ProviderName $Provider -ExplicitCommand $ProviderCommand -ExplicitFlags $ProviderFlags
@@ -2315,7 +2327,7 @@ function Invoke-TaskGroupEngineStep {
     $merge = $null
     $status = [string]$coordinator["status"]
     if ($status -eq "succeeded") {
-        $merge = ConvertTo-RelayHashtable -InputObject (Complete-TaskGroupMergeCommit -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -GroupId ([string]$packageResult["group_id"]) -MainWorkspace $script:ProjectDir)
+        $merge = ConvertTo-RelayHashtable -InputObject (Complete-TaskGroupMergeCommit -ProjectRoot $script:ProjectRoot -RunId $ResolvedRunId -GroupId ([string]$packageResult["group_id"]) -MainWorkspace $script:ProjectRoot)
         $status = if ([bool]$merge["ok"]) { "completed" } else { [string]$merge["status"] }
     }
 
@@ -2515,7 +2527,7 @@ switch ($Command) {
             throw "run-leased-job requires -JobPackageFile."
         }
 
-        $result = ConvertTo-RelayHashtable -InputObject (Invoke-LeasedJobPackage -Package $JobPackageFile -ProjectRoot $script:ProjectRoot -MainWorkspace $script:ProjectDir -TimeoutPolicy (Get-StepTimeoutPolicy) -ApprovalPhases $script:HumanReviewPhases -ArtifactCompletionProbe ${function:Invoke-PhaseArtifactCompletionProbe})
+        $result = ConvertTo-RelayHashtable -InputObject (Invoke-LeasedJobPackage -Package $JobPackageFile -ProjectRoot $script:ProjectRoot -MainWorkspace $script:ProjectRoot -TimeoutPolicy (Get-StepTimeoutPolicy) -ApprovalPhases $script:HumanReviewPhases -ArtifactCompletionProbe ${function:Invoke-PhaseArtifactCompletionProbe})
         $result | ConvertTo-Json -Depth 20
         if ($result.ContainsKey("exit_code") -and [int]$result["exit_code"] -ne 0) {
             exit ([int]$result["exit_code"])

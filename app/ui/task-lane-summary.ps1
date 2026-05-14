@@ -126,7 +126,7 @@ function New-TaskLaneLaunchBlockDetail {
 function Test-TaskLaneActiveTaskGroupStatus {
     param([AllowNull()][string]$Status)
 
-    return ($Status -in @("running", "waiting_approval", "partial_failed"))
+    return ($Status -in @("running", "waiting_approval"))
 }
 
 function Resolve-TaskLaneStallReason {
@@ -163,6 +163,54 @@ function Resolve-TaskLaneStallReason {
     }
 
     return "no_ready_tasks"
+}
+
+function Resolve-TaskLaneDispatchState {
+    param(
+        [Parameter(Mandatory)]$ReadyQueue,
+        [Parameter(Mandatory)]$ActiveJobs,
+        [Parameter(Mandatory)]$TaskGroups,
+        [int]$CapacityRemaining = 0
+    )
+
+    if (@($ActiveJobs).Count -gt 0) {
+        return "active_jobs_running"
+    }
+
+    $runningGroups = @(
+        @($TaskGroups) |
+            ForEach-Object { ConvertTo-RelayHashtable -InputObject $_ } |
+            Where-Object { $_ -and [string]$_["status"] -eq "running" }
+    )
+    if ($runningGroups.Count -gt 0) {
+        return "task_group_running"
+    }
+
+    $readyRows = @($ReadyQueue)
+    if ($readyRows.Count -eq 0) {
+        return "idle"
+    }
+
+    if ($CapacityRemaining -le 0) {
+        return "capacity_full"
+    }
+
+    $readyReasons = @(
+        $readyRows |
+            ForEach-Object { ConvertTo-RelayHashtable -InputObject $_ } |
+            Where-Object { $_ -and -not [string]::IsNullOrWhiteSpace([string]$_["launch_block_reason"]) } |
+            ForEach-Object { [string]$_["launch_block_reason"] }
+    )
+
+    if ($readyReasons.Count -eq $readyRows.Count) {
+        $uniqueReasons = @($readyReasons | Sort-Object -Unique)
+        if ($uniqueReasons.Count -eq 1 -and $uniqueReasons[0] -eq "cautious_parallel_safety") {
+            return "awaiting_cautious_parallel_opt_in"
+        }
+        return "ready_queue_blocked"
+    }
+
+    return "awaiting_dispatch"
 }
 
 function Resolve-TaskLaneLeaseCandidates {
@@ -646,6 +694,7 @@ function New-TaskLaneSummary {
     }
     Add-TaskLaneLaunchBlockDetails @launchDetailParams -Rows @($readyQueueRows.ToArray())
     Add-TaskLaneLaunchBlockDetails @launchDetailParams -Rows @($waitingTaskRows.ToArray())
+    $dispatchState = Resolve-TaskLaneDispatchState -ReadyQueue @($readyQueueRows.ToArray()) -ActiveJobs @($activeJobRows.ToArray()) -TaskGroups @($taskGroupRows.ToArray()) -CapacityRemaining $capacityRemaining
 
     return [ordered]@{
         total_tasks = @($taskStates.Keys).Count
@@ -671,6 +720,7 @@ function New-TaskLaneSummary {
         used_slots = $usedSlots
         lease_candidates = @($leaseCandidates)
         pending_approval = $approvalSummary
+        dispatch_state = $dispatchState
         event_count = @($Events).Count
     }
 }

@@ -84,6 +84,15 @@ function New-TaskGroupUiState {
                 task_ids = @("T-03")
                 worker_ids = @("worker-003")
             }
+            "group-003" = [ordered]@{
+                id = "group-003"
+                status = "partial_failed"
+                phase = "Phase5..Phase6"
+                phase_range = "Phase5..Phase6"
+                task_ids = @("T-04", "T-05")
+                worker_ids = @("worker-004", "worker-005")
+                failure_summary = "archived failed group"
+            }
         }
         task_group_workers = [ordered]@{
             "worker-001" = [ordered]@{
@@ -139,7 +148,7 @@ function New-LegacyUiState {
 }
 
 $summary = New-TaskLaneSummary -RunState (New-TaskGroupUiState) -Events @(@{ type = "seeded" })
-Assert-Equal @($summary["task_groups"]).Count 2 "Summary should include task group rows."
+Assert-Equal @($summary["task_groups"]).Count 3 "Summary should include task group rows."
 Assert-Equal @($summary["task_group_workers"]).Count 3 "Summary should include task group worker rows."
 Assert-Equal $summary["task_groups"][0]["group_id"] "group-001" "Group row should expose normalized group id."
 Assert-Equal $summary["task_groups"][0]["status"] "running" "Group row should expose status."
